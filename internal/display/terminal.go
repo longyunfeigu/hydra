@@ -1,3 +1,5 @@
+// Package display 负责处理 Hydra 代码审查过程中的所有终端输出和显示逻辑。
+// 包括进度旋转动画、审查状态展示、结果表格、Token 用量统计等。
 package display
 
 import (
@@ -11,15 +13,18 @@ import (
 	"github.com/guwanhua/hydra/internal/orchestrator"
 )
 
-// Display handles all terminal output for the review process.
+// Display 负责管理审查过程中的所有终端输出。
+// 包含旋转动画器（spinner）用于显示等待状态，
+// 以及当前审查者和轮次信息用于格式化输出。
 type Display struct {
-	spin            *spinner.Spinner
-	currentReviewer string
-	currentRound    int
-	maxRounds       int
+	spin            *spinner.Spinner // 终端旋转动画器，用于显示等待/处理中状态
+	currentReviewer string          // 当前正在展示输出的审查者 ID
+	currentRound    int             // 当前审查轮次
+	maxRounds       int             // 最大审查轮次数
 }
 
-// New creates a new Display instance.
+// New 创建一个新的 Display 实例。
+// 初始化旋转动画器（使用字符集 14，120ms 刷新间隔），初始轮次设为 1。
 func New() *Display {
 	s := spinner.New(spinner.CharSets[14], 120*time.Millisecond)
 	return &Display{
@@ -28,39 +33,41 @@ func New() *Display {
 	}
 }
 
-// --- Spinner methods ---
+// --- 旋转动画方法 ---
 
-// SpinnerStart starts the spinner with the given text.
+// SpinnerStart 启动旋转动画并显示指定文本。
+// 用于在等待 AI 响应等耗时操作时向用户显示进度。
 func (d *Display) SpinnerStart(text string) {
 	d.spin.Suffix = "  " + text
 	d.spin.Start()
 }
 
-// SpinnerSucceed stops the spinner and prints a success message.
+// SpinnerSucceed 停止旋转动画并显示绿色成功消息。
 func (d *Display) SpinnerSucceed(text string) {
 	d.spin.Stop()
 	color.Green("  %s %s", color.GreenString("✓"), text)
 }
 
-// SpinnerFail stops the spinner and prints a failure message.
+// SpinnerFail 停止旋转动画并显示红色失败消息。
 func (d *Display) SpinnerFail(text string) {
 	d.spin.Stop()
 	color.Red("  %s %s", color.RedString("✗"), text)
 }
 
-// SpinnerStop stops the spinner without printing anything.
+// SpinnerStop 停止旋转动画但不打印任何消息。
 func (d *Display) SpinnerStop() {
 	d.spin.Stop()
 }
 
-// --- Review lifecycle ---
+// --- 审查生命周期方法 ---
 
-// SetMaxRounds updates the maximum round count for display purposes.
+// SetMaxRounds 更新最大轮次数，用于显示目的。
 func (d *Display) SetMaxRounds(maxRounds int) {
 	d.maxRounds = maxRounds
 }
 
-// ReviewHeader prints the review header with configuration details.
+// ReviewHeader 打印审查头部信息，包含配置详情。
+// 展示审查目标、审查者列表、最大轮次数以及是否启用收敛检查和上下文收集。
 func (d *Display) ReviewHeader(label string, reviewerIDs []string, maxRounds int, checkConvergence, contextEnabled bool) {
 	d.maxRounds = maxRounds
 
@@ -84,9 +91,11 @@ func (d *Display) ReviewHeader(label string, reviewerIDs []string, maxRounds int
 	fmt.Println()
 }
 
-// --- DisplayCallbacks interface methods ---
+// --- DisplayCallbacks 接口方法 ---
+// 以下方法实现了 orchestrator 的回调接口，用于在审查过程的各个阶段更新终端显示。
 
-// OnWaiting shows a spinner while waiting for a reviewer/analyzer/summarizer.
+// OnWaiting 在等待审查者、分析器或摘要器响应时显示旋转动画。
+// 根据不同的 reviewerID 显示不同的等待提示文本，并附带随机冷笑话缓解等待焦虑。
 func (d *Display) OnWaiting(reviewerID string) {
 	d.spin.Stop()
 
@@ -118,7 +127,8 @@ func (d *Display) OnWaiting(reviewerID string) {
 	d.spin.Start()
 }
 
-// OnMessage displays a reviewer's response.
+// OnMessage 显示审查者的响应内容。
+// 当审查者切换时打印新的审查者标题头，然后渲染 Markdown 格式的响应内容。
 func (d *Display) OnMessage(reviewerID string, content string) {
 	d.spin.Stop()
 
@@ -139,14 +149,17 @@ func (d *Display) OnMessage(reviewerID string, content string) {
 	fmt.Print(rendered)
 }
 
-// OnParallelStatus updates the spinner to show parallel execution progress.
+// OnParallelStatus 更新旋转动画以显示并行执行的进度。
+// 展示每个审查者的状态（已完成/思考中/等待中）和耗时。
 func (d *Display) OnParallelStatus(round int, statuses []orchestrator.ReviewerStatus) {
 	statusLine := formatParallelStatus(round, statuses)
 	joke := getRandomJoke()
 	d.spin.Suffix = fmt.Sprintf("  %s | %s", statusLine, color.HiBlackString(joke))
 }
 
-// OnRoundComplete displays round completion status.
+// OnRoundComplete 显示审查轮次完成状态。
+// 如果审查者达成共识（converged=true），显示绿色的 CONVERGED 标记并提示提前结束；
+// 否则显示红色的 NOT CONVERGED 标记，继续下一轮。
 func (d *Display) OnRoundComplete(round int, converged bool) {
 	fmt.Println()
 	if converged {
@@ -160,7 +173,8 @@ func (d *Display) OnRoundComplete(round int, converged bool) {
 	d.currentRound = round + 1
 }
 
-// OnConvergenceJudgment shows the judge's reasoning.
+// OnConvergenceJudgment 展示收敛判断者的推理过程。
+// 以灰色文本逐行显示判断理由，帮助用户理解为何审查提前结束或继续。
 func (d *Display) OnConvergenceJudgment(verdict string, reasoning string) {
 	if reasoning == "" {
 		return
@@ -171,7 +185,8 @@ func (d *Display) OnConvergenceJudgment(verdict string, reasoning string) {
 	}
 }
 
-// OnContextGathered displays the gathered context information.
+// OnContextGathered 展示收集到的系统上下文信息。
+// 包括受影响模块（按影响级别着色）、关联 PR 列表和 AI 生成的上下文摘要。
 func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 	d.spin.Stop()
 
@@ -214,9 +229,10 @@ func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 	}
 }
 
-// --- Result display methods ---
+// --- 结果展示方法 ---
 
-// FinalConclusion shows the final review conclusion.
+// FinalConclusion 显示最终审查结论。
+// 使用绿色粗体的双线分隔框突出显示，并渲染 Markdown 格式的结论文本。
 func (d *Display) FinalConclusion(text string) {
 	d.spin.Stop()
 
@@ -228,7 +244,9 @@ func (d *Display) FinalConclusion(text string) {
 	fmt.Print(rendered)
 }
 
-// IssuesTable shows structured issues found during review.
+// IssuesTable 以表格形式展示审查过程中发现的结构化问题。
+// 按严重等级着色显示（critical=红色粗体, high=红色, medium=黄色, low=蓝色, nitpick=灰色），
+// 包含问题标题、文件位置、提出者和修复建议（如果有）。
 func (d *Display) IssuesTable(issues []orchestrator.MergedIssue) {
 	totalRaw := 0
 	for _, issue := range issues {
@@ -276,7 +294,9 @@ func (d *Display) IssuesTable(issues []orchestrator.MergedIssue) {
 	}
 }
 
-// TokenUsageDisplay shows token usage statistics.
+// TokenUsage 展示 Token 使用量统计信息。
+// 逐行显示每个审查者的输入/输出 Token 数，最后汇总显示总量和估算费用。
+// 如果审查提前收敛，还会显示收敛轮次。
 func (d *Display) TokenUsage(usage []orchestrator.TokenUsage, convergedAt *int) {
 	fmt.Println(color.HiBlackString("\n%s", strings.Repeat("─", 50)))
 	fmt.Println(color.HiBlackString("  Token Usage (Estimated)"))
@@ -309,8 +329,10 @@ func (d *Display) TokenUsage(usage []orchestrator.TokenUsage, convergedAt *int) 
 	fmt.Println()
 }
 
-// --- Helpers ---
+// --- 辅助函数 ---
 
+// formatParallelStatus 格式化并行审查的状态显示文本。
+// 每个审查者用不同颜色标识状态：绿色=已完成（附耗时），黄色=思考中，灰色=等待中。
 func formatParallelStatus(round int, statuses []orchestrator.ReviewerStatus) string {
 	parts := make([]string, len(statuses))
 	for i, s := range statuses {
@@ -327,6 +349,8 @@ func formatParallelStatus(round int, statuses []orchestrator.ReviewerStatus) str
 	return fmt.Sprintf("Round %d: [%s]", round, strings.Join(parts, " | "))
 }
 
+// formatNumber 将整数格式化为带千分位逗号的字符串。
+// 例如：1234 -> "1,234"，1234567 -> "1,234,567"
 func formatNumber(n int) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
@@ -337,7 +361,8 @@ func formatNumber(n int) string {
 	return fmt.Sprintf("%d,%03d,%03d", n/1000000, (n/1000)%1000, n%1000)
 }
 
-// Cold jokes displayed while waiting for AI responses.
+// coldJokes 是等待 AI 响应时显示的程序员冷笑话集合。
+// 在旋转动画旁随机展示，缓解用户等待时的无聊感。
 var coldJokes = []string{
 	"Why do programmers confuse Halloween and Christmas? Because Oct 31 = Dec 25",
 	`A SQL query walks into a bar, walks up to two tables and asks: "Can I join you?"`,
@@ -361,6 +386,7 @@ var coldJokes = []string{
 	`Git commit -m "fixed it for real this time"`,
 }
 
+// getRandomJoke 从冷笑话集合中随机选取一条返回。
 func getRandomJoke() string {
 	return coldJokes[rand.Intn(len(coldJokes))]
 }

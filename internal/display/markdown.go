@@ -8,43 +8,48 @@ import (
 	"github.com/guwanhua/hydra/internal/orchestrator"
 )
 
-// MessageForMarkdown represents a debate message for markdown export.
+// MessageForMarkdown 表示用于 Markdown 导出的辩论消息。
+// 包含审查者标识和消息内容。
 type MessageForMarkdown struct {
-	ReviewerID string
-	Content    string
+	ReviewerID string // 审查者标识
+	Content    string // 消息内容
 }
 
-// SummaryForMarkdown represents a reviewer summary for markdown export.
+// SummaryForMarkdown 表示用于 Markdown 导出的审查者摘要。
 type SummaryForMarkdown struct {
-	ReviewerID string
-	Summary    string
+	ReviewerID string // 审查者标识
+	Summary    string // 摘要内容
 }
 
-// MergedIssueForMarkdown mirrors MergedIssue for markdown export.
+// MergedIssueForMarkdown 是 MergedIssue 的 Markdown 导出版本。
+// 使用本地类型避免与 orchestrator 包的循环导入。
 type MergedIssueForMarkdown struct {
-	Severity     string
-	Title        string
-	File         string
-	Line         int
-	Description  string
-	SuggestedFix string
-	RaisedBy     []string
+	Severity     string   // 严重等级
+	Title        string   // 问题标题
+	File         string   // 问题所在文件
+	Line         int      // 问题所在行号
+	Description  string   // 问题描述
+	SuggestedFix string   // 建议的修复方案
+	RaisedBy     []string // 提出该问题的审查者列表
 }
 
-// DebateResultForMarkdown holds the fields needed to generate a markdown report.
-// Uses local types to avoid circular imports with the orchestrator package.
+// DebateResultForMarkdown 包含生成 Markdown 报告所需的所有字段。
+// 使用本地类型（而非直接引用 orchestrator 的类型）以避免循环导入。
+// 这个结构体是将审查结果导出为 Markdown 文件的数据载体。
 type DebateResultForMarkdown struct {
-	PRNumber         string
-	Analysis         string
-	FinalConclusion  string
-	Messages         []MessageForMarkdown
-	Summaries        []SummaryForMarkdown
-	TokenUsage       []orchestrator.TokenUsage
-	ConvergedAtRound *int
-	ParsedIssues     []MergedIssueForMarkdown
+	PRNumber         string                   // PR 编号或标签（如 "Local Changes"）
+	Analysis         string                   // 分析文本
+	FinalConclusion  string                   // 最终结论
+	Messages         []MessageForMarkdown     // 辩论消息列表
+	Summaries        []SummaryForMarkdown     // 审查者摘要列表
+	TokenUsage       []orchestrator.TokenUsage // Token 使用量统计
+	ConvergedAtRound *int                     // 收敛轮次（nil 表示未收敛）
+	ParsedIssues     []MergedIssueForMarkdown // 结构化问题列表
 }
 
-// FormatMarkdownFromResult generates a markdown report from a DebateResultForMarkdown.
+// FormatMarkdownFromResult 从 DebateResultForMarkdown 生成完整的 Markdown 审查报告。
+// 报告包含以下章节：标题、分析、辩论记录、审查者摘要、最终结论、问题列表和 Token 用量。
+// 对于本地变更（非 PR）会使用不同的标题格式。
 func FormatMarkdownFromResult(r *DebateResultForMarkdown) string {
 	var b strings.Builder
 
@@ -113,9 +118,11 @@ func FormatMarkdownFromResult(r *DebateResultForMarkdown) string {
 	return b.String()
 }
 
-// FormatMarkdown generates a markdown report from an orchestrator DebateResult.
+// FormatMarkdown 从 orchestrator 的 DebateResult 生成 Markdown 报告。
+// 将 orchestrator 包的类型转换为本地 Markdown 导出类型后调用 FormatMarkdownFromResult。
+// 这个函数是 orchestrator 调用 Markdown 导出的主入口。
 func FormatMarkdown(result *orchestrator.DebateResult) string {
-	// Convert orchestrator types to local markdown types
+	// 将 orchestrator 类型转换为本地 Markdown 导出类型
 	messages := make([]MessageForMarkdown, len(result.Messages))
 	for i, m := range result.Messages {
 		messages[i] = MessageForMarkdown{ReviewerID: m.ReviewerID, Content: m.Content}
@@ -154,8 +161,9 @@ func FormatMarkdown(result *orchestrator.DebateResult) string {
 	return FormatMarkdownFromResult(r)
 }
 
-// RenderTerminalMarkdown renders markdown text for terminal display using glamour.
-// Falls back to raw text if glamour fails.
+// RenderTerminalMarkdown 使用 glamour 库将 Markdown 文本渲染为终端友好的格式。
+// 自动适配终端的颜色主题（深色/浅色），设置 120 字符的自动换行宽度。
+// 如果 glamour 渲染失败（例如不支持的终端），则回退返回原始文本。
 func RenderTerminalMarkdown(text string) string {
 	r, err := glamour.NewTermRenderer(
 		glamour.WithAutoStyle(),

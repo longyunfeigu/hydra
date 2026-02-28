@@ -8,12 +8,16 @@ import (
 	"strings"
 )
 
-// CollectHistory gathers git history and related PRs for the changed files.
+// CollectHistory 收集与变更文件相关的历史 PR 信息。
+// 通过分析 git 提交历史中的 PR 引用（如 #123），找到最近 N 天内
+// 涉及相同文件的历史 PR，并获取其详细信息。
+// 这些数据帮助审查者了解相关代码区域的近期变更历史。
 func CollectHistory(changedFiles []string, maxDays, maxPRs int, cwd string) ([]RelatedPR, error) {
 	if len(changedFiles) == 0 {
 		return nil, nil
 	}
 
+	// 设置默认值
 	if maxDays <= 0 {
 		maxDays = 30
 	}
@@ -21,10 +25,10 @@ func CollectHistory(changedFiles []string, maxDays, maxPRs int, cwd string) ([]R
 		maxPRs = 10
 	}
 
-	// Get commits that touched these files in the last N days
+	// 从 git 提交历史中提取涉及这些文件的 PR 编号
 	prNumbers := extractPRNumbers(changedFiles, maxDays, cwd)
 
-	// Fetch PR details
+	// 逐个获取 PR 详情，直到达到最大数量限制
 	var relatedPRs []RelatedPR
 	for _, prNum := range prNumbers {
 		if len(relatedPRs) >= maxPRs {
@@ -39,7 +43,10 @@ func CollectHistory(changedFiles []string, maxDays, maxPRs int, cwd string) ([]R
 	return relatedPRs, nil
 }
 
+// extractPRNumbers 从 git log 中提取涉及指定文件的 PR 编号。
+// 使用 git log --since 限制时间范围，从提交消息中搜索 #N 格式的 PR 引用。
 func extractPRNumbers(files []string, maxDays int, cwd string) []int {
+	// 构建 git log 命令参数
 	fileArgs := make([]string, 0, len(files)+6)
 	fileArgs = append(fileArgs, "log",
 		fmt.Sprintf("--since=%d days ago", maxDays),
@@ -56,7 +63,7 @@ func extractPRNumbers(files []string, maxDays int, cwd string) []int {
 		return nil
 	}
 
-	// Parse PR numbers from commit messages
+	// 从提交消息中解析 PR 编号，去重
 	seen := make(map[int]bool)
 	var prNumbers []int
 
@@ -65,7 +72,7 @@ func extractPRNumbers(files []string, maxDays int, cwd string) []int {
 		if line == "" {
 			continue
 		}
-		// Common patterns: (#123), PR #123, pull/123
+		// 匹配常见的 PR 引用格式：(#123)、PR #123、pull/123
 		for _, idx := range findPRNumbers(line) {
 			if !seen[idx] {
 				seen[idx] = true
@@ -77,9 +84,11 @@ func extractPRNumbers(files []string, maxDays int, cwd string) []int {
 	return prNumbers
 }
 
+// findPRNumbers 从单条提交消息中查找所有 #N 格式的 PR 编号。
+// 逐字符扫描，找到 '#' 后提取后续数字组成 PR 编号。
 func findPRNumbers(message string) []int {
 	var numbers []int
-	// Look for (#N) pattern
+	// 查找 #N 模式（如 (#123)、PR #456）
 	for i := 0; i < len(message)-2; i++ {
 		if message[i] == '#' {
 			j := i + 1
@@ -97,6 +106,7 @@ func findPRNumbers(message string) []int {
 	return numbers
 }
 
+// ghPRView 是 gh pr view 命令 JSON 输出的反序列化结构体。
 type ghPRView struct {
 	Number   int    `json:"number"`
 	Title    string `json:"title"`
@@ -109,6 +119,9 @@ type ghPRView struct {
 	} `json:"files"`
 }
 
+// getPRDetails 通过 gh CLI 获取单个 PR 的详细信息。
+// 计算与当前变更文件的重叠文件列表，并根据是否有重叠文件
+// 判断关联程度（"direct" 表示直接修改相同文件，"same-module" 表示同模块）。
 func getPRDetails(prNumber int, changedFiles []string, cwd string) *RelatedPR {
 	cmd := exec.Command("gh", "pr", "view", strconv.Itoa(prNumber),
 		"--json", "number,title,author,mergedAt,files",
@@ -124,7 +137,7 @@ func getPRDetails(prNumber int, changedFiles []string, cwd string) *RelatedPR {
 		return nil
 	}
 
-	// Determine overlapping files and relevance
+	// 计算当前 PR 变更文件与历史 PR 文件的重叠情况
 	changedSet := make(map[string]bool, len(changedFiles))
 	for _, f := range changedFiles {
 		changedSet[f] = true
@@ -137,6 +150,7 @@ func getPRDetails(prNumber int, changedFiles []string, cwd string) *RelatedPR {
 		}
 	}
 
+	// 根据是否有重叠文件确定关联程度
 	relevance := "same-module"
 	if len(overlapping) > 0 {
 		relevance = "direct"

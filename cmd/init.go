@@ -9,12 +9,22 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// initCmd 定义了 "init" 子命令，用于在用户的 home 目录下生成 Hydra 的默认配置文件。
+// 这是用户开始使用 Hydra 的第一步，生成的配置文件包含了所有可配置项的示例和说明。
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Create a default configuration file",
 	RunE:  runInit,
 }
 
+// defaultConfig 是 Hydra 的默认配置文件模板。
+// 配置内容包括：
+//   - providers: AI 提供者的启用状态（支持 claude-code 和 codex-cli）
+//   - defaults: 全局默认参数（最大辩论轮数、输出格式、收敛检测开关）
+//   - analyzer: 预分析器的模型和提示词配置，负责在审查前分析代码变更的概况
+//   - summarizer: 总结器的模型和提示词配置，负责在辩论后综合各审查者的意见
+//   - reviewers: 审查者的定义，每个审查者有独立的模型和审查视角（如安全性、性能等）
+//   - contextGatherer: 上下文收集器配置（默认注释掉），可自动收集调用链、历史变更和文档
 const defaultConfig = `# Hydra Configuration
 # Multi-model adversarial code review
 
@@ -72,6 +82,9 @@ reviewers:
 #     maxSize: 50000
 `
 
+// runInit 执行 init 命令的核心逻辑：在 ~/.hydra/ 目录下创建默认配置文件。
+// 如果配置文件已存在，会提示用户确认是否覆盖，防止意外丢失自定义配置。
+// 配置文件路径固定为 ~/.hydra/config.yaml，这也是 Hydra 默认查找配置的位置。
 func runInit(cmd *cobra.Command, args []string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -81,7 +94,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	configDir := filepath.Join(home, ".hydra")
 	configPath := filepath.Join(configDir, "config.yaml")
 
-	// Check if config already exists
+	// 检查配置文件是否已存在，避免用户意外覆盖已有的自定义配置
 	if _, err := os.Stat(configPath); err == nil {
 		color.Yellow("Config file already exists: %s", configPath)
 		fmt.Print("Overwrite? (y/N): ")
@@ -93,10 +106,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// 确保配置目录存在，如果不存在则递归创建
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
+	// 将默认配置写入文件
 	if err := os.WriteFile(configPath, []byte(defaultConfig), 0644); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
