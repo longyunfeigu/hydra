@@ -17,15 +17,17 @@ import (
 // ClaudeCodeProvider implements AIProvider and SessionProvider using the Claude Code CLI.
 // Uses --output-format json/stream-json for structured output and session ID extraction.
 type ClaudeCodeProvider struct {
-	cwd     string
-	timeout time.Duration
-	session CliSessionHelper
+	cwd             string
+	timeout         time.Duration
+	session         CliSessionHelper
+	skipPermissions bool
 }
 
 // NewClaudeCodeProvider creates a new ClaudeCodeProvider.
 func NewClaudeCodeProvider() *ClaudeCodeProvider {
 	return &ClaudeCodeProvider{
-		timeout: 15 * time.Minute,
+		timeout:         15 * time.Minute,
+		skipPermissions: true,
 	}
 }
 
@@ -45,13 +47,14 @@ func (p *ClaudeCodeProvider) ShouldSendFullHistory() bool  { return p.session.Sh
 
 func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, _ *ChatOptions) (string, error) {
 	return WithRetry(func() (string, error) {
+		snap := p.session.Snapshot()
 		var prompt string
-		if p.session.ShouldSendFullHistory() {
+		if snap.ShouldSendFull() {
 			prompt = p.session.BuildPrompt(messages, systemPrompt)
 		} else {
 			prompt = p.session.BuildPromptLastOnly(messages)
 		}
-		result, err := p.runClaude(ctx, prompt, systemPrompt)
+		result, err := p.runClaude(ctx, prompt, systemPrompt, snap)
 		if err != nil {
 			return "", err
 		}
@@ -61,8 +64,9 @@ func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, syste
 }
 
 func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message, systemPrompt string) (<-chan string, <-chan error) {
+	snap := p.session.Snapshot()
 	var prompt string
-	if p.session.ShouldSendFullHistory() {
+	if snap.ShouldSendFull() {
 		prompt = p.session.BuildPrompt(messages, systemPrompt)
 	} else {
 		prompt = p.session.BuildPromptLastOnly(messages)
@@ -75,7 +79,7 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 		defer close(chunks)
 		defer close(errs)
 
-		err := p.runClaudeStream(ctx, prompt, systemPrompt, chunks)
+		err := p.runClaudeStream(ctx, prompt, systemPrompt, snap, chunks)
 		if err != nil {
 			errs <- err
 			return
@@ -87,8 +91,13 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 }
 
 // buildArgs constructs CLI arguments for the claude command.
-func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool) []string {
-	args := []string{"-p", "-", "--dangerously-skip-permissions"}
+// Uses a SessionSnapshot for atomic reads of correlated session state.
+func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool, snap SessionSnapshot) []string {
+	args := []string{"-p", "-"}
+
+	if p.skipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	}
 
 	if streaming {
 		args = append(args, "--output-format", "stream-json")
@@ -96,10 +105,9 @@ func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool) []st
 		args = append(args, "--output-format", "json")
 	}
 
-	sid := p.session.SessionID()
-	if sid != "" && !p.session.IsFirstMessage() {
+	if snap.ID != "" && !snap.FirstMessage {
 		// Resume existing session (system prompt remembered from first call)
-		args = append(args, "--resume", sid)
+		args = append(args, "--resume", snap.ID)
 	} else if systemPrompt != "" {
 		// First message or no session: pass system prompt
 		args = append(args, "--system-prompt", systemPrompt)
@@ -147,8 +155,8 @@ type claudeContent struct {
 
 // runClaude executes claude CLI with --output-format json (non-streaming).
 // The output is a JSON array: [system_event, assistant_event, result_event].
-func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt string) (string, error) {
-	args := p.buildArgs(systemPrompt, false)
+func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt string, snap SessionSnapshot) (string, error) {
+	args := p.buildArgs(systemPrompt, false, snap)
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Env = filterClaudeEnv()
 	if p.cwd != "" {
@@ -168,7 +176,7 @@ func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt
 	// Parse JSON array output
 	var events []claudeEvent
 	if err := json.Unmarshal(stdout.Bytes(), &events); err != nil {
-		// Fallback: treat as plain text
+		util.Warnf("claude CLI output is not valid JSON array, falling back to plain text: %v", err)
 		return strings.TrimSpace(stdout.String()), nil
 	}
 
@@ -197,8 +205,8 @@ func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt
 
 // runClaudeStream executes claude CLI with --output-format stream-json.
 // Output is JSONL: one event per line, parsed as they arrive.
-func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, systemPrompt string, chunks chan<- string) error {
-	args := p.buildArgs(systemPrompt, true)
+func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, systemPrompt string, snap SessionSnapshot, chunks chan<- string) error {
+	args := p.buildArgs(systemPrompt, true, snap)
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Env = filterClaudeEnv()
 	if p.cwd != "" {
@@ -310,6 +318,7 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 func (p *ClaudeCodeProvider) handleStreamEvent(line string, chunks chan<- string) {
 	var event claudeEvent
 	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		util.Warnf("claude stream: failed to parse JSONL line: %v", err)
 		return
 	}
 

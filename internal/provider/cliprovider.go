@@ -35,6 +35,29 @@ func (h *CliSessionHelper) End() {
 	h.sessionName = ""
 }
 
+// SessionSnapshot captures session state atomically to prevent TOCTOU races.
+type SessionSnapshot struct {
+	ID           string
+	FirstMessage bool
+	Name         string
+}
+
+// ShouldSendFull returns whether full history should be sent based on this snapshot.
+func (s SessionSnapshot) ShouldSendFull() bool {
+	return !(s.ID != "" && !s.FirstMessage)
+}
+
+// Snapshot returns an atomic snapshot of all session state.
+func (h *CliSessionHelper) Snapshot() SessionSnapshot {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return SessionSnapshot{
+		ID:           h.sessionID,
+		FirstMessage: h.firstMessage,
+		Name:         h.sessionName,
+	}
+}
+
 // SessionID returns the current session ID.
 func (h *CliSessionHelper) SessionID() string {
 	h.mu.Lock()

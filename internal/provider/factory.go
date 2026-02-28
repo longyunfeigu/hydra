@@ -16,11 +16,17 @@ func CreateProvider(model string, cfg *config.HydraConfig) (AIProvider, error) {
 		return NewMockProvider(), nil
 	}
 
+	skipPerms := cfg.Defaults.SkipPermissions != nil && *cfg.Defaults.SkipPermissions
+
 	switch {
 	case model == "claude-code":
-		return NewClaudeCodeProvider(), nil
+		p := NewClaudeCodeProvider()
+		p.skipPermissions = skipPerms
+		return p, nil
 	case model == "codex-cli":
-		return NewCodexCliProvider(), nil
+		p := NewCodexCliProvider()
+		p.skipPermissions = skipPerms
+		return p, nil
 	case strings.HasPrefix(model, "mock"):
 		return NewMockProvider(), nil
 	default:

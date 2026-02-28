@@ -33,6 +33,7 @@ type DefaultsConfig struct {
 	MaxRounds        int    `yaml:"max_rounds"`
 	OutputFormat     string `yaml:"output_format"`
 	CheckConvergence bool   `yaml:"check_convergence"`
+	SkipPermissions  *bool  `yaml:"skip_permissions,omitempty"`
 }
 
 // ReviewerConfig defines a reviewer/analyzer/summarizer.
@@ -115,6 +116,12 @@ func LoadConfig(configPath string) (*HydraConfig, error) {
 	}
 
 	expandEnvVarsInConfig(&cfg)
+
+	// Default skip_permissions to true (required for non-interactive CLI operation)
+	if cfg.Defaults.SkipPermissions == nil {
+		t := true
+		cfg.Defaults.SkipPermissions = &t
+	}
 
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err

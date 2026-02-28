@@ -9,20 +9,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/guwanhua/hydra/internal/util"
 )
 
 // CodexCliProvider implements AIProvider and SessionProvider using the Codex CLI.
 type CodexCliProvider struct {
-	cwd            string
-	timeout        time.Duration
-	session        CliSessionHelper
-	sessionEnabled bool
+	cwd             string
+	timeout         time.Duration
+	session         CliSessionHelper
+	sessionEnabled  bool
+	skipPermissions bool
 }
 
 // NewCodexCliProvider creates a new CodexCliProvider.
 func NewCodexCliProvider() *CodexCliProvider {
 	return &CodexCliProvider{
-		timeout: 15 * time.Minute,
+		timeout:         15 * time.Minute,
+		skipPermissions: true,
 	}
 }
 
@@ -51,13 +55,14 @@ func (p *CodexCliProvider) ShouldSendFullHistory() bool { return p.session.Shoul
 
 func (p *CodexCliProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, opts *ChatOptions) (string, error) {
 	return WithRetry(func() (string, error) {
+		snap := p.session.Snapshot()
 		var prompt string
-		if p.sessionEnabled && !p.session.ShouldSendFullHistory() {
+		if p.sessionEnabled && !snap.ShouldSendFull() {
 			prompt = p.session.BuildPromptLastOnly(messages)
 		} else {
 			prompt = p.session.BuildPrompt(messages, systemPrompt)
 		}
-		result, err := p.runCodex(ctx, prompt)
+		result, err := p.runCodex(ctx, prompt, snap)
 		if err != nil {
 			return "", err
 		}
@@ -67,8 +72,9 @@ func (p *CodexCliProvider) Chat(ctx context.Context, messages []Message, systemP
 }
 
 func (p *CodexCliProvider) ChatStream(ctx context.Context, messages []Message, systemPrompt string) (<-chan string, <-chan error) {
+	snap := p.session.Snapshot()
 	var prompt string
-	if p.sessionEnabled && !p.session.ShouldSendFullHistory() {
+	if p.sessionEnabled && !snap.ShouldSendFull() {
 		prompt = p.session.BuildPromptLastOnly(messages)
 	} else {
 		prompt = p.session.BuildPrompt(messages, systemPrompt)
@@ -81,7 +87,7 @@ func (p *CodexCliProvider) ChatStream(ctx context.Context, messages []Message, s
 		defer close(chunks)
 		defer close(errs)
 
-		err := p.runCodexStream(ctx, prompt, chunks)
+		err := p.runCodexStream(ctx, prompt, snap, chunks)
 		if err != nil {
 			errs <- err
 			return
@@ -92,11 +98,15 @@ func (p *CodexCliProvider) ChatStream(ctx context.Context, messages []Message, s
 	return chunks, errs
 }
 
-func (p *CodexCliProvider) buildArgs() []string {
-	baseArgs := []string{"--json", "--dangerously-bypass-approvals-and-sandbox"}
-	sid := p.session.SessionID()
-	if p.sessionEnabled && sid != "" {
-		return append([]string{"exec", "resume", sid}, append(baseArgs, "-")...)
+// buildArgs constructs CLI arguments for the codex command.
+// Uses a SessionSnapshot for atomic reads of correlated session state.
+func (p *CodexCliProvider) buildArgs(snap SessionSnapshot) []string {
+	baseArgs := []string{"--json"}
+	if p.skipPermissions {
+		baseArgs = append(baseArgs, "--dangerously-bypass-approvals-and-sandbox")
+	}
+	if p.sessionEnabled && snap.ID != "" {
+		return append([]string{"exec", "resume", snap.ID}, append(baseArgs, "-")...)
 	}
 	return append([]string{"exec"}, append(baseArgs, "-")...)
 }
@@ -123,6 +133,7 @@ func (p *CodexCliProvider) parseJsonlOutput(output string) string {
 		}
 		var event codexEvent
 		if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
+			util.Warnf("codex: failed to parse JSONL line: %v", err)
 			continue
 		}
 		if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
@@ -134,8 +145,8 @@ func (p *CodexCliProvider) parseJsonlOutput(output string) string {
 	return text
 }
 
-func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string) (string, error) {
-	args := p.buildArgs()
+func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string, snap SessionSnapshot) (string, error) {
+	args := p.buildArgs(snap)
 	cmd := exec.CommandContext(ctx, "codex", args...)
 	if p.cwd != "" {
 		cmd.Dir = p.cwd
@@ -154,8 +165,8 @@ func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string) (string,
 	return p.parseJsonlOutput(stdout.String()), nil
 }
 
-func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, chunks chan<- string) error {
-	args := p.buildArgs()
+func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, snap SessionSnapshot, chunks chan<- string) error {
+	args := p.buildArgs(snap)
 	cmd := exec.CommandContext(ctx, "codex", args...)
 	if p.cwd != "" {
 		cmd.Dir = p.cwd
@@ -246,6 +257,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, ch
 
 				var event codexEvent
 				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					util.Warnf("codex stream: failed to parse JSONL line: %v", err)
 					continue
 				}
 				if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
