@@ -5,19 +5,21 @@ import (
 	"sync"
 )
 
-// CliSessionHelper provides shared session management for CLI-based providers.
-// Session IDs are NOT generated upfront — each CLI provider extracts the real
-// session/thread ID from its first response (stream-json for Claude, JSONL for Codex).
-// All sessionID access is mutex-protected for safe concurrent use from streaming goroutines.
+// CliSessionHelper 为 CLI 类提供者（claude-code、codex-cli）提供共享的会话管理。
+//
+// 会话 ID 不是预先生成的，而是由各 CLI 的首次响应中提取：
+//   - Claude Code: 从 stream-json 事件的 session_id 字段获取
+//   - Codex CLI:   从 JSONL 的 thread.started 事件的 thread_id 字段获取
+//
+// 所有字段的访问都通过 mutex 保护，因为流式读取在独立的 goroutine 中进行。
 type CliSessionHelper struct {
 	mu           sync.Mutex
-	sessionID    string
-	firstMessage bool
-	sessionName  string
+	sessionID    string // 由 CLI 响应设置，初始为空
+	firstMessage bool   // 是否还未发送过消息
+	sessionName  string // 会话名称，用于 prompt 中标识
 }
 
-// Start begins a new session with the given name.
-// Session ID starts empty and will be set by the provider after the first response.
+// Start 开始一个新会话。sessionID 初始为空，等待首次 CLI 响应来设置。
 func (h *CliSessionHelper) Start(name string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -26,7 +28,7 @@ func (h *CliSessionHelper) Start(name string) {
 	h.sessionName = name
 }
 
-// End clears the current session.
+// End 结束当前会话，清除所有状态。
 func (h *CliSessionHelper) End() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -35,19 +37,24 @@ func (h *CliSessionHelper) End() {
 	h.sessionName = ""
 }
 
-// SessionSnapshot captures session state atomically to prevent TOCTOU races.
+// SessionSnapshot 原子快照，解决 TOCTOU 竞态问题。
+//
+// 问题：如果分别调用 SessionID() 和 IsFirstMessage()，两次锁之间
+// 可能有其他 goroutine 修改了状态，导致读到不一致的值。
+// 解决：一次性在同一把锁下读取所有相关字段。
 type SessionSnapshot struct {
 	ID           string
 	FirstMessage bool
 	Name         string
 }
 
-// ShouldSendFull returns whether full history should be sent based on this snapshot.
+// ShouldSendFull 根据快照判断是否需要发送完整历史。
+// 当没有活跃会话（ID 为空）或是首条消息时，返回 true。
 func (s SessionSnapshot) ShouldSendFull() bool {
 	return !(s.ID != "" && !s.FirstMessage)
 }
 
-// Snapshot returns an atomic snapshot of all session state.
+// Snapshot 原子地获取会话的所有状态，用于后续的 prompt 构建和参数构建。
 func (h *CliSessionHelper) Snapshot() SessionSnapshot {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -58,42 +65,43 @@ func (h *CliSessionHelper) Snapshot() SessionSnapshot {
 	}
 }
 
-// SessionID returns the current session ID.
+// SessionID 返回当前会话 ID。
 func (h *CliSessionHelper) SessionID() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.sessionID
 }
 
-// SetSessionID sets the session ID (called by providers after parsing CLI response).
+// SetSessionID 设置会话 ID（由 provider 解析 CLI 响应后调用）。
 func (h *CliSessionHelper) SetSessionID(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.sessionID = id
 }
 
-// IsFirstMessage returns whether the next message is the first in the session.
+// IsFirstMessage 返回下一条消息是否为会话中的第一条。
 func (h *CliSessionHelper) IsFirstMessage() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.firstMessage
 }
 
-// ShouldSendFullHistory returns true if there is no active session or this is the first message.
+// ShouldSendFullHistory 判断是否需要发送完整历史。
 func (h *CliSessionHelper) ShouldSendFullHistory() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return !(h.sessionID != "" && !h.firstMessage)
 }
 
-// MarkMessageSent marks that a message has been sent in the current session.
+// MarkMessageSent 标记已发送一条消息，后续消息将走增量模式。
 func (h *CliSessionHelper) MarkMessageSent() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.firstMessage = false
 }
 
-// BuildPrompt builds the full prompt from messages and system prompt for first call or non-session mode.
+// BuildPrompt 构建完整的 prompt（包含系统提示 + 所有消息历史）。
+// 用于首次调用或非会话模式。
 func (h *CliSessionHelper) BuildPrompt(messages []Message, systemPrompt string) string {
 	h.mu.Lock()
 	name := h.sessionName
@@ -113,7 +121,8 @@ func (h *CliSessionHelper) BuildPrompt(messages []Message, systemPrompt string) 
 	return prompt
 }
 
-// BuildPromptLastOnly returns only the last user message content for session continuation.
+// BuildPromptLastOnly 仅返回最后一条 user 消息的内容。
+// 用于会话续传模式，因为 CLI 已记住之前的上下文。
 func (h *CliSessionHelper) BuildPromptLastOnly(messages []Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
