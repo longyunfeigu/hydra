@@ -3,14 +3,19 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/guwanhua/hydra/internal/util"
 )
 
 // ClaudeCodeProvider implements AIProvider and SessionProvider using the Claude Code CLI.
+// Uses --output-format json/stream-json for structured output and session ID extraction.
 type ClaudeCodeProvider struct {
 	cwd     string
 	timeout time.Duration
@@ -31,14 +36,14 @@ func (p *ClaudeCodeProvider) SetCwd(cwd string) {
 
 func (p *ClaudeCodeProvider) Name() string { return "claude-code" }
 
-func (p *ClaudeCodeProvider) StartSession(name string)  { p.session.Start(name) }
-func (p *ClaudeCodeProvider) EndSession()                { p.session.End() }
-func (p *ClaudeCodeProvider) SessionID() string          { return p.session.SessionID() }
-func (p *ClaudeCodeProvider) IsFirstMessage() bool       { return p.session.IsFirstMessage() }
-func (p *ClaudeCodeProvider) MarkMessageSent()           { p.session.MarkMessageSent() }
-func (p *ClaudeCodeProvider) ShouldSendFullHistory() bool { return p.session.ShouldSendFullHistory() }
+func (p *ClaudeCodeProvider) StartSession(name string)    { p.session.Start(name) }
+func (p *ClaudeCodeProvider) EndSession()                  { p.session.End() }
+func (p *ClaudeCodeProvider) SessionID() string            { return p.session.SessionID() }
+func (p *ClaudeCodeProvider) IsFirstMessage() bool         { return p.session.IsFirstMessage() }
+func (p *ClaudeCodeProvider) MarkMessageSent()             { p.session.MarkMessageSent() }
+func (p *ClaudeCodeProvider) ShouldSendFullHistory() bool  { return p.session.ShouldSendFullHistory() }
 
-func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, opts *ChatOptions) (string, error) {
+func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, _ *ChatOptions) (string, error) {
 	return WithRetry(func() (string, error) {
 		var prompt string
 		if p.session.ShouldSendFullHistory() {
@@ -46,7 +51,7 @@ func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, syste
 		} else {
 			prompt = p.session.BuildPromptLastOnly(messages)
 		}
-		result, err := p.runClaude(ctx, prompt, systemPrompt, opts)
+		result, err := p.runClaude(ctx, prompt, systemPrompt)
 		if err != nil {
 			return "", err
 		}
@@ -81,31 +86,71 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 	return chunks, errs
 }
 
-func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, opts *ChatOptions) []string {
+// buildArgs constructs CLI arguments for the claude command.
+func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool) []string {
 	args := []string{"-p", "-", "--dangerously-skip-permissions"}
 
-	if opts != nil && opts.DisableTools {
-		args = append(args, "--tools", "")
+	if streaming {
+		args = append(args, "--output-format", "stream-json")
+	} else {
+		args = append(args, "--output-format", "json")
 	}
 
 	sid := p.session.SessionID()
-	if sid != "" {
-		if p.session.IsFirstMessage() {
-			args = append(args, "--session-id", sid)
-			if systemPrompt != "" {
-				args = append(args, "--system-prompt", systemPrompt)
-			}
-		} else {
-			args = append(args, "--resume", sid)
-		}
+	if sid != "" && !p.session.IsFirstMessage() {
+		// Resume existing session (system prompt remembered from first call)
+		args = append(args, "--resume", sid)
+	} else if systemPrompt != "" {
+		// First message or no session: pass system prompt
+		args = append(args, "--system-prompt", systemPrompt)
 	}
 
 	return args
 }
 
-func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt string, opts *ChatOptions) (string, error) {
-	args := p.buildArgs(systemPrompt, opts)
+// filterClaudeEnv returns os.Environ() with CLAUDECODE removed, so nested
+// claude processes don't fail with "cannot launch inside another session".
+func filterClaudeEnv() []string {
+	var env []string
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
+			env = append(env, e)
+		}
+	}
+	return env
+}
+
+// Claude CLI JSON event types.
+//
+// --output-format json: JSON array  [system, assistant, result]
+// --output-format stream-json: JSONL (one event per line)
+//
+// assistant event: {"type":"assistant","message":{"content":[{"text":"..."}]},"session_id":"..."}
+// result event:    {"type":"result","subtype":"success","result":"...","session_id":"..."}
+type claudeEvent struct {
+	Type      string         `json:"type"`
+	Subtype   string         `json:"subtype,omitempty"`
+	SessionID string         `json:"session_id,omitempty"`
+	Result    string         `json:"result,omitempty"`
+	IsError   bool           `json:"is_error,omitempty"`
+	Message   *claudeMessage `json:"message,omitempty"`
+}
+
+type claudeMessage struct {
+	Content []claudeContent `json:"content"`
+}
+
+type claudeContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// runClaude executes claude CLI with --output-format json (non-streaming).
+// The output is a JSON array: [system_event, assistant_event, result_event].
+func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt string) (string, error) {
+	args := p.buildArgs(systemPrompt, false)
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Env = filterClaudeEnv()
 	if p.cwd != "" {
 		cmd.Dir = p.cwd
 	}
@@ -120,12 +165,42 @@ func (p *ClaudeCodeProvider) runClaude(ctx context.Context, prompt, systemPrompt
 		return "", fmt.Errorf("claude CLI failed: %w: %s", err, stderr.String())
 	}
 
+	// Parse JSON array output
+	var events []claudeEvent
+	if err := json.Unmarshal(stdout.Bytes(), &events); err != nil {
+		// Fallback: treat as plain text
+		return strings.TrimSpace(stdout.String()), nil
+	}
+
+	// Extract session ID and result from events
+	for _, ev := range events {
+		if ev.SessionID != "" {
+			p.session.SetSessionID(ev.SessionID)
+		}
+		if ev.Type == "result" {
+			if ev.IsError {
+				return "", fmt.Errorf("claude returned error: %s", ev.Result)
+			}
+			return ev.Result, nil
+		}
+	}
+
+	// Fallback: extract text from assistant event
+	for _, ev := range events {
+		if ev.Type == "assistant" && ev.Message != nil {
+			return extractTextFromContent(ev.Message.Content), nil
+		}
+	}
+
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// runClaudeStream executes claude CLI with --output-format stream-json.
+// Output is JSONL: one event per line, parsed as they arrive.
 func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, systemPrompt string, chunks chan<- string) error {
-	args := p.buildArgs(systemPrompt, nil)
+	args := p.buildArgs(systemPrompt, true)
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Env = filterClaudeEnv()
 	if p.cwd != "" {
 		cmd.Dir = p.cwd
 	}
@@ -191,21 +266,82 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 		}
 	}()
 
-	// Read stdout and send chunks
+	// Read stdout with JSONL line buffering
+	var lineBuf string
 	buf := make([]byte, 4096)
 	for {
 		n, readErr := stdoutPipe.Read(buf)
 		if n > 0 {
 			updateActivity()
-			chunks <- string(buf[:n])
+			lineBuf += string(buf[:n])
+
+			for {
+				idx := strings.Index(lineBuf, "\n")
+				if idx < 0 {
+					break
+				}
+				line := strings.TrimSpace(lineBuf[:idx])
+				lineBuf = lineBuf[idx+1:]
+
+				if line == "" {
+					continue
+				}
+
+				p.handleStreamEvent(line, chunks)
+			}
 		}
 		if readErr != nil {
 			break
 		}
 	}
 
+	// Process remaining buffer
+	if trimmed := strings.TrimSpace(lineBuf); trimmed != "" {
+		p.handleStreamEvent(trimmed, chunks)
+	}
+
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("claude CLI exited with error: %w", err)
 	}
 	return nil
+}
+
+// handleStreamEvent parses a single stream-json line and dispatches accordingly.
+func (p *ClaudeCodeProvider) handleStreamEvent(line string, chunks chan<- string) {
+	var event claudeEvent
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		return
+	}
+
+	// Always capture session ID from any event that has one
+	if event.SessionID != "" {
+		p.session.SetSessionID(event.SessionID)
+	}
+
+	switch event.Type {
+	case "assistant":
+		// Complete assistant message — extract text and send as chunk
+		if event.Message != nil {
+			if text := extractTextFromContent(event.Message.Content); text != "" {
+				chunks <- text
+			}
+		}
+	case "result":
+		// Final result — session_id already captured above.
+		// Don't re-send text since it was already sent via assistant event.
+		if event.IsError {
+			util.Warnf("claude stream returned error result: %s", event.Result)
+		}
+	}
+}
+
+// extractTextFromContent joins all text blocks from a Claude message content array.
+func extractTextFromContent(content []claudeContent) string {
+	var parts []string
+	for _, c := range content {
+		if c.Type == "text" && c.Text != "" {
+			parts = append(parts, c.Text)
+		}
+	}
+	return strings.Join(parts, "")
 }

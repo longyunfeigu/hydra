@@ -36,7 +36,7 @@ func (p *CodexCliProvider) Name() string { return "codex-cli" }
 func (p *CodexCliProvider) StartSession(name string) {
 	p.sessionEnabled = true
 	p.session.Start(name)
-	p.session.sessionID = "" // Will be set from first response's JSONL
+	// session.sessionID starts empty; will be set from first response's thread.started JSONL event
 }
 
 func (p *CodexCliProvider) EndSession() {
@@ -126,7 +126,7 @@ func (p *CodexCliProvider) parseJsonlOutput(output string) string {
 			continue
 		}
 		if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
-			p.session.sessionID = event.ThreadID
+			p.session.SetSessionID(event.ThreadID)
 		} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
 			text += event.Item.Text
 		}
@@ -249,7 +249,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, ch
 					continue
 				}
 				if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
-					p.session.sessionID = event.ThreadID
+					p.session.SetSessionID(event.ThreadID)
 				} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
 					chunks <- event.Item.Text
 				}
@@ -265,7 +265,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, ch
 		var event codexEvent
 		if err := json.Unmarshal([]byte(trimmed), &event); err == nil {
 			if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
-				p.session.sessionID = event.ThreadID
+				p.session.SetSessionID(event.ThreadID)
 			} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
 				chunks <- event.Item.Text
 			}
