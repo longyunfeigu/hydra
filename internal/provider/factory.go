@@ -9,39 +9,52 @@ import (
 	"github.com/guwanhua/hydra/internal/config"
 )
 
-// CreateProvider creates an AIProvider based on the model name and config.
+// CreateProvider 是 AI 提供者的工厂函数，根据模型名称和配置创建对应的 AIProvider 实例。
+// 支持的模型名称：
+//   - "claude-code"：使用 Claude Code CLI 作为后端
+//   - "codex-cli"：使用 OpenAI Codex CLI 作为后端
+//   - "mock*"：使用模拟提供者（用于测试）
+//
+// 如果全局 Mock 模式开启，则所有模型都会被替换为 MockProvider。
 func CreateProvider(model string, cfg *config.HydraConfig) (AIProvider, error) {
-	// Global mock mode: override all models to MockProvider
+	// 全局模拟模式：将所有模型替换为 MockProvider，用于测试和开发
 	if cfg.Mock {
 		return NewMockProvider(), nil
 	}
 
+	// 从配置中读取是否跳过 CLI 权限提示
 	skipPerms := cfg.Defaults.SkipPermissions != nil && *cfg.Defaults.SkipPermissions
 
 	switch {
 	case model == "claude-code":
+		// 创建 Claude Code CLI 提供者，通过调用 claude 命令行工具进行交互
 		p := NewClaudeCodeProvider()
 		p.skipPermissions = skipPerms
 		return p, nil
 	case model == "codex-cli":
+		// 创建 Codex CLI 提供者，通过调用 codex 命令行工具进行交互
 		p := NewCodexCliProvider()
 		p.skipPermissions = skipPerms
 		return p, nil
 	case strings.HasPrefix(model, "mock"):
+		// 以 "mock" 开头的模型名称均使用模拟提供者
 		return NewMockProvider(), nil
 	default:
 		return nil, fmt.Errorf("unknown provider model: %s", model)
 	}
 }
 
-// MockProvider is a test provider that returns canned responses.
+// MockProvider 是用于测试的模拟 AI 提供者。
+// 它不调用任何外部 CLI 工具，而是返回预设的固定响应，
+// 通过轮询方式循环返回不同的测试响应。线程安全。
 type MockProvider struct {
-	mu        sync.Mutex
-	responses []string
-	callCount int
+	mu        sync.Mutex // 保护并发访问的互斥锁
+	responses []string   // 预设的模拟响应列表
+	callCount int        // 调用计数器，用于轮询选择响应
 }
 
-// NewMockProvider creates a MockProvider with default test responses.
+// NewMockProvider 创建一个带有默认测试响应的 MockProvider。
+// 包含三个预设响应，模拟真实的审查、分析和汇总结果。
 func NewMockProvider() *MockProvider {
 	return &MockProvider{
 		responses: []string{
@@ -52,17 +65,21 @@ func NewMockProvider() *MockProvider {
 	}
 }
 
+// Name 返回提供者名称 "mock"。
 func (p *MockProvider) Name() string { return "mock" }
 
+// Chat 实现同步聊天接口。按轮询顺序返回预设响应，线程安全。
 func (p *MockProvider) Chat(_ context.Context, _ []Message, _ string, _ *ChatOptions) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 通过取模运算循环使用预设响应
 	idx := p.callCount % len(p.responses)
 	p.callCount++
 	return p.responses[idx], nil
 }
 
+// ChatStream 实现流式聊天接口。将预设响应作为单个数据块发送到 channel 中。
 func (p *MockProvider) ChatStream(_ context.Context, _ []Message, _ string) (<-chan string, <-chan error) {
 	chunks := make(chan string, 1)
 	errs := make(chan error, 1)
@@ -83,10 +100,11 @@ func (p *MockProvider) ChatStream(_ context.Context, _ []Message, _ string) (<-c
 	return chunks, errs
 }
 
-// SessionProvider interface methods for MockProvider.
-func (p *MockProvider) StartSession(_ string)        {}
-func (p *MockProvider) EndSession()                   {}
-func (p *MockProvider) SessionID() string             { return "mock-session" }
-func (p *MockProvider) IsFirstMessage() bool          { return true }
-func (p *MockProvider) MarkMessageSent()              {}
-func (p *MockProvider) ShouldSendFullHistory() bool   { return true }
+// 以下是 MockProvider 对 SessionProvider 接口的空实现。
+// MockProvider 不需要真正的会话管理，因此所有方法都是空操作或返回固定值。
+func (p *MockProvider) StartSession(_ string)        {} // 启动会话（空操作）
+func (p *MockProvider) EndSession()                   {} // 结束会话（空操作）
+func (p *MockProvider) SessionID() string             { return "mock-session" } // 返回固定的模拟会话 ID
+func (p *MockProvider) IsFirstMessage() bool          { return true }           // 始终返回 true
+func (p *MockProvider) MarkMessageSent()              {}                        // 标记消息已发送（空操作）
+func (p *MockProvider) ShouldSendFullHistory() bool   { return true }           // 始终发送完整历史

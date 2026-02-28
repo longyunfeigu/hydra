@@ -1,3 +1,7 @@
+// Package provider 的 codexcli.go 文件实现了基于 OpenAI Codex CLI 的 AI 提供者。
+// Codex CLI 是 OpenAI 提供的命令行工具，Hydra 通过子进程方式调用它，
+// 将提示词通过 stdin 传入，从 stdout 读取 JSONL 格式的响应。
+// 支持会话管理（通过 thread_id 实现多轮对话）和流式输出。
 package provider
 
 import (
@@ -13,16 +17,19 @@ import (
 	"github.com/guwanhua/hydra/internal/util"
 )
 
-// CodexCliProvider implements AIProvider and SessionProvider using the Codex CLI.
+// CodexCliProvider 实现了基于 Codex CLI 命令行工具的 AIProvider 和 SessionProvider 接口。
+// 它通过创建子进程调用 `codex` 命令，使用 JSONL 格式进行数据交换。
+// 支持会话恢复（resume）功能，通过 thread_id 维持多轮对话的上下文。
 type CodexCliProvider struct {
-	cwd             string
-	timeout         time.Duration
-	session         CliSessionHelper
-	sessionEnabled  bool
-	skipPermissions bool
+	cwd             string           // CLI 命令的工作目录，决定 codex 在哪个目录下执行
+	timeout         time.Duration    // 无活动超时时间，超过此时间将终止 CLI 进程
+	session         CliSessionHelper // 会话辅助器，管理会话状态和提示词构建
+	sessionEnabled  bool             // 是否启用会话模式（支持多轮对话）
+	skipPermissions bool             // 是否跳过 CLI 的权限确认提示
 }
 
-// NewCodexCliProvider creates a new CodexCliProvider.
+// NewCodexCliProvider 创建一个新的 CodexCliProvider 实例。
+// 默认超时时间为 15 分钟，默认跳过权限提示。
 func NewCodexCliProvider() *CodexCliProvider {
 	return &CodexCliProvider{
 		timeout:         15 * time.Minute,
@@ -30,36 +37,51 @@ func NewCodexCliProvider() *CodexCliProvider {
 	}
 }
 
-// SetCwd sets the working directory for CLI invocations.
+// SetCwd 设置 CLI 调用时的工作目录。
+// 这决定了 Codex CLI 在哪个目录下执行代码审查，通常设置为被审查项目的根目录。
 func (p *CodexCliProvider) SetCwd(cwd string) {
 	p.cwd = cwd
 }
 
+// Name 返回提供者名称 "codex-cli"。
 func (p *CodexCliProvider) Name() string { return "codex-cli" }
 
+// StartSession 启动一个新的会话。
+// 会话 ID 初始为空，将在收到第一个响应中的 thread.started JSONL 事件后自动设置。
+// 后续请求将使用此 thread_id 来恢复会话（resume），实现多轮对话。
 func (p *CodexCliProvider) StartSession(name string) {
 	p.sessionEnabled = true
 	p.session.Start(name)
-	// session.sessionID starts empty; will be set from first response's thread.started JSONL event
 }
 
+// EndSession 结束当前会话，清理会话状态。
 func (p *CodexCliProvider) EndSession() {
 	p.sessionEnabled = false
 	p.session.End()
 }
 
+// SessionID 返回当前会话的 thread_id。
 func (p *CodexCliProvider) SessionID() string          { return p.session.SessionID() }
+// IsFirstMessage 返回当前是否是会话中的第一条消息。
 func (p *CodexCliProvider) IsFirstMessage() bool       { return p.session.IsFirstMessage() }
+// MarkMessageSent 标记一条消息已发送，更新会话状态。
 func (p *CodexCliProvider) MarkMessageSent()           { p.session.MarkMessageSent() }
+// ShouldSendFullHistory 返回是否需要发送完整的消息历史（首次消息时需要）。
 func (p *CodexCliProvider) ShouldSendFullHistory() bool { return p.session.ShouldSendFullHistory() }
 
+// Chat 实现同步聊天接口，将消息发送给 Codex CLI 并等待完整响应。
+// 内置重试机制（WithRetry），对暂时性错误（超时、限流等）自动重试。
+// 在会话模式下，非首次消息只发送最新消息（利用 CLI 的 resume 功能保持上下文）。
 func (p *CodexCliProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, opts *ChatOptions) (string, error) {
 	return WithRetry(func() (string, error) {
+		// 获取会话状态的原子快照，避免并发读取不一致
 		snap := p.session.Snapshot()
 		var prompt string
 		if p.sessionEnabled && !snap.ShouldSendFull() {
+			// 会话已建立且非首次消息：只发送最新一条消息，CLI 通过 thread_id 恢复上下文
 			prompt = p.session.BuildPromptLastOnly(messages)
 		} else {
+			// 首次消息或无会话：发送完整的消息历史和系统提示词
 			prompt = p.session.BuildPrompt(messages, systemPrompt)
 		}
 		result, err := p.runCodex(ctx, prompt, snap)
@@ -71,17 +93,22 @@ func (p *CodexCliProvider) Chat(ctx context.Context, messages []Message, systemP
 	}, nil)
 }
 
+// ChatStream 实现流式聊天接口，将消息发送给 Codex CLI 并通过 channel 逐步返回响应片段。
+// 流式模式下，响应内容会被实时解析并发送，适合需要即时反馈的场景。
 func (p *CodexCliProvider) ChatStream(ctx context.Context, messages []Message, systemPrompt string) (<-chan string, <-chan error) {
+	// 获取会话状态的原子快照
 	snap := p.session.Snapshot()
 	var prompt string
 	if p.sessionEnabled && !snap.ShouldSendFull() {
+		// 会话续接模式：只发送最新消息
 		prompt = p.session.BuildPromptLastOnly(messages)
 	} else {
+		// 完整模式：发送所有消息历史
 		prompt = p.session.BuildPrompt(messages, systemPrompt)
 	}
 
-	chunks := make(chan string, 64)
-	errs := make(chan error, 1)
+	chunks := make(chan string, 64) // 响应片段缓冲 channel
+	errs := make(chan error, 1)     // 错误 channel
 
 	go func() {
 		defer close(chunks)
@@ -98,32 +125,48 @@ func (p *CodexCliProvider) ChatStream(ctx context.Context, messages []Message, s
 	return chunks, errs
 }
 
-// buildArgs constructs CLI arguments for the codex command.
-// Uses a SessionSnapshot for atomic reads of correlated session state.
+// buildArgs 构建 Codex CLI 的命令行参数。
+// 使用 SessionSnapshot 的原子快照来避免并发读取会话状态时的数据不一致。
+//
+// 生成的命令格式：
+//   - 新会话：codex exec --json [--dangerously-bypass-approvals-and-sandbox] -
+//   - 恢复会话：codex exec resume <thread_id> --json [--dangerously-bypass-approvals-and-sandbox] -
+//
+// 末尾的 "-" 表示从 stdin 读取输入（提示词）。
 func (p *CodexCliProvider) buildArgs(snap SessionSnapshot) []string {
-	baseArgs := []string{"--json"}
+	baseArgs := []string{"--json"} // 输出 JSONL 格式，便于程序解析
 	if p.skipPermissions {
+		// 跳过所有权限确认和沙箱限制，允许非交互式运行
 		baseArgs = append(baseArgs, "--dangerously-bypass-approvals-and-sandbox")
 	}
 	if p.sessionEnabled && snap.ID != "" {
+		// 已有会话 ID：使用 resume 子命令恢复之前的对话线程
 		return append([]string{"exec", "resume", snap.ID}, append(baseArgs, "-")...)
 	}
+	// 无会话 ID：启动新的执行
 	return append([]string{"exec"}, append(baseArgs, "-")...)
 }
 
-// codexEvent represents a JSONL event from Codex CLI output.
+// codexEvent 表示 Codex CLI 输出的一个 JSONL 事件。
+// Codex CLI 以 JSONL（每行一个 JSON 对象）格式输出事件流，主要事件类型包括：
+//   - "thread.started"：线程启动事件，包含 thread_id 用于后续会话恢复
+//   - "item.completed"：内容完成事件，包含 AI 生成的消息文本
 type codexEvent struct {
-	Type     string         `json:"type"`
-	ThreadID string         `json:"thread_id,omitempty"`
-	Item     *codexItemData `json:"item,omitempty"`
+	Type     string         `json:"type"`               // 事件类型
+	ThreadID string         `json:"thread_id,omitempty"` // 线程 ID（仅 thread.started 事件包含）
+	Item     *codexItemData `json:"item,omitempty"`      // 事件数据（仅 item.completed 事件包含）
 }
 
+// codexItemData 表示 Codex 事件中的数据项内容。
 type codexItemData struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type string `json:"type"` // 数据项类型（如 "agent_message"）
+	Text string `json:"text"` // AI 生成的文本内容
 }
 
-// parseJsonlOutput parses JSONL output, extracting thread_id and agent_message text.
+// parseJsonlOutput 解析 Codex CLI 的 JSONL 输出，提取会话 ID 和 AI 生成的消息文本。
+// 逐行解析 JSON 对象，处理两种关键事件：
+//   - thread.started：提取 thread_id 并保存到会话中，用于后续的会话恢复
+//   - item.completed（agent_message 类型）：提取 AI 的回复文本并拼接
 func (p *CodexCliProvider) parseJsonlOutput(output string) string {
 	var text string
 	for _, line := range strings.Split(output, "\n") {
@@ -136,15 +179,20 @@ func (p *CodexCliProvider) parseJsonlOutput(output string) string {
 			util.Warnf("codex: failed to parse JSONL line: %v", err)
 			continue
 		}
+		// 捕获线程启动事件，保存 thread_id 以便后续恢复会话
 		if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
 			p.session.SetSessionID(event.ThreadID)
 		} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
+			// 提取 AI 代理消息的文本内容
 			text += event.Item.Text
 		}
 	}
 	return text
 }
 
+// runCodex 以同步方式运行 Codex CLI，等待命令完成后返回完整的响应文本。
+// 通过 stdin 传入提示词，从 stdout 读取 JSONL 输出并解析。
+// 执行过程：创建子进程 -> 写入 stdin -> 等待完成 -> 解析 JSONL 输出。
 func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string, snap SessionSnapshot) (string, error) {
 	args := p.buildArgs(snap)
 	cmd := exec.CommandContext(ctx, "codex", args...)
@@ -152,6 +200,7 @@ func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string, snap Ses
 		cmd.Dir = p.cwd
 	}
 
+	// 将提示词通过 stdin 传递给 codex 命令
 	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr bytes.Buffer
@@ -162,9 +211,19 @@ func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string, snap Ses
 		return "", fmt.Errorf("codex CLI failed: %w: %s", err, stderr.String())
 	}
 
+	// 解析 JSONL 输出，提取 AI 响应文本
 	return p.parseJsonlOutput(stdout.String()), nil
 }
 
+// runCodexStream 以流式方式运行 Codex CLI，实时解析 JSONL 输出并将响应片段发送到 chunks channel。
+// 相比 runCodex 的同步模式，流式模式可以在 CLI 仍在运行时就开始处理输出，
+// 适合长时间运行的审查任务。
+//
+// 主要机制：
+//   1. 通过 pipe 连接子进程的 stdout/stderr
+//   2. 后台 goroutine 监控无活动超时，超时后强制终止进程
+//   3. 后台 goroutine 读取 stderr 以更新活动时间戳
+//   4. 主循环逐行读取 stdout，解析 JSONL 事件并分发到 chunks channel
 func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, snap SessionSnapshot, chunks chan<- string) error {
 	args := p.buildArgs(snap)
 	cmd := exec.CommandContext(ctx, "codex", args...)
@@ -172,8 +231,10 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 		cmd.Dir = p.cwd
 	}
 
+	// 将提示词通过 stdin 传递给 codex 命令
 	cmd.Stdin = strings.NewReader(prompt)
 
+	// 创建 stdout 和 stderr 的管道，用于流式读取输出
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
@@ -187,6 +248,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 		return fmt.Errorf("failed to start codex CLI: %w", err)
 	}
 
+	// 用互斥锁保护最后活动时间戳，因为多个 goroutine 会并发访问
 	var mu sync.Mutex
 	lastActivity := time.Now()
 
@@ -196,7 +258,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 		mu.Unlock()
 	}
 
-	// Inactivity timeout goroutine
+	// 无活动超时监控 goroutine：每 10 秒检查一次，如果超过设定超时则强制终止进程
 	done := make(chan struct{})
 	defer close(done)
 
@@ -213,6 +275,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 					elapsed := time.Since(lastActivity)
 					mu.Unlock()
 					if elapsed > p.timeout {
+						// 超时，强制终止 CLI 进程
 						cmd.Process.Kill()
 						return
 					}
@@ -221,7 +284,8 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 		}()
 	}
 
-	// Read stderr in background to track activity
+	// 后台读取 stderr：虽然不处理 stderr 内容，但用于更新活动时间戳，
+	// 防止 CLI 在输出大量 stderr 日志时被误判为无活动而超时
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -233,7 +297,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 		}
 	}()
 
-	// Read stdout with JSONL line buffering
+	// 主循环：从 stdout 流式读取数据，按行缓冲并解析 JSONL 事件
 	var lineBuf string
 	buf := make([]byte, 4096)
 	for {
@@ -242,11 +306,11 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 			updateActivity()
 			lineBuf += string(buf[:n])
 
-			// Process complete lines
+			// 处理缓冲区中所有完整的行（以换行符分隔的 JSONL 事件）
 			for {
 				idx := strings.Index(lineBuf, "\n")
 				if idx < 0 {
-					break
+					break // 没有完整行，等待更多数据
 				}
 				line := strings.TrimSpace(lineBuf[:idx])
 				lineBuf = lineBuf[idx+1:]
@@ -255,24 +319,27 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 					continue
 				}
 
+				// 解析 JSONL 事件
 				var event codexEvent
 				if err := json.Unmarshal([]byte(line), &event); err != nil {
 					util.Warnf("codex stream: failed to parse JSONL line: %v", err)
 					continue
 				}
+				// 处理线程启动事件：保存 thread_id
 				if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
 					p.session.SetSessionID(event.ThreadID)
 				} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
+					// 处理完成事件：将 AI 响应文本发送到 chunks channel
 					chunks <- event.Item.Text
 				}
 			}
 		}
 		if readErr != nil {
-			break
+			break // 读取结束（EOF 或错误）
 		}
 	}
 
-	// Process any remaining data in line buffer
+	// 处理缓冲区中可能残留的最后一行数据（未以换行符结尾的情况）
 	if trimmed := strings.TrimSpace(lineBuf); trimmed != "" {
 		var event codexEvent
 		if err := json.Unmarshal([]byte(trimmed), &event); err == nil {
@@ -284,6 +351,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 		}
 	}
 
+	// 等待子进程完全退出
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("codex CLI exited with error: %w", err)
 	}
