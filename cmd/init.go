@@ -35,7 +35,7 @@ providers:
     enabled: true
 
 defaults:
-  max_rounds: 3
+  max_rounds: 5
   output_format: markdown
   check_convergence: true
 

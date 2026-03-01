@@ -718,7 +718,7 @@ Use reviewer IDs: %s`, reviewText, reviewerIDs[0], reviewerIDsStr)
 					Descriptions: []string{issue.Description},
 				})
 			}
-			return result
+			return DeduplicateMergedIssues(result)
 		}
 	}
 

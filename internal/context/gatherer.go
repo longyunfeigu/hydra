@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guwanhua/hydra/internal/config"
@@ -126,12 +127,16 @@ func (g *ContextGatherer) Gather(diff, prNumber, baseBranch string) (*GatheredCo
 	cwd := "."
 	changedFiles := extractChangedFiles(diff)
 
-	// 收集三类数据：代码引用、历史 PR、项目文档
-	references := CollectReferences(diff, cwd)
-
-	relatedPRs, _ := CollectHistory(changedFiles, g.options.History.MaxDays, g.options.History.MaxPRs, cwd)
-
-	docs, _ := CollectDocs(g.options.Docs.Patterns, g.options.Docs.MaxSize, cwd)
+	// 并行收集三类数据：代码引用、历史 PR、项目文档
+	var references []RawReference
+	var relatedPRs []RelatedPR
+	var docs []RawDoc
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); references = CollectReferences(diff, cwd) }()
+	go func() { defer wg.Done(); relatedPRs, _ = CollectHistory(changedFiles, g.options.History.MaxDays, g.options.History.MaxPRs, cwd) }()
+	go func() { defer wg.Done(); docs, _ = CollectDocs(g.options.Docs.Patterns, g.options.Docs.MaxSize, cwd) }()
+	wg.Wait()
 
 	// 构建分析提示词并调用 AI 进行分析
 	prompt := BuildAnalysisPrompt(diff, changedFiles, references, relatedPRs, docs)

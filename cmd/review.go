@@ -46,7 +46,7 @@ func init() {
 	f.StringP("format", "f", "markdown", "Output format (markdown|json)") // 输出格式：markdown 或 json
 	f.Bool("no-converge", false, "Disable convergence detection")      // 禁用收敛检测，强制完成所有辩论轮次
 	f.BoolP("local", "l", false, "Review local uncommitted changes")   // 审查本地未提交的代码变更
-	f.String("branch", "", "Review current branch vs base")            // 审查当前分支与指定基准分支的差异
+	f.StringP("branch", "b", "", "Review current branch vs base")            // 审查当前分支与指定基准分支的差异
 	f.StringSlice("files", nil, "Review specific files")               // 审查指定的文件列表
 	f.String("reviewers", "", "Comma-separated reviewer IDs")          // 以逗号分隔指定使用哪些审查者
 	f.BoolP("all", "a", false, "Use all reviewers")                    // 使用配置中定义的所有审查者

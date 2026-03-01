@@ -360,6 +360,53 @@ func firstN(s []string, n int) []string {
 	return s[:n]
 }
 
+// DeduplicateMergedIssues 对扁平的 MergedIssue 列表进行去重和按严重程度排序。
+// 复用 isSimilarIssue() 比较逻辑，将相似问题合并（保留最高严重程度、合并 raisedBy 和描述）。
+// 最终结果按 severity 排序（critical 在前）。
+func DeduplicateMergedIssues(issues []MergedIssue) []MergedIssue {
+	var merged []MergedIssue
+
+	for _, issue := range issues {
+		found := false
+		for i := range merged {
+			if isSimilarIssue(&merged[i].ReviewIssue, &issue.ReviewIssue) {
+				// 合并 raisedBy（去重）
+				seen := make(map[string]bool)
+				for _, r := range merged[i].RaisedBy {
+					seen[r] = true
+				}
+				for _, r := range issue.RaisedBy {
+					if !seen[r] {
+						merged[i].RaisedBy = append(merged[i].RaisedBy, r)
+					}
+				}
+				// 合并描述
+				merged[i].Descriptions = append(merged[i].Descriptions, issue.Descriptions...)
+				// 保留最高严重程度
+				if severityOrder[issue.Severity] < severityOrder[merged[i].Severity] {
+					merged[i].Severity = issue.Severity
+				}
+				// 补充修复建议
+				if merged[i].SuggestedFix == "" && issue.SuggestedFix != "" {
+					merged[i].SuggestedFix = issue.SuggestedFix
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			merged = append(merged, issue)
+		}
+	}
+
+	// 按严重程度排序，critical 排在最前面
+	sort.Slice(merged, func(i, j int) bool {
+		return severityOrder[merged[i].Severity] < severityOrder[merged[j].Severity]
+	})
+
+	return merged
+}
+
 // FormatCallChainForReviewer 将原始引用数据格式化为可读的调用链Markdown文档。
 // 为每个被修改的符号（函数/变量），列出其在代码仓库中被引用的位置（最多10个）。
 // 输出格式适合直接嵌入审查者的提示词中，帮助审查者理解变更的影响范围。
