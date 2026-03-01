@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/guwanhua/hydra/internal/provider"
+	"github.com/guwanhua/hydra/internal/util"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -279,18 +280,32 @@ func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt str
 		return nil, fmt.Errorf("collecting summaries: %w", err)
 	}
 
-	finalConclusion, err := o.getFinalConclusion(ctx, summaries)
-	if err != nil {
-		return nil, fmt.Errorf("final conclusion: %w", err)
-	}
-
-	// 在结构化提取之前结束总结器会话，确保后续JSON提取不受会话上下文干扰
+	// 结束总结器会话，后续的 getFinalConclusion 和 structurizeIssues 都构建全新消息，
+	// 不依赖会话上下文，可以安全地并行执行
 	if sp, ok := o.summarizer.Provider.(provider.SessionProvider); ok {
 		sp.EndSession()
 	}
 
-	// 从审查文本中提取结构化问题（支持重试），转换为可直接用于GitHub评论的格式
-	parsedIssues := o.structurizeIssues(ctx, display)
+	// getFinalConclusion（依赖 summaries）和 structurizeIssues（只读 conversationHistory）并行执行
+	var finalConclusion string
+	var parsedIssues []MergedIssue
+
+	g3, g3ctx := errgroup.WithContext(ctx)
+	g3.Go(func() error {
+		var err error
+		finalConclusion, err = o.getFinalConclusion(g3ctx, summaries)
+		if err != nil {
+			return fmt.Errorf("final conclusion: %w", err)
+		}
+		return nil
+	})
+	g3.Go(func() error {
+		parsedIssues = o.structurizeIssues(g3ctx, display)
+		return nil
+	})
+	if err := g3.Wait(); err != nil {
+		return nil, err
+	}
 
 	return &DebateResult{
 		PRNumber:         label,
@@ -355,6 +370,7 @@ func (o *DebateOrchestrator) buildMessages(currentReviewerID string) []provider.
 
 You are [%s]. Review EVERY changed file and EVERY changed function/block -- do not skip any.
 For each change, check: correctness, security, performance, error handling, edge cases, maintainability.
+IMPORTANT: For each issue, always reference the exact file path and line number (e.g. "base_parser.py:263" or "line 263 in base_parser.py"). Line numbers are critical for inline comments.
 If you reviewed a file and found no issues, say so briefly. Do not stop early.`,
 			o.taskPrompt, contextSection, focusSection, callChainSection, o.analysis, currentReviewerID)
 
@@ -561,33 +577,43 @@ Then on the LAST line, respond with EXACTLY one word: CONVERGED or NOT_CONVERGED
 	return isConverged, nil
 }
 
-// collectSummaries 请求每个审查者提供最终总结。
+// collectSummaries 并行请求每个审查者提供最终总结。
 // 在辩论结束后，每个审查者总结自己的核心观点和结论，不透露身份。
 func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
 	summaryPrompt := "Please summarize your key points and conclusions. Do not reveal your identity or role."
-	var summaries []DebateSummary
 
-	for _, reviewer := range o.reviewers {
-		messages := o.buildMessages(reviewer.ID)
-		messages = append(messages, provider.Message{Role: "user", Content: summaryPrompt})
+	// 预分配结果切片，每个 goroutine 写入自己的索引位置，无需加锁
+	summaries := make([]DebateSummary, len(o.reviewers))
 
-		summary, err := reviewer.Provider.Chat(ctx, messages, reviewer.SystemPrompt, nil)
-		if err != nil {
-			return nil, fmt.Errorf("summary from %s: %w", reviewer.ID, err)
-		}
+	g, gctx := errgroup.WithContext(ctx)
+	for i, reviewer := range o.reviewers {
+		i, reviewer := i, reviewer
+		g.Go(func() error {
+			messages := o.buildMessages(reviewer.ID)
+			messages = append(messages, provider.Message{Role: "user", Content: summaryPrompt})
 
-		var inputParts []string
-		for _, m := range messages {
-			inputParts = append(inputParts, m.Content)
-		}
-		o.trackTokens(reviewer.ID, strings.Join(inputParts, "\n")+reviewer.SystemPrompt, summary)
+			summary, err := reviewer.Provider.Chat(gctx, messages, reviewer.SystemPrompt, nil)
+			if err != nil {
+				return fmt.Errorf("summary from %s: %w", reviewer.ID, err)
+			}
 
-		summaries = append(summaries, DebateSummary{
-			ReviewerID: reviewer.ID,
-			Summary:    summary,
+			var inputParts []string
+			for _, m := range messages {
+				inputParts = append(inputParts, m.Content)
+			}
+			o.trackTokens(reviewer.ID, strings.Join(inputParts, "\n")+reviewer.SystemPrompt, summary)
+
+			summaries[i] = DebateSummary{
+				ReviewerID: reviewer.ID,
+				Summary:    summary,
+			}
+			return nil
 		})
 	}
 
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
 	return summaries, nil
 }
 
@@ -621,24 +647,34 @@ func (o *DebateOrchestrator) getFinalConclusion(ctx context.Context, summaries [
 // 如果JSON解析失败，最多重试3次。每次重试会使用更明确的提示词引导模型输出正确格式。
 // 提取的问题包含：严重程度、分类、文件位置、描述和建议修复等信息。
 func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display DisplayCallbacks) []MergedIssue {
-	// 收集每个审查者的最后一条消息（代表其最终观点）
-	lastMessages := make(map[string]string)
+	// 收集每个审查者的所有消息（按轮次），避免只取最后一条导致早期发现的问题丢失
+	allMessages := make(map[string][]string) // reviewerID -> []content (按轮次顺序)
 	for _, msg := range o.conversationHistory {
 		if msg.ReviewerID == "user" {
 			continue
 		}
-		lastMessages[msg.ReviewerID] = msg.Content
+		allMessages[msg.ReviewerID] = append(allMessages[msg.ReviewerID], msg.Content)
 	}
 
-	if len(lastMessages) == 0 {
+	if len(allMessages) == 0 {
+		util.Warnf("structurizeIssues: no reviewer messages found in conversation history (total messages: %d)", len(o.conversationHistory))
 		return nil
 	}
+	util.Debugf("structurizeIssues: collected messages from %d reviewers", len(allMessages))
 
 	var reviewParts []string
 	var reviewerIDs []string
-	for id, content := range lastMessages {
-		reviewParts = append(reviewParts, fmt.Sprintf("[%s]:\n%s", id, content))
+	for id, rounds := range allMessages {
 		reviewerIDs = append(reviewerIDs, id)
+		if len(rounds) == 1 {
+			reviewParts = append(reviewParts, fmt.Sprintf("[%s]:\n%s", id, rounds[0]))
+		} else {
+			var roundParts []string
+			for i, content := range rounds {
+				roundParts = append(roundParts, fmt.Sprintf("[%s] Round %d:\n%s", id, i+1, content))
+			}
+			reviewParts = append(reviewParts, strings.Join(roundParts, "\n\n"))
+		}
 	}
 	reviewText := strings.Join(reviewParts, "\n\n---\n\n")
 	reviewerIDsStr := strings.Join(reviewerIDs, ", ")
@@ -667,10 +703,10 @@ Output ONLY a JSON block (no other text):
 
 Rules:
 - Include every issue mentioned by any reviewer
-- The "description" field will be posted as a GitHub PR comment. Make it comprehensive markdown covering: (1) What the problem is, (2) Why it matters (impact/risk), (3) The original problematic code quoted in a code block, (4) The suggested fix shown as code, (5) Why the fix is correct
+- The "description" field will be posted as a review comment. Make it comprehensive markdown covering: (1) What the problem is, (2) Why it matters (impact/risk), (3) The original problematic code quoted in a code block, (4) The suggested fix shown as code, (5) Why the fix is correct
 - If multiple reviewers mention the same issue, list all their IDs in raisedBy
 - Use the exact reviewer IDs: %s
-- If a file path or line number is mentioned, include it; otherwise omit the field
+- IMPORTANT: Always include the "file" field with the full path and the "line" field with the exact line number from the reviewer's text. Search the review text carefully for line references (e.g. "line 42", "L42", ":42", "at 42"). If you truly cannot find a line number, omit the "line" field, but try hard to find one.
 - Severity: critical = blocks merge, high = should fix, medium = worth fixing, low = minor, nitpick = style only`, reviewText, reviewerIDsStr)
 
 	systemPrompt := "You extract structured issues from code review text. Output only valid JSON."
@@ -700,11 +736,24 @@ Use reviewer IDs: %s`, reviewText, reviewerIDs[0], reviewerIDsStr)
 		msgs := []provider.Message{{Role: "user", Content: prompt}}
 		response, err := o.summarizer.Provider.Chat(ctx, msgs, systemPrompt, chatOpts)
 		if err != nil {
+			util.Warnf("structurizeIssues: attempt %d/%d Chat error: %v", attempt, maxAttempts, err)
 			continue
 		}
 		o.trackTokens("summarizer", prompt, response)
 
+		// 截取前 500 字符用于调试
+		preview := response
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		util.Debugf("structurizeIssues: attempt %d/%d response preview: %s", attempt, maxAttempts, preview)
+
 		parsed := ParseReviewerOutput(response)
+		if parsed == nil {
+			util.Warnf("structurizeIssues: attempt %d/%d ParseReviewerOutput returned nil (no valid JSON found)", attempt, maxAttempts)
+		} else if len(parsed.Issues) == 0 {
+			util.Warnf("structurizeIssues: attempt %d/%d parsed OK but 0 valid issues (all filtered by validation)", attempt, maxAttempts)
+		}
 		if parsed != nil && len(parsed.Issues) > 0 {
 			result := make([]MergedIssue, 0, len(parsed.Issues))
 			for _, issue := range parsed.Issues {
@@ -718,7 +767,7 @@ Use reviewer IDs: %s`, reviewText, reviewerIDs[0], reviewerIDsStr)
 					Descriptions: []string{issue.Description},
 				})
 			}
-			return result
+			return DeduplicateMergedIssues(result)
 		}
 	}
 

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // symbolPatterns 是用于从 diff 新增行（"+"开头）中提取符号名称的正则表达式集合。
@@ -24,6 +25,8 @@ var symbolPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?m)^\+.*class\s+([a-zA-Z_][a-zA-Z0-9_]*)`),
 	// JS/TS：导出声明，如 export const/function/class Name
 	regexp.MustCompile(`(?m)^\+.*export\s+(?:const|let|var|function|class|async function)\s+([a-zA-Z_][a-zA-Z0-9_]*)`),
+	// Python：函数和异步函数定义，如 def name( 或 async def name(
+	regexp.MustCompile(`(?m)^\+.*(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`),
 }
 
 // skipSymbols 是需要跳过的常见关键字和短标识符集合。
@@ -32,6 +35,9 @@ var skipSymbols = map[string]bool{
 	"get": true, "set": true, "new": true, "for": true,
 	"if": true, "do": true, "var": true, "nil": true,
 	"err": true, "ok": true,
+	// Python 常见关键字和魔术方法
+	"self": true, "cls": true, "def": true,
+	"None": true, "True": true, "False": true,
 }
 
 // ExtractSymbolsFromDiff 从 diff 的新增行中提取函数、类、方法等符号名称。
@@ -57,48 +63,65 @@ func ExtractSymbolsFromDiff(diff string) []string {
 	return symbols
 }
 
-// FindReferences 使用 ripgrep (rg) 在代码库中搜索指定符号的所有出现位置。
+// FindReferences 并行使用 ripgrep (rg) 在代码库中搜索指定符号的所有出现位置。
 // 对每个符号执行全文搜索，解析 ripgrep 输出的 "文件:行号:内容" 格式，
 // 返回每个符号的引用位置列表。这些数据用于调用链分析。
 func FindReferences(symbols []string, cwd string) []RawReference {
+	// 预分配结果切片，每个 goroutine 写入自己的索引位置
+	results := make([]RawReference, len(symbols))
+	found := make([]bool, len(symbols))
+
+	var wg sync.WaitGroup
+	for i, symbol := range symbols {
+		i, symbol := i, symbol
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 使用 ripgrep 搜索：-n 显示行号，-H 显示文件名，--no-heading 不分组
+			cmd := exec.Command("rg", "-n", "-H", "--no-heading", symbol)
+			cmd.Dir = cwd
+			out, err := cmd.Output()
+			if err != nil || len(out) == 0 {
+				return
+			}
+
+			// 解析 ripgrep 输出，格式为 "文件:行号:内容"
+			var locations []ReferenceLocation
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if line == "" {
+					continue
+				}
+				parts := strings.SplitN(line, ":", 3)
+				if len(parts) < 3 {
+					continue
+				}
+				lineNum := 0
+				fmt.Sscanf(parts[1], "%d", &lineNum)
+				locations = append(locations, ReferenceLocation{
+					File:    parts[0],
+					Line:    lineNum,
+					Content: strings.TrimSpace(parts[2]),
+				})
+			}
+
+			if len(locations) > 0 {
+				results[i] = RawReference{
+					Symbol:       symbol,
+					FoundInFiles: locations,
+				}
+				found[i] = true
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 按原始顺序收集有结果的引用
 	var references []RawReference
-
-	for _, symbol := range symbols {
-		// 使用 ripgrep 搜索：-n 显示行号，-H 显示文件名，--no-heading 不分组
-		cmd := exec.Command("rg", "-n", "-H", "--no-heading", symbol)
-		cmd.Dir = cwd
-		out, err := cmd.Output()
-		if err != nil || len(out) == 0 {
-			continue
-		}
-
-		// 解析 ripgrep 输出，格式为 "文件:行号:内容"
-		var locations []ReferenceLocation
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, ":", 3)
-			if len(parts) < 3 {
-				continue
-			}
-			lineNum := 0
-			fmt.Sscanf(parts[1], "%d", &lineNum)
-			locations = append(locations, ReferenceLocation{
-				File:    parts[0],
-				Line:    lineNum,
-				Content: strings.TrimSpace(parts[2]),
-			})
-		}
-
-		if len(locations) > 0 {
-			references = append(references, RawReference{
-				Symbol:       symbol,
-				FoundInFiles: locations,
-			})
+	for i := range results {
+		if found[i] {
+			references = append(references, results[i])
 		}
 	}
-
 	return references
 }
 

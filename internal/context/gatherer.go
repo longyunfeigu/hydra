@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guwanhua/hydra/internal/config"
+	"github.com/guwanhua/hydra/internal/platform"
 	"github.com/guwanhua/hydra/internal/provider"
 )
 
@@ -32,13 +34,14 @@ type GathererOptions struct {
 // 它协调多个数据源（代码引用、git 历史、项目文档）的收集，
 // 并通过 AI 提供者进行结构化的架构影响分析。
 type ContextGatherer struct {
-	provider provider.AIProvider // AI 提供者，用于执行上下文分析
-	options  GathererOptions     // 收集行为配置选项
+	provider        provider.AIProvider        // AI 提供者，用于执行上下文分析
+	options         GathererOptions            // 收集行为配置选项
+	historyProvider platform.HistoryProvider   // 平台历史提供者（可为 nil）
 }
 
 // NewContextGatherer 使用指定的 AI 提供者和配置创建新的 ContextGatherer。
 // 先设置合理的默认值，然后用配置文件中的值覆盖（如果提供了配置）。
-func NewContextGatherer(p provider.AIProvider, cfg *config.ContextGathererConfig) *ContextGatherer {
+func NewContextGatherer(p provider.AIProvider, cfg *config.ContextGathererConfig, historyProvider platform.HistoryProvider) *ContextGatherer {
 	opts := GathererOptions{}
 
 	// 设置默认值
@@ -78,8 +81,9 @@ func NewContextGatherer(p provider.AIProvider, cfg *config.ContextGathererConfig
 	}
 
 	return &ContextGatherer{
-		provider: p,
-		options:  opts,
+		provider:        p,
+		options:         opts,
+		historyProvider: historyProvider,
 	}
 }
 
@@ -126,12 +130,16 @@ func (g *ContextGatherer) Gather(diff, prNumber, baseBranch string) (*GatheredCo
 	cwd := "."
 	changedFiles := extractChangedFiles(diff)
 
-	// 收集三类数据：代码引用、历史 PR、项目文档
-	references := CollectReferences(diff, cwd)
-
-	relatedPRs, _ := CollectHistory(changedFiles, g.options.History.MaxDays, g.options.History.MaxPRs, cwd)
-
-	docs, _ := CollectDocs(g.options.Docs.Patterns, g.options.Docs.MaxSize, cwd)
+	// 并行收集三类数据：代码引用、历史 PR、项目文档
+	var references []RawReference
+	var relatedPRs []RelatedPR
+	var docs []RawDoc
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); references = CollectReferences(diff, cwd) }()
+	go func() { defer wg.Done(); relatedPRs, _ = CollectHistory(changedFiles, g.options.History.MaxDays, g.options.History.MaxPRs, cwd, g.historyProvider) }()
+	go func() { defer wg.Done(); docs, _ = CollectDocs(g.options.Docs.Patterns, g.options.Docs.MaxSize, cwd) }()
+	wg.Wait()
 
 	// 构建分析提示词并调用 AI 进行分析
 	prompt := BuildAnalysisPrompt(diff, changedFiles, references, relatedPRs, docs)

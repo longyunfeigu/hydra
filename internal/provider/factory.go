@@ -15,8 +15,10 @@ import (
 //   - "codex-cli"：使用 OpenAI Codex CLI 作为后端
 //   - "mock*"：使用模拟提供者（用于测试）
 //
+// modelName 为可选的底层模型名称（如 "claude-sonnet-4-5-20250514"），
+// 对 CLI 提供者会通过 --model 参数传递。
 // 如果全局 Mock 模式开启，则所有模型都会被替换为 MockProvider。
-func CreateProvider(model string, cfg *config.HydraConfig) (AIProvider, error) {
+func CreateProvider(model, modelName string, cfg *config.HydraConfig) (AIProvider, error) {
 	// 全局模拟模式：将所有模型替换为 MockProvider，用于测试和开发
 	if cfg.Mock {
 		return NewMockProvider(), nil
@@ -30,12 +32,23 @@ func CreateProvider(model string, cfg *config.HydraConfig) (AIProvider, error) {
 		// 创建 Claude Code CLI 提供者，通过调用 claude 命令行工具进行交互
 		p := NewClaudeCodeProvider()
 		p.skipPermissions = skipPerms
+		p.modelName = modelName
 		return p, nil
 	case model == "codex-cli":
 		// 创建 Codex CLI 提供者，通过调用 codex 命令行工具进行交互
 		p := NewCodexCliProvider()
 		p.skipPermissions = skipPerms
+		p.modelName = modelName
 		return p, nil
+	case strings.HasPrefix(model, "gpt-"),
+		strings.HasPrefix(model, "o1-"),
+		strings.HasPrefix(model, "o3-"):
+		// OpenAI 模型（gpt-4o, o1-*, o3-* 等），使用 OpenAI API 直接调用
+		provCfg := cfg.Providers["openai"]
+		if provCfg.APIKey == "" {
+			return nil, fmt.Errorf("openai provider requires api_key in config (providers.openai.api_key)")
+		}
+		return NewOpenAIProvider(provCfg.APIKey, model, provCfg.BaseURL), nil
 	case strings.HasPrefix(model, "mock"):
 		// 以 "mock" 开头的模型名称均使用模拟提供者
 		return NewMockProvider(), nil

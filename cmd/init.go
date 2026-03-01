@@ -33,9 +33,12 @@ providers:
     enabled: true
   codex-cli:
     enabled: true
+  # openai:
+  #   api_key: ${OPENAI_API_KEY}
+  #   base_url: https://api.openai.com/v1  # optional, for Azure/Ollama compatibility
 
 defaults:
-  max_rounds: 3
+  max_rounds: 5
   output_format: markdown
   check_convergence: true
 
@@ -67,6 +70,16 @@ reviewers:
     prompt: |
       You are a pragmatic code reviewer focused on performance, edge cases,
       and real-world reliability. Challenge assumptions and find issues others miss.
+  # openai:
+  #   model: gpt-4o
+  #   prompt: |
+  #     You are an experienced code reviewer focused on design patterns,
+  #     API correctness, and code clarity. Provide actionable suggestions.
+
+# Platform: auto-detected from git remote (github or gitlab)
+# platform:
+#   type: auto
+#   host: gitlab.example.com  # for self-hosted GitLab
 
 # Optional: context gathering
 # contextGatherer:

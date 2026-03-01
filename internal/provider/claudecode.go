@@ -26,6 +26,7 @@ type ClaudeCodeProvider struct {
 	timeout         time.Duration    // 无活动超时时间（默认 15 分钟）
 	session         CliSessionHelper // 会话状态管理
 	skipPermissions bool             // 是否跳过 CLI 的权限确认（非交互模式必须为 true）
+	modelName       string           // 底层模型名称，传给 --model 参数（如 "claude-sonnet-4-5-20250514"）
 }
 
 func NewClaudeCodeProvider() *ClaudeCodeProvider {
@@ -117,6 +118,10 @@ func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool, snap
 		args = append(args, "--output-format", "stream-json")
 	} else {
 		args = append(args, "--output-format", "json")
+	}
+
+	if p.modelName != "" {
+		args = append(args, "--model", p.modelName)
 	}
 
 	if snap.ID != "" && !snap.FirstMessage {

@@ -26,6 +26,7 @@ type CodexCliProvider struct {
 	session         CliSessionHelper // 会话辅助器，管理会话状态和提示词构建
 	sessionEnabled  bool             // 是否启用会话模式（支持多轮对话）
 	skipPermissions bool             // 是否跳过 CLI 的权限确认提示
+	modelName       string           // 底层模型名称，传给 --model 参数
 }
 
 // NewCodexCliProvider 创建一个新的 CodexCliProvider 实例。
@@ -138,6 +139,9 @@ func (p *CodexCliProvider) buildArgs(snap SessionSnapshot) []string {
 	if p.skipPermissions {
 		// 跳过所有权限确认和沙箱限制，允许非交互式运行
 		baseArgs = append(baseArgs, "--dangerously-bypass-approvals-and-sandbox")
+	}
+	if p.modelName != "" {
+		baseArgs = append(baseArgs, "--model", p.modelName)
 	}
 	if p.sessionEnabled && snap.ID != "" {
 		// 已有会话 ID：使用 resume 子命令恢复之前的对话线程

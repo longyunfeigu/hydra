@@ -24,6 +24,13 @@ type HydraConfig struct {
 	Analyzer        ReviewerConfig               `yaml:"analyzer"`              // 分析器配置，负责分析代码变更
 	Summarizer      ReviewerConfig               `yaml:"summarizer"`            // 汇总器配置，负责汇总多轮审查结果
 	ContextGatherer *ContextGathererConfig       `yaml:"contextGatherer,omitempty"` // 上下文收集器配置（可选）
+	Platform        *PlatformConfig              `yaml:"platform,omitempty"`    // 平台配置（可选，默认自动检测）
+}
+
+// PlatformConfig 配置代码托管平台（GitHub 或 GitLab）。
+type PlatformConfig struct {
+	Type string `yaml:"type,omitempty"` // "auto"(默认) | "github" | "gitlab"
+	Host string `yaml:"host,omitempty"` // 自托管域名，如 "gitlab.company.com"
 }
 
 // CLIProviderConfig 保存 CLI 提供者的可选配置。
@@ -46,8 +53,9 @@ type DefaultsConfig struct {
 // ReviewerConfig 定义审查者、分析器或汇总器的配置。
 // 每个角色需要指定使用的 AI 模型和系统提示词，以引导其审查行为。
 type ReviewerConfig struct {
-	Model  string `yaml:"model"`  // AI 模型标识（如 "claude-code"、"codex-cli"）
-	Prompt string `yaml:"prompt"` // 系统提示词，指导模型的审查角度和风格
+	Model     string `yaml:"model"`                // AI 提供者标识（如 "claude-code"、"codex-cli"、"gpt-4o"）
+	ModelName string `yaml:"model_name,omitempty"`  // 底层模型名称，传给 CLI 的 --model 参数（如 "claude-sonnet-4-5-20250514"）
+	Prompt    string `yaml:"prompt"`                // 系统提示词，指导模型的审查角度和风格
 }
 
 // ContextGathererConfig 保存上下文收集器的配置。
@@ -108,13 +116,16 @@ func expandEnvVarsInConfig(cfg *HydraConfig) {
 	// 替换所有审查者配置中的环境变量
 	for k, v := range cfg.Reviewers {
 		v.Model = expandEnvVars(v.Model)
+		v.ModelName = expandEnvVars(v.ModelName)
 		v.Prompt = expandEnvVars(v.Prompt)
 		cfg.Reviewers[k] = v
 	}
 	// 替换分析器和汇总器配置中的环境变量
 	cfg.Analyzer.Model = expandEnvVars(cfg.Analyzer.Model)
+	cfg.Analyzer.ModelName = expandEnvVars(cfg.Analyzer.ModelName)
 	cfg.Analyzer.Prompt = expandEnvVars(cfg.Analyzer.Prompt)
 	cfg.Summarizer.Model = expandEnvVars(cfg.Summarizer.Model)
+	cfg.Summarizer.ModelName = expandEnvVars(cfg.Summarizer.ModelName)
 	cfg.Summarizer.Prompt = expandEnvVars(cfg.Summarizer.Prompt)
 }
 

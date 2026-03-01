@@ -114,6 +114,47 @@ func TestExtractSymbols_OnlyAddedLines(t *testing.T) {
 	}
 }
 
+func TestExtractSymbols_PythonDef(t *testing.T) {
+	diff := `+def process_data(items):
++    return [x * 2 for x in items]`
+
+	got := ExtractSymbolsFromDiff(diff)
+
+	if !containsSymbol(got, "process_data") {
+		t.Errorf("expected process_data in result, got: %v", got)
+	}
+}
+
+func TestExtractSymbols_PythonAsyncDef(t *testing.T) {
+	diff := `+    async def fetch_user(self, user_id: int) -> User:`
+
+	got := ExtractSymbolsFromDiff(diff)
+
+	if !containsSymbol(got, "fetch_user") {
+		t.Errorf("expected fetch_user in result, got: %v", got)
+	}
+	if containsSymbol(got, "self") {
+		t.Errorf("should not extract 'self' as symbol, got: %v", got)
+	}
+}
+
+func TestExtractSymbols_PythonClass(t *testing.T) {
+	diff := `+class OrderService:
++    def __init__(self, db):
++        self.db = db
++    def create_order(self, data):
++        pass`
+
+	got := ExtractSymbolsFromDiff(diff)
+
+	if !containsSymbol(got, "OrderService") {
+		t.Errorf("expected OrderService in result, got: %v", got)
+	}
+	if !containsSymbol(got, "create_order") {
+		t.Errorf("expected create_order in result, got: %v", got)
+	}
+}
+
 func containsSymbol(symbols []string, target string) bool {
 	for _, s := range symbols {
 		if s == target {

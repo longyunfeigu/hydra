@@ -35,4 +35,5 @@ func Execute() {
 func init() {
 	rootCmd.AddCommand(reviewCmd)
 	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(serveCmd)
 }

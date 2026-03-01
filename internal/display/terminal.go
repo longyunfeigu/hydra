@@ -212,7 +212,7 @@ func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 	}
 
 	if len(ctx.RelatedPRs) > 0 {
-		fmt.Println(color.HiBlackString("Related PRs:"))
+		fmt.Println(color.HiBlackString("Related Changes:"))
 		limit := len(ctx.RelatedPRs)
 		if limit > 5 {
 			limit = 5
