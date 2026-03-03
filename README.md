@@ -389,6 +389,8 @@ hydra review --files "internal/server/*.go"                  # 指定文件
 # === 通用选项 ===
 hydra review 42 --no-post                                    # 不发布评论
 hydra review 42 --skip-context                               # 跳过上下文收集
+hydra review 42 --show-tool-trace                            # 显示完整过程输出（默认隐藏）
+hydra review 42 -v                                           # 同上（verbose）
 hydra review 42 -o result.md                                 # 输出到文件
 hydra review 42 -f json -o result.json                       # JSON 格式输出
 HYDRA_LOG_LEVEL=debug hydra review 42                        # 调试模式
@@ -407,6 +409,8 @@ Flags:
   -o, --output string      输出保存到文件
   -f, --format string      输出格式：markdown | json（默认 "markdown"）
       --no-converge        禁用收敛检测
+      --show-tool-trace    显示 analyzer/reviewer 完整过程输出（默认摘要模式）
+  -v, --verbose            `--show-tool-trace` 的别名
   -l, --local              审查本地未提交变更
       --branch string      审查当前分支 vs 指定基准分支
       --files strings      审查指定文件

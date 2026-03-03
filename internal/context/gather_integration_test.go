@@ -106,7 +106,7 @@ func TestGather_Integration_ClaudeCode(t *testing.T) {
 	gatherer := NewContextGatherer(p, nil, nil) // nil config = 使用默认值, nil historyProvider
 
 	start := time.Now()
-	result, err := gatherer.Gather(testDiff, "test-42", "main")
+	result, err := gatherer.Gather(gocontext.Background(), testDiff, "test-42", "main")
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -180,7 +180,7 @@ func TestGather_Integration_AIFailureFallback(t *testing.T) {
 	os.Chdir(projectRoot)
 	defer os.Chdir(origDir)
 
-	result, err := gatherer.Gather(testDiff, "test-99", "main")
+	result, err := gatherer.Gather(gocontext.Background(), testDiff, "test-99", "main")
 
 	// Gather 在 AI 失败时不应返回 error，而是返回部分上下文
 	if err != nil {
@@ -442,10 +442,10 @@ func TestCollectDocs_MaxSize(t *testing.T) {
 
 func TestExtractChangedFiles(t *testing.T) {
 	tests := []struct {
-		name     string
-		diff     string
-		wantLen  int
-		wantHas  []string
+		name    string
+		diff    string
+		wantLen int
+		wantHas []string
 	}{
 		{
 			name: "standard diff",

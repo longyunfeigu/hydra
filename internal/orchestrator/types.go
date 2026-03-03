@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"time"
 
 	"github.com/guwanhua/hydra/internal/provider"
@@ -59,16 +60,16 @@ type OrchestratorOptions struct {
 // 包含多个审查者、一个分析器、一个总结器、可选的上下文收集器以及编排选项。
 type OrchestratorConfig struct {
 	Reviewers       []Reviewer               // 参与辩论的审查者列表
-	Analyzer        Reviewer                  // 预分析器，负责在辩论前分析代码变更
-	Summarizer      Reviewer                  // 总结器，负责判断共识和生成最终结论
-	ContextGatherer ContextGathererInterface  // 上下文收集器，为nil时表示禁用
-	Options         OrchestratorOptions       // 辩论行为控制选项
+	Analyzer        Reviewer                 // 预分析器，负责在辩论前分析代码变更
+	Summarizer      Reviewer                 // 总结器，负责判断共识和生成最终结论
+	ContextGatherer ContextGathererInterface // 上下文收集器，为nil时表示禁用
+	Options         OrchestratorOptions      // 辩论行为控制选项
 }
 
 // ContextGathererInterface 抽象了上下文收集功能，避免循环导入。
 // 实现者负责从代码仓库中收集与变更相关的上下文信息（如调用链、受影响模块等）。
 type ContextGathererInterface interface {
-	Gather(diff, prNumber, baseBranch string) (*GatheredContext, error)
+	Gather(ctx context.Context, diff, prNumber, baseBranch string) (*GatheredContext, error)
 }
 
 // GatheredContext 保存收集到的代码上下文数据。
@@ -116,7 +117,7 @@ type ReferenceLocation struct {
 type DebateResult struct {
 	PRNumber         string           `json:"prNumber"`
 	Analysis         string           `json:"analysis"`
-	Context          *GatheredContext  `json:"context,omitempty"`
+	Context          *GatheredContext `json:"context,omitempty"`
 	Messages         []DebateMessage  `json:"messages"`
 	Summaries        []DebateSummary  `json:"summaries"`
 	FinalConclusion  string           `json:"finalConclusion"`

@@ -19,7 +19,7 @@ var initCmd = &cobra.Command{
 
 // defaultConfig 是 Hydra 的默认配置文件模板。
 // 配置内容包括：
-//   - providers: AI 提供者的启用状态（支持 claude-code 和 codex-cli）
+//   - providers: AI 提供者配置（claude-code、codex-cli、openai）
 //   - defaults: 全局默认参数（最大辩论轮数、输出格式、收敛检测开关）
 //   - analyzer: 预分析器的模型和提示词配置，负责在审查前分析代码变更的概况
 //   - summarizer: 总结器的模型和提示词配置，负责在辩论后综合各审查者的意见
@@ -33,9 +33,9 @@ providers:
     enabled: true
   codex-cli:
     enabled: true
-  # openai:
-  #   api_key: ${OPENAI_API_KEY}
-  #   base_url: https://api.openai.com/v1  # optional, for Azure/Ollama compatibility
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    base_url: https://api.openai.com/v1  # optional, for Azure/Ollama compatibility
 
 defaults:
   max_rounds: 5
@@ -54,7 +54,8 @@ analyzer:
     - List specific areas reviewers should focus on
 
 summarizer:
-  model: claude-code
+  # Summarizer must use OpenAI API models (gpt-*/o1-*/o3-*)
+  model: gpt-4o
   prompt: |
     You are a senior engineering lead synthesizing code review feedback.
     Provide balanced, actionable conclusions.

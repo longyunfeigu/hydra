@@ -17,14 +17,22 @@ import (
 // 它定义了所有 AI 提供者、审查者、分析器和汇总器的配置，
 // 是整个多模型对抗式代码审查系统的核心配置入口。
 type HydraConfig struct {
-	Providers       map[string]CLIProviderConfig `yaml:"providers,omitempty"`    // AI 提供者配置映射（如 claude、codex 等）
-	Mock            bool                         `yaml:"mock,omitempty"`         // 是否启用全局模拟模式（用于测试）
-	Defaults        DefaultsConfig               `yaml:"defaults"`              // 默认运行参数
-	Reviewers       map[string]ReviewerConfig    `yaml:"reviewers"`             // 审查者配置映射，每个审查者使用不同的模型和提示词
-	Analyzer        ReviewerConfig               `yaml:"analyzer"`              // 分析器配置，负责分析代码变更
-	Summarizer      ReviewerConfig               `yaml:"summarizer"`            // 汇总器配置，负责汇总多轮审查结果
+	Providers       map[string]CLIProviderConfig `yaml:"providers,omitempty"`       // AI 提供者配置映射（如 claude、codex 等）
+	Mock            bool                         `yaml:"mock,omitempty"`            // 是否启用全局模拟模式（用于测试）
+	Defaults        DefaultsConfig               `yaml:"defaults"`                  // 默认运行参数
+	Reviewers       map[string]ReviewerConfig    `yaml:"reviewers"`                 // 审查者配置映射，每个审查者使用不同的模型和提示词
+	Analyzer        ReviewerConfig               `yaml:"analyzer"`                  // 分析器配置，负责分析代码变更
+	Summarizer      ReviewerConfig               `yaml:"summarizer"`                // 汇总器配置，负责汇总多轮审查结果
 	ContextGatherer *ContextGathererConfig       `yaml:"contextGatherer,omitempty"` // 上下文收集器配置（可选）
-	Platform        *PlatformConfig              `yaml:"platform,omitempty"`    // 平台配置（可选，默认自动检测）
+	Platform        *PlatformConfig              `yaml:"platform,omitempty"`        // 平台配置（可选，默认自动检测）
+	Checkout        *CheckoutConfig              `yaml:"checkout,omitempty"`        // 本地仓库 checkout 配置（可选）
+}
+
+// CheckoutConfig 配置 PR/MR 审查时的本地仓库 checkout 行为。
+type CheckoutConfig struct {
+	Enabled bool   `yaml:"enabled"`           // 是否启用本地 checkout
+	BaseDir string `yaml:"baseDir,omitempty"` // 镜像缓存目录，默认 ~/.hydra/repos
+	TTL     string `yaml:"ttl,omitempty"`     // 缓存过期时间，默认 24h
 }
 
 // PlatformConfig 配置代码托管平台（GitHub 或 GitLab）。
@@ -36,37 +44,37 @@ type PlatformConfig struct {
 // CLIProviderConfig 保存 CLI 提供者的可选配置。
 // 每个 AI 提供者（如 Claude Code CLI、Codex CLI）可以有独立的启用状态、API 密钥和基础 URL。
 type CLIProviderConfig struct {
-	Enabled bool   `yaml:"enabled,omitempty"` // 是否启用该提供者
-	APIKey  string `yaml:"api_key,omitempty"` // API 密钥，支持环境变量替换（如 ${ANTHROPIC_API_KEY}）
+	Enabled bool   `yaml:"enabled,omitempty"`  // 是否启用该提供者
+	APIKey  string `yaml:"api_key,omitempty"`  // API 密钥，支持环境变量替换（如 ${ANTHROPIC_API_KEY}）
 	BaseURL string `yaml:"base_url,omitempty"` // API 基础 URL，可用于自定义端点
 }
 
 // DefaultsConfig 保存默认运行参数。
 // 这些参数控制审查流程的基本行为，如最大轮数、输出格式等。
 type DefaultsConfig struct {
-	MaxRounds        int    `yaml:"max_rounds"`                  // 最大审查轮数，控制对抗式审查的迭代次数
-	OutputFormat     string `yaml:"output_format"`               // 输出格式（如 markdown、json 等）
-	CheckConvergence bool   `yaml:"check_convergence"`           // 是否检查审查意见的收敛性（提前终止）
-	SkipPermissions  *bool  `yaml:"skip_permissions,omitempty"`  // 是否跳过 CLI 权限提示（非交互模式必须为 true）
+	MaxRounds        int    `yaml:"max_rounds"`                 // 最大审查轮数，控制对抗式审查的迭代次数
+	OutputFormat     string `yaml:"output_format"`              // 输出格式（如 markdown、json 等）
+	CheckConvergence bool   `yaml:"check_convergence"`          // 是否检查审查意见的收敛性（提前终止）
+	SkipPermissions  *bool  `yaml:"skip_permissions,omitempty"` // 是否跳过 CLI 权限提示（非交互模式必须为 true）
 }
 
 // ReviewerConfig 定义审查者、分析器或汇总器的配置。
 // 每个角色需要指定使用的 AI 模型和系统提示词，以引导其审查行为。
 type ReviewerConfig struct {
-	Model     string `yaml:"model"`                // AI 提供者标识（如 "claude-code"、"codex-cli"、"gpt-4o"）
-	ModelName string `yaml:"model_name,omitempty"`  // 底层模型名称，传给 CLI 的 --model 参数（如 "claude-sonnet-4-5-20250514"）
-	Prompt          string `yaml:"prompt"`                      // 系统提示词，指导模型的审查角度和风格
-	ReasoningEffort string `yaml:"reasoning_effort,omitempty"`  // 推理深度（none|low|medium|high|xhigh），仅 OpenAI 推理模型有效
+	Model           string `yaml:"model"`                      // AI 提供者标识（如 "claude-code"、"codex-cli"、"gpt-4o"）
+	ModelName       string `yaml:"model_name,omitempty"`       // 底层模型名称，传给 CLI 的 --model 参数（如 "claude-sonnet-4-5-20250514"）
+	Prompt          string `yaml:"prompt"`                     // 系统提示词，指导模型的审查角度和风格
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty"` // 推理深度（none|low|medium|high|xhigh），仅 OpenAI 推理模型有效
 }
 
 // ContextGathererConfig 保存上下文收集器的配置。
 // 上下文收集器在审查前自动收集相关代码上下文（调用链、历史记录、文档），
 // 帮助审查者更全面地理解代码变更。
 type ContextGathererConfig struct {
-	Enabled   bool              `yaml:"enabled"`              // 是否启用上下文收集
-	History   *HistoryConfig    `yaml:"history,omitempty"`    // Git 历史记录分析配置
-	Docs      *DocsConfig       `yaml:"docs,omitempty"`       // 相关文档收集配置
-	Model     string            `yaml:"model,omitempty"`      // 用于上下文分析的 AI 模型
+	Enabled bool           `yaml:"enabled"`           // 是否启用上下文收集
+	History *HistoryConfig `yaml:"history,omitempty"` // Git 历史记录分析配置
+	Docs    *DocsConfig    `yaml:"docs,omitempty"`    // 相关文档收集配置
+	Model   string         `yaml:"model,omitempty"`   // 用于上下文分析的 AI 模型
 }
 
 // HistoryConfig 配置 Git 历史记录分析的参数。
@@ -203,6 +211,9 @@ func validateConfig(cfg *HydraConfig) error {
 	if err := validateReviewerConfig("summarizer", cfg.Summarizer); err != nil {
 		return err
 	}
+	if !cfg.Mock && !isOpenAIModel(cfg.Summarizer.Model) && !isMockModel(cfg.Summarizer.Model) {
+		return fmt.Errorf("config error: summarizer.model must be an OpenAI model (gpt-*, o1-*, o3-*), got %q", cfg.Summarizer.Model)
+	}
 
 	// 验证分析器配置
 	if err := validateReviewerConfig("analyzer", cfg.Analyzer); err != nil {
@@ -210,4 +221,15 @@ func validateConfig(cfg *HydraConfig) error {
 	}
 
 	return nil
+}
+
+func isOpenAIModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "gpt-") ||
+		strings.HasPrefix(m, "o1-") ||
+		strings.HasPrefix(m, "o3-")
+}
+
+func isMockModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "mock")
 }

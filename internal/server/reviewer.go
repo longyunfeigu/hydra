@@ -6,7 +6,9 @@ import (
 	"log"
 	"strings"
 
+	"github.com/guwanhua/hydra/internal/checkout"
 	"github.com/guwanhua/hydra/internal/config"
+	appctx "github.com/guwanhua/hydra/internal/context"
 	"github.com/guwanhua/hydra/internal/display"
 	"github.com/guwanhua/hydra/internal/orchestrator"
 	"github.com/guwanhua/hydra/internal/platform"
@@ -19,7 +21,7 @@ const hydraSummaryMarker = "<!-- hydra:summary -->"
 // RunServerReview 执行 server 模式下的审查流程。
 // 镜像 cmd/review.go:runReview，但不依赖 CLI 交互。
 func RunServerReview(ctx context.Context, event *MergeRequestEvent,
-	plat platform.Platform, cfg *config.HydraConfig, logger *log.Logger) error {
+	plat platform.Platform, cfg *config.HydraConfig, checkoutMgr *checkout.Manager, logger *log.Logger) error {
 
 	repo := event.Project.PathWithNamespace
 	mrID := fmt.Sprintf("%d", event.ObjectAttributes.IID)
@@ -38,13 +40,31 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 		return fmt.Errorf("failed to get MR info: %w", err)
 	}
 
+	var checkoutResult checkout.Result
+	if checkoutMgr != nil {
+		host := ""
+		if cfg.Platform != nil {
+			host = cfg.Platform.Host
+		}
+		checkoutResult = checkoutMgr.Checkout(checkout.Params{
+			Platform: plat.Name(),
+			Repo:     repo,
+			MRNumber: mrID,
+			Host:     host,
+		})
+		if checkoutResult.Available {
+			defer checkoutResult.Release()
+		}
+	}
+
 	// 构建 review prompt（格式同 cmd/review.go）
 	annotatedDiff := platform.AnnotateDiffWithLineNumbers(mrDiff)
 	reviewPrompt := prompt.MustRender("server_review.tmpl", map[string]any{
-		"MRURL":       mrURL,
-		"Title":       mrInfo.Title,
-		"Description": mrInfo.Description,
-		"Diff":        annotatedDiff,
+		"MRURL":        mrURL,
+		"Title":        mrInfo.Title,
+		"Description":  mrInfo.Description,
+		"Diff":         annotatedDiff,
+		"HasLocalRepo": checkoutResult.Available,
 	})
 
 	// 创建 reviewers
@@ -89,6 +109,30 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 		SystemPrompt: cfg.Summarizer.Prompt,
 	}
 
+	if checkoutResult.Available {
+		for i := range reviewers {
+			provider.SetCwdIfSupported(reviewers[i].Provider, checkoutResult.RepoDir)
+		}
+		provider.SetCwdIfSupported(analyzerProvider, checkoutResult.RepoDir)
+		provider.SetCwdIfSupported(summarizerProvider, checkoutResult.RepoDir)
+	}
+
+	var contextGatherer orchestrator.ContextGathererInterface
+	if checkoutResult.Available && cfg.ContextGatherer != nil && cfg.ContextGatherer.Enabled {
+		contextModel := cfg.ContextGatherer.Model
+		if contextModel == "" {
+			contextModel = cfg.Analyzer.Model
+		}
+		ctxProvider, err := provider.CreateProvider(contextModel, "", "", cfg)
+		if err != nil {
+			logger.Printf("[warn] context gatherer provider failed: %v", err)
+		} else {
+			adapter := appctx.NewContextGathererAdapter(ctxProvider, cfg.ContextGatherer, plat)
+			adapter.SetCwd(checkoutResult.RepoDir)
+			contextGatherer = adapter
+		}
+	}
+
 	maxRounds := cfg.Defaults.MaxRounds
 	isSolo := len(reviewers) == 1
 	if isSolo {
@@ -96,12 +140,12 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 	}
 	checkConvergence := !isSolo && cfg.Defaults.CheckConvergence
 
-	// 创建 orchestrator（ContextGatherer 设为 nil，server 模式无本地文件系统）
+	// 创建 orchestrator
 	oCfg := orchestrator.OrchestratorConfig{
 		Reviewers:       reviewers,
 		Analyzer:        analyzer,
 		Summarizer:      summarizer,
-		ContextGatherer: nil,
+		ContextGatherer: contextGatherer,
 		Options: orchestrator.OrchestratorOptions{
 			MaxRounds:        maxRounds,
 			CheckConvergence: checkConvergence,

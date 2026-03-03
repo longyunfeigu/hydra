@@ -42,8 +42,9 @@ func CreateProvider(model, modelName, reasoningEffort string, cfg *config.HydraC
 		return p, nil
 	case strings.HasPrefix(model, "gpt-"),
 		strings.HasPrefix(model, "o1-"),
-		strings.HasPrefix(model, "o3-"):
-		// OpenAI 模型（gpt-4o, o1-*, o3-* 等），使用 OpenAI API 直接调用
+		strings.HasPrefix(model, "o3-"),
+		strings.HasPrefix(model, "o4-"):
+		// OpenAI 模型（gpt-4o, gpt-5.2, o1-*, o3-*, o4-* 等），使用 OpenAI API 直接调用
 		provCfg := cfg.Providers["openai"]
 		if provCfg.APIKey == "" {
 			return nil, fmt.Errorf("openai provider requires api_key in config (providers.openai.api_key)")

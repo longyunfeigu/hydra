@@ -23,6 +23,7 @@ type ProjectInfo struct {
 	ID                int    `json:"id"`
 	PathWithNamespace string `json:"path_with_namespace"`
 	WebURL            string `json:"web_url"`
+	HTTPURLToRepo     string `json:"http_url_to_repo"`
 }
 
 // MRAttributes 包含 webhook 事件中的 MR 属性。

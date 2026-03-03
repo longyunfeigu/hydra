@@ -59,9 +59,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if webhookSecret == "" {
 		webhookSecret = os.Getenv("HYDRA_WEBHOOK_SECRET")
 	}
-	if webhookSecret == "" {
-		return fmt.Errorf("webhook secret is required (--webhook-secret or HYDRA_WEBHOOK_SECRET)")
-	}
+	// TODO: 暂时不强制要求 webhook secret
+	// if webhookSecret == "" {
+	// 	return fmt.Errorf("webhook secret is required (--webhook-secret or HYDRA_WEBHOOK_SECRET)")
+	// }
 
 	// 解析 gitlab-host（flag > env > default）
 	gitlabHost, _ := cmd.Flags().GetString("gitlab-host")

@@ -1,6 +1,8 @@
 package context
 
 import (
+	"context"
+
 	"github.com/guwanhua/hydra/internal/config"
 	"github.com/guwanhua/hydra/internal/orchestrator"
 	"github.com/guwanhua/hydra/internal/platform"
@@ -26,12 +28,17 @@ func NewContextGathererAdapter(p provider.AIProvider, cfg *config.ContextGathere
 }
 
 // Gather 实现 orchestrator.ContextGathererInterface 接口。
-func (a *ContextGathererAdapter) Gather(diff, prNumber, baseBranch string) (*orchestrator.GatheredContext, error) {
-	gc, err := a.inner.Gather(diff, prNumber, baseBranch)
+func (a *ContextGathererAdapter) Gather(ctx context.Context, diff, prNumber, baseBranch string) (*orchestrator.GatheredContext, error) {
+	gc, err := a.inner.Gather(ctx, diff, prNumber, baseBranch)
 	if err != nil {
 		return nil, err
 	}
 	return convertToOrchestrator(gc), nil
+}
+
+// SetCwd 设置上下文收集器的工作目录。
+func (a *ContextGathererAdapter) SetCwd(cwd string) {
+	a.inner.SetCwd(cwd)
 }
 
 func convertToOrchestrator(gc *GatheredContext) *orchestrator.GatheredContext {

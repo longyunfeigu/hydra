@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/guwanhua/hydra/internal/checkout"
 	"github.com/guwanhua/hydra/internal/config"
 	appctx "github.com/guwanhua/hydra/internal/context"
 	"github.com/guwanhua/hydra/internal/display"
@@ -42,6 +43,8 @@ func init() {
 	f.StringP("output", "o", "", "Output to file")
 	f.StringP("format", "f", "markdown", "Output format (markdown|json)")
 	f.Bool("no-converge", false, "Disable convergence detection")
+	f.Bool("show-tool-trace", false, "Show full analyzer/reviewer trace during review")
+	f.BoolP("verbose", "v", false, "Alias for --show-tool-trace")
 	f.BoolP("local", "l", false, "Review local uncommitted changes")
 	f.StringP("branch", "b", "", "Review current branch vs base")
 	f.StringSlice("files", nil, "Review specific files")
@@ -56,10 +59,11 @@ const hydraSummaryMarker = "<!-- hydra:summary -->"
 
 // reviewTarget 封装了审查目标的所有必要信息。
 type reviewTarget struct {
-	Type   string // "pr"、"local"、"branch"、"files"
-	Label  string // 显示标签，如 "PR #123"、"MR !456"
-	Prompt string // AI 审查提示词
-	Repo   string // 仓库标识（owner/repo 或 group/project）
+	Type     string // "pr"、"local"、"branch"、"files"
+	Label    string // 显示标签，如 "PR #123"、"MR !456"
+	Prompt   string // AI 审查提示词
+	Repo     string // 仓库标识（owner/repo 或 group/project）
+	MRNumber string // PR/MR 编号（仅 PR/MR 模式）
 }
 
 func runReview(cmd *cobra.Command, args []string) error {
@@ -67,6 +71,9 @@ func runReview(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	d := display.New()
+	showToolTrace, _ := cmd.Flags().GetBool("show-tool-trace")
+	verbose, _ := cmd.Flags().GetBool("verbose")
+	d.SetShowToolTrace(showToolTrace || verbose)
 	d.SpinnerStart("Loading configuration...")
 
 	configPath, _ := cmd.Flags().GetString("config")
@@ -148,6 +155,51 @@ func runReview(cmd *cobra.Command, args []string) error {
 		} else {
 			contextGatherer = appctx.NewContextGathererAdapter(contextProvider, cfg.ContextGatherer, plat)
 		}
+	}
+
+	var checkoutResult checkout.Result
+	mgr := checkout.NewManager(cfg.Checkout)
+	if target.Type == "pr" && mgr != nil && target.Repo != "" {
+		d.SpinnerStart("Checking out repository...")
+		platName := ""
+		if plat != nil {
+			platName = plat.Name()
+		}
+		host := ""
+		if cfg.Platform != nil {
+			host = cfg.Platform.Host
+		}
+		checkoutResult = mgr.Checkout(checkout.Params{
+			Platform: platName,
+			Repo:     target.Repo,
+			MRNumber: target.MRNumber,
+			Host:     host,
+		})
+		if checkoutResult.Available {
+			defer checkoutResult.Release()
+			d.SpinnerSucceed("Repository checked out")
+		} else {
+			d.SpinnerSucceed("Checkout skipped, using diff-only mode")
+		}
+	}
+
+	cwd := "."
+	if checkoutResult.Available {
+		cwd = checkoutResult.RepoDir
+	}
+	for i := range reviewers {
+		provider.SetCwdIfSupported(reviewers[i].Provider, cwd)
+	}
+	provider.SetCwdIfSupported(analyzerProvider, cwd)
+	provider.SetCwdIfSupported(summarizerProvider, cwd)
+	if contextGatherer != nil {
+		if cg, ok := contextGatherer.(interface{ SetCwd(string) }); ok {
+			cg.SetCwd(cwd)
+		}
+	}
+
+	if checkoutResult.Available {
+		target.Prompt += "\n\nNote: The full repository source code is available in your working directory.\nYou can browse files, read implementations, and examine the broader codebase context beyond the diff."
 	}
 
 	maxRounds := cfg.Defaults.MaxRounds
@@ -385,6 +437,13 @@ func resolveMRTarget(input string, plat platform.Platform) (*reviewTarget, error
 		}
 	}
 
+	// fallback：URL 解析失败时尝试从当前 git remote 推断仓库
+	if mrRepo == "" && plat != nil {
+		if repo, err := plat.DetectRepoFromRemote(); err == nil {
+			mrRepo = repo
+		}
+	}
+
 	// 通过 Platform 接口获取 diff 和信息
 	var mrDiff, mrTitle, mrBody string
 	if plat != nil {
@@ -413,10 +472,11 @@ func resolveMRTarget(input string, plat platform.Platform) (*reviewTarget, error
 	}
 
 	return &reviewTarget{
-		Type:   "pr",
-		Label:  label,
-		Prompt: prompt,
-		Repo:   mrRepo,
+		Type:     "pr",
+		Label:    label,
+		Prompt:   prompt,
+		Repo:     mrRepo,
+		MRNumber: mrNumber,
 	}, nil
 }
 

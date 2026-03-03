@@ -30,9 +30,10 @@ type GathererOptions struct {
 // 它协调多个数据源（代码引用、git 历史、项目文档）的收集，
 // 并通过 AI 提供者进行结构化的架构影响分析。
 type ContextGatherer struct {
-	provider        provider.AIProvider        // AI 提供者，用于执行上下文分析
-	options         GathererOptions            // 收集行为配置选项
-	historyProvider platform.HistoryProvider   // 平台历史提供者（可为 nil）
+	provider        provider.AIProvider      // AI 提供者，用于执行上下文分析
+	options         GathererOptions          // 收集行为配置选项
+	historyProvider platform.HistoryProvider // 平台历史提供者（可为 nil）
+	cwd             string                   // 上下文收集时使用的工作目录
 }
 
 // NewContextGatherer 使用指定的 AI 提供者和配置创建新的 ContextGatherer。
@@ -70,7 +71,17 @@ func NewContextGatherer(p provider.AIProvider, cfg *config.ContextGathererConfig
 		provider:        p,
 		options:         opts,
 		historyProvider: historyProvider,
+		cwd:             ".",
 	}
+}
+
+// SetCwd 设置上下文收集时使用的工作目录。
+func (g *ContextGatherer) SetCwd(cwd string) {
+	if strings.TrimSpace(cwd) == "" {
+		g.cwd = "."
+		return
+	}
+	g.cwd = cwd
 }
 
 // diffFilePattern 匹配 unified diff 中文件路径的正则表达式。
@@ -112,8 +123,8 @@ func extractChangedFiles(diff string) []string {
 //  4. 解析 AI 响应并组合所有数据返回完整的上下文
 //
 // 如果 AI 分析失败，仍会返回部分上下文（不含 AI 分析结果）而不是报错。
-func (g *ContextGatherer) Gather(diff, prNumber, baseBranch string) (*GatheredContext, error) {
-	cwd := "."
+func (g *ContextGatherer) Gather(ctx gocontext.Context, diff, prNumber, baseBranch string) (*GatheredContext, error) {
+	cwd := g.cwd
 	changedFiles := extractChangedFiles(diff)
 
 	// 并行收集三类数据：代码引用、历史 PR、项目文档
@@ -123,15 +134,21 @@ func (g *ContextGatherer) Gather(diff, prNumber, baseBranch string) (*GatheredCo
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() { defer wg.Done(); references = CollectReferences(diff, cwd) }()
-	go func() { defer wg.Done(); relatedPRs, _ = CollectHistory(changedFiles, g.options.History.MaxDays, g.options.History.MaxPRs, cwd, g.historyProvider) }()
+	go func() {
+		defer wg.Done()
+		relatedPRs, _ = CollectHistory(changedFiles, g.options.History.MaxDays, g.options.History.MaxPRs, cwd, g.historyProvider)
+	}()
 	go func() { defer wg.Done(); docs, _ = CollectDocs(g.options.Docs.Patterns, g.options.Docs.MaxSize, cwd) }()
 	wg.Wait()
 
 	// 构建分析提示词并调用 AI 进行分析
 	prompt := BuildAnalysisPrompt(diff, changedFiles, references, relatedPRs, docs)
+	if ctx == nil {
+		ctx = gocontext.Background()
+	}
 
 	response, err := g.provider.Chat(
-		gocontext.Background(),
+		ctx,
 		[]provider.Message{{Role: "user", Content: prompt}},
 		"You are a senior software architect. Analyze the PR context and respond in JSON format only.",
 		nil,

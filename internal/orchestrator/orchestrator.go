@@ -34,16 +34,16 @@ type tokenCount struct {
 //  3. 收集总结并生成最终结论和结构化问题列表
 type DebateOrchestrator struct {
 	reviewers       []Reviewer               // 参与辩论的审查者列表
-	analyzer        Reviewer                  // 预分析器
-	summarizer      Reviewer                  // 总结器/共识判断器
-	contextGatherer ContextGathererInterface  // 上下文收集器
+	analyzer        Reviewer                 // 预分析器
+	summarizer      Reviewer                 // 总结器/共识判断器
+	contextGatherer ContextGathererInterface // 上下文收集器
 
-	options         OrchestratorOptions       // 辩论行为配置
+	options OrchestratorOptions // 辩论行为配置
 
-	conversationHistory []DebateMessage       // 完整的辩论对话历史
+	conversationHistory []DebateMessage        // 完整的辩论对话历史
 	tokenUsage          map[string]*tokenCount // 每个审查者的Token使用量
 	analysis            string                 // 预分析结果
-	gatheredContext      *GatheredContext      // 收集到的代码上下文
+	gatheredContext     *GatheredContext       // 收集到的代码上下文
 	taskPrompt          string                 // 原始任务提示词（包含diff等）
 	lastSeenIndex       map[string]int         // 每个审查者最后看到的消息索引
 
@@ -66,9 +66,10 @@ func New(cfg OrchestratorConfig) *DebateOrchestrator {
 
 // RunStreaming 执行完整的辩论循环，支持并行审查者执行和流式输出。
 // 这是Hydra的核心算法，包含三个阶段：
-//   阶段1：并行执行上下文收集和代码预分析
-//   阶段2：多轮辩论，每轮所有审查者并行执行，可选共识检测提前终止
-//   阶段3：收集审查者总结，生成最终结论，提取结构化问题
+//
+//	阶段1：并行执行上下文收集和代码预分析
+//	阶段2：多轮辩论，每轮所有审查者并行执行，可选共识检测提前终止
+//	阶段3：收集审查者总结，生成最终结论，提取结构化问题
 //
 // 参数：
 //   - label: 任务标识（如PR编号），用于会话标记
@@ -130,7 +131,7 @@ func (o *DebateOrchestrator) runAnalysisPhase(ctx context.Context, label, prompt
 		g.Go(func() error {
 			display.OnWaiting("context-gatherer")
 			diff := extractDiffFromPrompt(prompt)
-			gathered, err := o.contextGatherer.Gather(diff, label, "main")
+			gathered, err := o.contextGatherer.Gather(gctx, diff, label, "main")
 			if err != nil {
 				// 上下文收集失败是非致命的，不影响核心审查流程
 				return nil

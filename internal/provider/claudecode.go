@@ -108,7 +108,10 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 //   --resume <id>             : 复用已有会话（非首次消息时）
 //   --system-prompt <prompt>  : 系统提示（仅首次消息时传入）
 func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool, snap SessionSnapshot) []string {
-	args := []string{"-p", "-"}
+	args := []string{"-p", "-",
+		"--strict-mcp-config",       // 不加载用户配置的 MCP servers，节省内存
+		"--no-session-persistence",  // 不持久化会话到磁盘
+	}
 
 	if p.skipPermissions {
 		args = append(args, "--dangerously-skip-permissions")

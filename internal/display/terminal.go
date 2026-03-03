@@ -5,12 +5,17 @@ package display
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/briandowns/spinner"
 	"github.com/fatih/color"
 	"github.com/guwanhua/hydra/internal/orchestrator"
+	"github.com/mattn/go-isatty"
+	"golang.org/x/term"
 )
 
 // Display 负责管理审查过程中的所有终端输出。
@@ -18,19 +23,43 @@ import (
 // 以及当前审查者和轮次信息用于格式化输出。
 type Display struct {
 	spin            *spinner.Spinner // 终端旋转动画器，用于显示等待/处理中状态
-	currentReviewer string          // 当前正在展示输出的审查者 ID
-	currentRound    int             // 当前审查轮次
-	maxRounds       int             // 最大审查轮次数
+	isTTY           bool             // stdout 是否为 TTY（非 TTY 时禁用 spinner 避免刷屏）
+	termWidth       int              // 终端列宽，用于截断 spinner 文本防止换行
+	currentReviewer string           // 当前正在展示输出的审查者 ID
+	currentRound    int              // 当前审查轮次
+	maxRounds       int              // 最大审查轮次数
+	showToolTrace   bool             // 是否显示 analyzer/reviewer 的完整过程输出
+	traceHintShown  bool             // 默认摘要模式下，是否已提示可用 --show-tool-trace 查看明细
 }
 
 // New 创建一个新的 Display 实例。
 // 初始化旋转动画器（使用字符集 14，120ms 刷新间隔），初始轮次设为 1。
 func New() *Display {
 	s := spinner.New(spinner.CharSets[14], 120*time.Millisecond)
-	return &Display{
-		spin:         s,
-		currentRound: 1,
+	fd := int(os.Stderr.Fd())
+	tty := isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())
+
+	width := 80
+	if tty {
+		if w, _, err := term.GetSize(fd); err == nil && w > 0 {
+			width = w
+		}
 	}
+
+	return &Display{
+		spin:           s,
+		isTTY:          tty,
+		termWidth:      width,
+		currentRound:   1,
+		showToolTrace:  false,
+		traceHintShown: false,
+	}
+}
+
+// SetShowToolTrace 控制是否显示 analyzer/reviewer 的完整过程输出。
+// 默认关闭（仅展示摘要结果）；开启后会实时渲染完整 Markdown 内容。
+func (d *Display) SetShowToolTrace(show bool) {
+	d.showToolTrace = show
 }
 
 // --- 旋转动画方法 ---
@@ -38,25 +67,35 @@ func New() *Display {
 // SpinnerStart 启动旋转动画并显示指定文本。
 // 用于在等待 AI 响应等耗时操作时向用户显示进度。
 func (d *Display) SpinnerStart(text string) {
+	if !d.isTTY {
+		fmt.Fprintf(os.Stderr, "  %s\n", text)
+		return
+	}
 	d.spin.Suffix = "  " + text
 	d.spin.Start()
 }
 
 // SpinnerSucceed 停止旋转动画并显示绿色成功消息。
 func (d *Display) SpinnerSucceed(text string) {
-	d.spin.Stop()
+	if d.isTTY {
+		d.spin.Stop()
+	}
 	color.Green("  %s %s", color.GreenString("✓"), text)
 }
 
 // SpinnerFail 停止旋转动画并显示红色失败消息。
 func (d *Display) SpinnerFail(text string) {
-	d.spin.Stop()
+	if d.isTTY {
+		d.spin.Stop()
+	}
 	color.Red("  %s %s", color.RedString("✗"), text)
 }
 
 // SpinnerStop 停止旋转动画但不打印任何消息。
 func (d *Display) SpinnerStop() {
-	d.spin.Stop()
+	if d.isTTY {
+		d.spin.Stop()
+	}
 }
 
 // --- 审查生命周期方法 ---
@@ -80,6 +119,11 @@ func (d *Display) ReviewHeader(label string, reviewerIDs []string, maxRounds int
 	color.White("  Target:      %s", label)
 	color.White("  Reviewers:   %s", strings.Join(reviewerIDs, ", "))
 	color.White("  Max Rounds:  %d", maxRounds)
+	if d.showToolTrace {
+		color.White("  Trace:       enabled")
+	} else {
+		color.White("  Trace:       summary-only (use --show-tool-trace)")
+	}
 
 	if checkConvergence {
 		color.White("  Convergence: enabled")
@@ -97,7 +141,7 @@ func (d *Display) ReviewHeader(label string, reviewerIDs []string, maxRounds int
 // OnWaiting 在等待审查者、分析器或摘要器响应时显示旋转动画。
 // 根据不同的 reviewerID 显示不同的等待提示文本，并附带随机冷笑话缓解等待焦虑。
 func (d *Display) OnWaiting(reviewerID string) {
-	d.spin.Stop()
+	d.SpinnerStop()
 
 	if reviewerID == "convergence-check" {
 		color.New(color.FgYellow, color.Bold).Printf("\n┌─ Convergence Judge %s\n", strings.Repeat("─", 30))
@@ -122,15 +166,33 @@ func (d *Display) OnWaiting(reviewerID string) {
 		label = fmt.Sprintf("%s is thinking", reviewerID)
 	}
 
-	joke := getRandomJoke()
-	d.spin.Suffix = fmt.Sprintf("  %s... | %s", label, color.HiBlackString(joke))
+	if !d.isTTY {
+		fmt.Fprintf(os.Stderr, "  %s...\n", label)
+		return
+	}
+
+	prefix := fmt.Sprintf("  %s... | ", label)
+	d.spin.Suffix = d.buildSpinnerSuffix(prefix, getRandomJoke())
 	d.spin.Start()
 }
 
 // OnMessage 显示审查者的响应内容。
 // 当审查者切换时打印新的审查者标题头，然后渲染 Markdown 格式的响应内容。
 func (d *Display) OnMessage(reviewerID string, content string) {
-	d.spin.Stop()
+	if !d.showToolTrace {
+		// analyzer 是流式 chunk 回调，默认模式下不逐块展示，避免刷屏
+		if reviewerID == "analyzer" {
+			return
+		}
+		d.SpinnerStop()
+		if !d.traceHintShown {
+			fmt.Println(color.HiBlackString("  Detailed trace is hidden (use --show-tool-trace or -v)."))
+			d.traceHintShown = true
+		}
+		return
+	}
+
+	d.SpinnerStop()
 
 	if reviewerID != d.currentReviewer {
 		d.currentReviewer = reviewerID
@@ -152,9 +214,12 @@ func (d *Display) OnMessage(reviewerID string, content string) {
 // OnParallelStatus 更新旋转动画以显示并行执行的进度。
 // 展示每个审查者的状态（已完成/思考中/等待中）和耗时。
 func (d *Display) OnParallelStatus(round int, statuses []orchestrator.ReviewerStatus) {
+	if !d.isTTY {
+		return
+	}
 	statusLine := formatParallelStatus(round, statuses)
-	joke := getRandomJoke()
-	d.spin.Suffix = fmt.Sprintf("  %s | %s", statusLine, color.HiBlackString(joke))
+	prefix := fmt.Sprintf("  %s | ", statusLine)
+	d.spin.Suffix = d.buildSpinnerSuffix(prefix, getRandomJoke())
 }
 
 // OnRoundComplete 显示审查轮次完成状态。
@@ -188,7 +253,7 @@ func (d *Display) OnConvergenceJudgment(verdict string, reasoning string) {
 // OnContextGathered 展示收集到的系统上下文信息。
 // 包括受影响模块（按影响级别着色）、关联 PR 列表和 AI 生成的上下文摘要。
 func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
-	d.spin.Stop()
+	d.SpinnerStop()
 
 	color.New(color.FgMagenta, color.Bold).Printf("\n%s\n", strings.Repeat("─", 50))
 	color.New(color.FgMagenta, color.Bold).Printf("  System Context\n")
@@ -207,6 +272,7 @@ func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 				impact = color.GreenString("●")
 			}
 			fmt.Printf("  %s %s (%d files)\n", impact, color.HiBlackString(mod.Name), len(mod.AffectedFiles))
+			printAffectedFiles(mod.AffectedFiles, 8)
 		}
 		fmt.Println()
 	}
@@ -229,12 +295,29 @@ func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 	}
 }
 
+// printAffectedFiles 按模块打印受影响文件列表，限制条数避免终端输出过长。
+func printAffectedFiles(files []string, max int) {
+	if len(files) == 0 {
+		return
+	}
+	limit := len(files)
+	if limit > max {
+		limit = max
+	}
+	for _, f := range files[:limit] {
+		fmt.Printf("      - %s\n", color.HiBlackString(f))
+	}
+	if len(files) > max {
+		fmt.Printf("      - %s\n", color.HiBlackString("... +%d more", len(files)-max))
+	}
+}
+
 // --- 结果展示方法 ---
 
 // FinalConclusion 显示最终审查结论。
 // 使用绿色粗体的双线分隔框突出显示，并渲染 Markdown 格式的结论文本。
 func (d *Display) FinalConclusion(text string) {
-	d.spin.Stop()
+	d.SpinnerStop()
 
 	color.New(color.FgGreen, color.Bold).Printf("\n%s\n", strings.Repeat("═", 50))
 	color.New(color.FgGreen, color.Bold).Printf("  Final Conclusion\n")
@@ -389,4 +472,27 @@ var coldJokes = []string{
 // getRandomJoke 从冷笑话集合中随机选取一条返回。
 func getRandomJoke() string {
 	return coldJokes[rand.Intn(len(coldJokes))]
+}
+
+// ansiRe 匹配 ANSI 转义序列，用于计算可见字符长度。
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// visibleLen 返回去除 ANSI 转义序列后的可见字符数。
+func visibleLen(s string) int {
+	return utf8.RuneCountInString(ansiRe.ReplaceAllString(s, ""))
+}
+
+// buildSpinnerSuffix 构造 spinner 后缀文本，自动截断 joke 以确保总长度不超过终端宽度。
+// prefix 是已含 ANSI 码的前半段文本（如 "  Analyzing changes... | "），joke 是纯文本。
+func (d *Display) buildSpinnerSuffix(prefix string, joke string) string {
+	// spinner 字符本身占 1 列
+	available := d.termWidth - 1 - visibleLen(prefix)
+	if available <= 3 {
+		return prefix
+	}
+	jokeRunes := []rune(joke)
+	if len(jokeRunes) > available {
+		joke = string(jokeRunes[:available-3]) + "..."
+	}
+	return prefix + color.HiBlackString(joke)
 }

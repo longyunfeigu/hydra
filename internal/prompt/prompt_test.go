@@ -132,10 +132,11 @@ func TestRender(t *testing.T) {
 
 	t.Run("renders server_review", func(t *testing.T) {
 		result, err := Render("server_review.tmpl", map[string]any{
-			"MRURL":       "https://gitlab.com/mr/1",
-			"Title":       "Fix bug",
-			"Description": "Bug fix description",
-			"Diff":        "+added line",
+			"MRURL":        "https://gitlab.com/mr/1",
+			"Title":        "Fix bug",
+			"Description":  "Bug fix description",
+			"Diff":         "+added line",
+			"HasLocalRepo": true,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -145,6 +146,9 @@ func TestRender(t *testing.T) {
 		}
 		if !strings.Contains(result, "Fix bug") {
 			t.Error("missing Title")
+		}
+		if !strings.Contains(result, "full repository source code is available") {
+			t.Error("missing local repo note")
 		}
 	})
 

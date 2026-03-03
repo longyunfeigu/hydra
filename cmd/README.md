@@ -101,6 +101,8 @@ hydra init
 | `--reviewers` | - | string | 全部 | 逗号分隔的审查者 ID |
 | `--all` | `-a` | bool | false | 使用所有审查者 |
 | `--no-converge` | - | bool | false | 禁用收敛检测 |
+| `--show-tool-trace` | - | bool | false | 显示 analyzer/reviewer 的完整过程输出（默认隐藏） |
+| `--verbose` | `-v` | bool | false | `--show-tool-trace` 的别名 |
 | `--no-post` | - | bool | false | 不发布评论到 PR/MR |
 | `--no-post-summary` | - | bool | false | 不发布总结 note 到 PR/MR |
 | `--skip-context` | - | bool | false | 跳过上下文收集 |

@@ -50,6 +50,7 @@ type openaiRequest struct {
 	Model           string          `json:"model"`
 	Messages        []openaiMessage `json:"messages"`
 	Stream          bool            `json:"stream"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`       // 最大输出 token 数（0 表示使用模型默认值）
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // 推理深度，仅推理模型有效
 }
 
@@ -102,17 +103,20 @@ func buildMessages(messages []Message, systemPrompt string) []openaiMessage {
 // Chat 发送消息并等待完整响应（同步）。使用 WithRetry 进行重试。
 func (p *OpenAIProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, opts *ChatOptions) (string, error) {
 	return WithRetry(func() (string, error) {
-		return p.doChat(ctx, messages, systemPrompt)
+		return p.doChat(ctx, messages, systemPrompt, opts)
 	}, nil)
 }
 
 // doChat 执行实际的 API 调用（非流式）。
-func (p *OpenAIProvider) doChat(ctx context.Context, messages []Message, systemPrompt string) (string, error) {
+func (p *OpenAIProvider) doChat(ctx context.Context, messages []Message, systemPrompt string, opts *ChatOptions) (string, error) {
 	reqBody := openaiRequest{
 		Model:           p.model,
 		Messages:        buildMessages(messages, systemPrompt),
 		Stream:          false,
 		ReasoningEffort: p.reasoningEffort,
+	}
+	if opts != nil && opts.MaxTokens > 0 {
+		reqBody.MaxTokens = opts.MaxTokens
 	}
 
 	body, err := json.Marshal(reqBody)

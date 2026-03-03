@@ -42,6 +42,25 @@ func (g *GitLabPlatform) getHost() string {
 	return "gitlab.com"
 }
 
+// glabHostname 返回用于 glab --hostname 参数的纯主机名（去掉 scheme）。
+// 例如 "http://39.99.155.169" → "39.99.155.169"，"gitlab.com" → "gitlab.com"
+func (g *GitLabPlatform) glabHostname() string {
+	h := g.getHost()
+	if u, err := url.Parse(h); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return h
+}
+
+// glabCmd 创建一个自动附带 --hostname 的 glab 命令（仅自托管 GitLab 时附加）。
+func (g *GitLabPlatform) glabCmd(args ...string) *exec.Cmd {
+	hostname := g.glabHostname()
+	if hostname != "" && hostname != "gitlab.com" {
+		args = append(args, "--hostname", hostname)
+	}
+	return exec.Command("glab", args...)
+}
+
 // DetectRepoFromRemote 从 git remote URL 中检测 GitLab 项目路径。
 // 支持嵌套组路径（如 group/subgroup/project）。
 func (g *GitLabPlatform) DetectRepoFromRemote() (string, error) {
@@ -81,8 +100,8 @@ func encodeProject(repo string) string {
 // glabPostJSON 通过 glab api 发送 JSON POST 请求。
 // 必须设置 Content-Type: application/json，否则 glab 默认不设 Content-Type，
 // 导致 GitLab 返回 415 或将 position 中的整数字段当作字符串处理（inline comment 失效）。
-func glabPostJSON(endpoint string, payload []byte) ([]byte, error) {
-	cmd := exec.Command("glab", "api", endpoint,
+func (g *GitLabPlatform) glabPostJSON(endpoint string, payload []byte) ([]byte, error) {
+	cmd := g.glabCmd("api", endpoint,
 		"--method", "POST",
 		"--input", "-",
 		"-H", "Content-Type: application/json",
@@ -92,8 +111,8 @@ func glabPostJSON(endpoint string, payload []byte) ([]byte, error) {
 }
 
 // glabPutJSON 通过 glab api 发送 JSON PUT 请求。
-func glabPutJSON(endpoint string, payload []byte) ([]byte, error) {
-	cmd := exec.Command("glab", "api", endpoint,
+func (g *GitLabPlatform) glabPutJSON(endpoint string, payload []byte) ([]byte, error) {
+	cmd := g.glabCmd("api", endpoint,
 		"--method", "PUT",
 		"--input", "-",
 		"-H", "Content-Type: application/json",
@@ -108,7 +127,7 @@ func (g *GitLabPlatform) GetDiff(mrID, repo string) (string, error) {
 	if repo != "" {
 		return g.getDiffViaAPI(mrID, repo)
 	}
-	out, err := exec.Command("glab", "mr", "diff", mrID).Output()
+	out, err := g.glabCmd("mr", "diff", mrID).Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get MR diff: %w", err)
 	}
@@ -118,7 +137,7 @@ func (g *GitLabPlatform) GetDiff(mrID, repo string) (string, error) {
 // getDiffViaAPI 通过 glab api 获取 MR diff（不需要 git 上下文）。
 func (g *GitLabPlatform) getDiffViaAPI(mrID, repo string) (string, error) {
 	encoded := encodeProject(repo)
-	out, err := exec.Command("glab", "api",
+	out, err := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/diffs", encoded, mrID),
 	).Output()
 	if err != nil {
@@ -147,7 +166,7 @@ func (g *GitLabPlatform) GetInfo(mrID, repo string) (*platform.MRInfo, error) {
 	if repo != "" {
 		return g.getInfoViaAPI(mrID, repo)
 	}
-	out, err := exec.Command("glab", "mr", "view", mrID, "--output", "json").Output()
+	out, err := g.glabCmd( "mr", "view", mrID, "--output", "json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MR info: %w", err)
 	}
@@ -167,7 +186,7 @@ func (g *GitLabPlatform) GetInfo(mrID, repo string) (*platform.MRInfo, error) {
 // getInfoViaAPI 通过 glab api 获取 MR 信息（不需要 git 上下文）。
 func (g *GitLabPlatform) getInfoViaAPI(mrID, repo string) (*platform.MRInfo, error) {
 	encoded := encodeProject(repo)
-	out, err := exec.Command("glab", "api",
+	out, err := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%s", encoded, mrID),
 	).Output()
 	if err != nil {
@@ -193,7 +212,7 @@ func (g *GitLabPlatform) GetHeadCommitInfo(mrID, repo string) (*platform.CommitI
 	if repo != "" {
 		return g.getHeadCommitInfoViaAPI(mrID, repo)
 	}
-	out, err := exec.Command("glab", "mr", "view", mrID, "--output", "json").Output()
+	out, err := g.glabCmd( "mr", "view", mrID, "--output", "json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MR commit info: %w", err)
 	}
@@ -203,7 +222,7 @@ func (g *GitLabPlatform) GetHeadCommitInfo(mrID, repo string) (*platform.CommitI
 // getHeadCommitInfoViaAPI 通过 glab api 获取 MR 提交信息（不需要 git 上下文）。
 func (g *GitLabPlatform) getHeadCommitInfoViaAPI(mrID, repo string) (*platform.CommitInfo, error) {
 	encoded := encodeProject(repo)
-	out, err := exec.Command("glab", "api",
+	out, err := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%s", encoded, mrID),
 	).Output()
 	if err != nil {
@@ -246,7 +265,7 @@ func (g *GitLabPlatform) GetChangedFiles(mrID, repo string) ([]platform.DiffFile
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	out, err := exec.Command("glab", "api",
+	out, err := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/diffs", encodedProject, mrID),
 	).Output()
 	if err != nil {
@@ -287,7 +306,7 @@ func (g *GitLabPlatform) GetExistingComments(mrID, repo string) []platform.Exist
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	out, err := exec.Command("glab", "api",
+	out, err := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID),
 	).Output()
 	if err != nil {
@@ -339,7 +358,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 			"body": opts.Body,
 			"position": buildTextPosition(opts.Path, *opts.Line, opts.CommitInfo),
 		})
-		out, err := glabPostJSON(endpoint, payload)
+		out, err := g.glabPostJSON(endpoint, payload)
 		if err == nil {
 			util.Debugf("PostComment success mode=inline path=%s line=%d", opts.Path, *opts.Line)
 			return platform.CommentResult{Success: true, Inline: true, Mode: "inline"}
@@ -358,7 +377,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 			"body": lineRef + opts.Body,
 			"position": buildFilePosition(opts.Path, opts.CommitInfo),
 		})
-		out, err := glabPostJSON(endpoint, payload)
+		out, err := g.glabPostJSON(endpoint, payload)
 		if err == nil {
 			util.Debugf("PostComment success mode=file path=%s", opts.Path)
 			return platform.CommentResult{Success: true, Inline: false, Mode: "file"}
@@ -374,7 +393,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		}
 		body := location + opts.Body
 
-		cmd := exec.Command("glab", "mr", "note", mrID, "--unique", "--message", body)
+		cmd := g.glabCmd( "mr", "note", mrID, "--unique", "--message", body)
 		if err := cmd.Run(); err != nil {
 			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
 		}
@@ -502,7 +521,7 @@ func (g *GitLabPlatform) PostReview(mrID string, classified []platform.Classifie
 		}
 		body := location + cc.Input.Body
 
-		cmd := exec.Command("glab", "mr", "note", mrID, "--unique", "--message", body)
+		cmd := g.glabCmd( "mr", "note", mrID, "--unique", "--message", body)
 		if err := cmd.Run(); err == nil {
 			result.Posted++
 			result.Global++
@@ -531,7 +550,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 			"position": buildTextPosition(cc.Input.Path, *cc.Input.Line, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
-		out, err := glabPostJSON(endpoint, payload)
+		out, err := g.glabPostJSON(endpoint, payload)
 		if err != nil {
 			return false // Draft Notes API 不可用
 		}
@@ -553,7 +572,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 			"position": buildFilePosition(cc.Input.Path, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
-		out, err := glabPostJSON(endpoint, payload)
+		out, err := g.glabPostJSON(endpoint, payload)
 		if err != nil {
 			return false
 		}
@@ -571,7 +590,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 		return false
 	}
 
-	cmd := exec.Command("glab", "api",
+	cmd := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes/bulk_publish", encodedProject, mrID),
 		"--method", "POST",
 	)
@@ -660,7 +679,7 @@ func (g *GitLabPlatform) PostNote(mrID, repo, body string) error {
 
 	payload, _ := json.Marshal(map[string]string{"body": body})
 	endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes", encoded, mrID)
-	if _, err := glabPostJSON(endpoint, payload); err != nil {
+	if _, err := g.glabPostJSON(endpoint, payload); err != nil {
 		return fmt.Errorf("failed to post MR note: %w", err)
 	}
 	return nil
@@ -676,7 +695,7 @@ func (g *GitLabPlatform) UpsertSummaryNote(mrID, repo, marker, body string) erro
 	encoded := encodeProject(resolvedRepo)
 
 	listEndpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes", encoded, mrID)
-	out, err := exec.Command("glab", "api", listEndpoint).Output()
+	out, err := g.glabCmd( "api", listEndpoint).Output()
 	if err != nil {
 		return fmt.Errorf("failed to list MR notes: %w", err)
 	}
@@ -693,7 +712,7 @@ func (g *GitLabPlatform) UpsertSummaryNote(mrID, repo, marker, body string) erro
 		if marker != "" && strings.Contains(note.Body, marker) {
 			payload, _ := json.Marshal(map[string]string{"body": body})
 			updateEndpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes/%d", encoded, mrID, note.ID)
-			if _, err := glabPutJSON(updateEndpoint, payload); err != nil {
+			if _, err := g.glabPutJSON(updateEndpoint, payload); err != nil {
 				return fmt.Errorf("failed to update summary note: %w", err)
 			}
 			return nil
@@ -711,7 +730,7 @@ func (g *GitLabPlatform) GetMRDetails(mrNumber int, cwd string) (*platform.MRDet
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	cmd := exec.Command("glab", "api",
+	cmd := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%d", encodedProject, mrNumber),
 	)
 	cmd.Dir = cwd
@@ -733,7 +752,7 @@ func (g *GitLabPlatform) GetMRDetails(mrNumber int, cwd string) (*platform.MRDet
 	}
 
 	// 获取 MR 变更的文件列表
-	changesOut, err := exec.Command("glab", "api",
+	changesOut, err := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/merge_requests/%d/diffs", encodedProject, mrNumber),
 	).Output()
 
@@ -766,7 +785,7 @@ func (g *GitLabPlatform) GetMRsForCommit(commitSHA string, cwd string) ([]int, e
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	cmd := exec.Command("glab", "api",
+	cmd := g.glabCmd( "api",
 		fmt.Sprintf("projects/%s/repository/commits/%s/merge_requests", encodedProject, commitSHA),
 	)
 	cmd.Dir = cwd

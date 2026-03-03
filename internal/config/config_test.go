@@ -26,7 +26,7 @@ analyzer:
   model: claude-code
   prompt: "Analyze the code."
 summarizer:
-  model: mock
+  model: gpt-4o
   prompt: "Summarize findings."
 `
 	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
@@ -56,8 +56,8 @@ summarizer:
 	if cfg.Analyzer.Model != "claude-code" {
 		t.Errorf("Analyzer.Model = %q, want %q", cfg.Analyzer.Model, "claude-code")
 	}
-	if cfg.Summarizer.Model != "mock" {
-		t.Errorf("Summarizer.Model = %q, want %q", cfg.Summarizer.Model, "mock")
+	if cfg.Summarizer.Model != "gpt-4o" {
+		t.Errorf("Summarizer.Model = %q, want %q", cfg.Summarizer.Model, "gpt-4o")
 	}
 }
 
@@ -79,7 +79,7 @@ analyzer:
   model: "${HYDRA_TEST_MODEL}"
   prompt: "analyze"
 summarizer:
-  model: mock
+  model: gpt-4o
   prompt: "summarize"
 `
 	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
@@ -141,7 +141,7 @@ func TestValidateConfig(t *testing.T) {
 				Defaults:   DefaultsConfig{MaxRounds: 1},
 				Reviewers:  map[string]ReviewerConfig{},
 				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
-				Summarizer: ReviewerConfig{Model: "m", Prompt: "p"},
+				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: "p"},
 			},
 			wantErr: true,
 			errMsg:  "at least one reviewer",
@@ -152,7 +152,7 @@ func TestValidateConfig(t *testing.T) {
 				Defaults:   DefaultsConfig{MaxRounds: 1},
 				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
 				Analyzer:   ReviewerConfig{Model: "", Prompt: "p"},
-				Summarizer: ReviewerConfig{Model: "m", Prompt: "p"},
+				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: "p"},
 			},
 			wantErr: true,
 			errMsg:  "analyzer is missing a \"model\" field",
@@ -163,7 +163,7 @@ func TestValidateConfig(t *testing.T) {
 				Defaults:   DefaultsConfig{MaxRounds: 1},
 				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
 				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
-				Summarizer: ReviewerConfig{Model: "m", Prompt: ""},
+				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: ""},
 			},
 			wantErr: true,
 			errMsg:  "summarizer is missing a \"prompt\" field",
@@ -174,10 +174,21 @@ func TestValidateConfig(t *testing.T) {
 				Defaults:   DefaultsConfig{MaxRounds: 0},
 				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
 				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
-				Summarizer: ReviewerConfig{Model: "m", Prompt: "p"},
+				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: "p"},
 			},
 			wantErr: true,
 			errMsg:  "max_rounds must be > 0",
+		},
+		{
+			name: "summarizer must be openai model",
+			cfg: HydraConfig{
+				Defaults:   DefaultsConfig{MaxRounds: 2},
+				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
+				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
+				Summarizer: ReviewerConfig{Model: "claude-code", Prompt: "p"},
+			},
+			wantErr: true,
+			errMsg:  "summarizer.model must be an OpenAI model",
 		},
 		{
 			name: "valid config",
@@ -185,7 +196,7 @@ func TestValidateConfig(t *testing.T) {
 				Defaults:   DefaultsConfig{MaxRounds: 2},
 				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
 				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
-				Summarizer: ReviewerConfig{Model: "m", Prompt: "p"},
+				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: "p"},
 			},
 			wantErr: false,
 		},
