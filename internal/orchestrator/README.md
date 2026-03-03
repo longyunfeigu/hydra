@@ -152,6 +152,50 @@ RunStreaming(ctx, label, prompt, display) -> (*DebateResult, error)
                           FinalConclusion, TokenUsage, ConvergedAtRound, ParsedIssues }
 ```
 
+## 角色分工
+
+```
+角色              调用次数                    作用
+─────────────────────────────────────────────────────────────────
+analyzer          1 次                       预分析 diff，提取审查关注重点
+contextGatherer   1 次                       收集调用链引用、历史 PR、项目文档
+reviewers (N个)   N × 辩论轮数               多轮辩论，互相挑战对方观点
+summarizer        2~4 次                     ① 共识检测 ② 最终结论 ③ 问题结构化（含重试）
+```
+
+其中 summarizer 的调用次数取决于：
+- 共识检测：每次检测 1 次（从第 2 轮到倒数第 2 轮，每轮可能触发一次）
+- 最终结论：1 次（`getFinalConclusion`）
+- 问题结构化：1~3 次（`structurizeIssues`，JSON 解析失败时重试）
+
+## 关键设计点
+
+### 快照式消息构建
+
+在每轮辩论开始时，先为**所有审查者**一次性构建好消息（`orchestrator.go:213-225`），然后再并行执行。这样保证同一轮的所有审查者看到的是**完全相同的信息**——先完成的审查者的输出不会影响后完成的审查者的输入。
+
+```go
+// 先快照，再执行
+tasks := make([]reviewerTask, len(o.reviewers))
+for i, r := range o.reviewers {
+    tasks[i] = reviewerTask{
+        reviewer: r,
+        messages: o.buildMessages(r.ID),  // 快照当前历史
+    }
+}
+// ... 然后并行执行 tasks
+```
+
+如果边执行边构建消息，审查者 A 的输出可能出现在审查者 B 的输入中，导致同一轮内信息不对称。
+
+### 共识检测使用全量消息
+
+`checkConvergence` 将**所有已完成轮次**（而非仅最后一轮）的完整辩论记录发给总结器（`orchestrator.go:567-576`）。这避免了仅看最后一轮导致的误判——某些分歧可能在早期轮次提出但在后续轮次中被忽略而非被解决。
+
+### structurizeIssues 收集所有轮次
+
+`structurizeIssues` 收集每个审查者在**所有轮次**的消息（`orchestrator.go:734-739`），而非只取最后一条。这是因为审查者可能在第 1 轮发现问题 A，第 2 轮转而讨论问题 B，如果只看最后一轮就会丢失问题 A。
+
 ## DebateMessage 示例
 
 辩论对话中的单条消息记录：
@@ -278,6 +322,68 @@ messages = [
     Content: "[security-reviewer 自己在 Round 1 的输出]"    // 作为 assistant 角色维持对话连贯性
   }
 ]
+```
+
+### 消息角色分配规则
+
+AI 对话模型只认三种角色：`system`、`user`、`assistant`。辩论中有多个审查者，但对每个审查者的 AI 来说，世界观是：
+
+```
+system:    系统提示词（"You are a security-focused code reviewer..."）
+user:      人类 + 其他所有审查者的发言 → 统一作为"外部输入"
+assistant: 只有自己之前的发言 → 维持"我说过什么"的连贯性
+```
+
+**非会话模式下的消息构建**（`buildFullContextDebateMessages`，`orchestrator.go:525-545`）：
+
+```go
+// 其他审查者的消息 → user 角色
+for _, msg := range previousRoundsMessages {
+    messages = append(messages, provider.Message{
+        Role:    "user",        // ← 其他人都是 user
+        Content: fmt.Sprintf("[%s]: %s", msg.ReviewerID, msg.Content),
+    })
+}
+
+// 自己之前的消息 → assistant 角色
+for _, m := range o.conversationHistory {
+    if m.ReviewerID == currentReviewerID {
+        messages = append(messages, provider.Message{
+            Role:    "assistant",   // ← 只有自己是 assistant
+            Content: m.Content,
+        })
+    }
+}
+```
+
+**会话模式下的消息构建**（`buildSessionDebateMessages`，`orchestrator.go:490-501`）：
+
+```go
+// 所有其他人的新消息拼成一条 → user 角色
+var parts []string
+for _, m := range newMessages {
+    parts = append(parts, fmt.Sprintf("[%s]: %s", m.ReviewerID, m.Content))
+}
+// 整条作为 user 发送（自己的历史已在 CLI 会话中）
+return []provider.Message{{Role: "user", Content: p}}
+```
+
+**为什么其他审查者不能是 assistant 角色？**
+
+如果把 perf-reviewer 的消息也标为 `assistant`，security-reviewer 的 AI 会认为那些话是**自己说过的**，就无法形成"对方提出了什么观点，我需要回应"的辩论效果。通过 `[perf-reviewer]: ...` 前缀区分身份，用 `user` 角色表示"这是来自外部的输入"。
+
+以第 2 轮 security-reviewer 的视角为例：
+
+```
+messages = [
+  {role: "user",      content: "Task: [diff]...\nYou are [security-reviewer]..."},
+  {role: "user",      content: "[perf-reviewer]: N+1 查询问题..."},    ← 对方观点，需要回应
+  {role: "assistant", content: "SQL 注入漏洞..."},                     ← 我第1轮说的，保持一致
+]
+
+AI 的理解：
+  "我之前说了 SQL 注入的事（assistant），现在有人（user）提出了 N+1 查询问题，
+   我需要回应他的观点并补充新的发现。"
 ```
 
 ## ReviewIssue JSON 示例
@@ -431,9 +537,227 @@ AI 从审查文本中提取的单个结构化问题（`structurizeIssues` 输出
 }
 ```
 
+## structurizeIssues 详细流程
+
+从所有审查者的自由文本审查结果中提取结构化的 JSON 问题列表。整个流程：收集全量消息 → 构建提示词 → AI 提取 → 三层验证 → 去重 → 失败重试。
+
+### 流程图
+
+```
+structurizeIssues(ctx, display)
+  │
+  ├─ 1. 收集全量消息
+  │   ├─ 遍历 conversationHistory，按 reviewerID 分组
+  │   ├─ 跳过 ReviewerID == "user" 的消息
+  │   └─ allMessages = map[reviewerID] → []content（按轮次顺序）
+  │
+  ├─ 2. 构建审查文本
+  │   ├─ 单轮: "[security-reviewer]:\n<内容>"
+  │   ├─ 多轮: "[security-reviewer] Round 1:\n<内容>\n\n[security-reviewer] Round 2:\n<内容>"
+  │   └─ 多个审查者用 "---" 分隔
+  │
+  ├─ 3. 渲染提示词模板
+  │   ├─ structurize_issues.tmpl（首次尝试）
+  │   │   包含: reviewText + reviewerIDs + JSON Schema
+  │   └─ structurize_system.tmpl → "You extract structured issues from code review text. Output only valid JSON."
+  │
+  ├─ 4. 重试循环 (最多 3 次)
+  │   │
+  │   ├─ attempt 1: 使用 basePrompt（structurize_issues.tmpl）
+  │   ├─ attempt 2+: 使用 retryPrompt（structurize_retry.tmpl）
+  │   │   额外包含上次的 ValidationErrors
+  │   │
+  │   ├─ summarizer.Provider.Chat(ctx, msgs, systemPrompt, {DisableTools: true})
+  │   │   注意: DisableTools=true 防止 CLI 提供者调用工具，确保只输出 JSON
+  │   │
+  │   ├─ ParseReviewerOutput(response) → 三层验证:
+  │   │   ├─ 第1层: JSON 提取（```json 代码块 或 原始 JSON 对象）
+  │   │   ├─ 第2层: JSON Schema 校验（schema.ValidateIssuesJSON）
+  │   │   └─ 第3层: 逐条手动验证（severity有效? file非空? title非空? description非空?）
+  │   │
+  │   ├─ 验证通过 → DeduplicateMergedIssues() → return
+  │   │
+  │   └─ 验证失败 → 记录错误到 lastValidationErrors，用于下次重试
+  │       ├─ ParseError (JSON 语法错误) → "JSON parse error: ..."
+  │       ├─ SchemaErrors → schema.FormatErrorsForRetry(vr)
+  │       └─ 0 issues → "JSON was valid but contained 0 issues..."
+  │
+  ├─ 5. bestEffort 兜底
+  │   └─ 3 次都失败时，返回历次尝试中提取到最多问题的结果
+  │
+  └─ 6. 全部失败 → return nil
+```
+
+### 具体例子
+
+假设 2 个审查者完成了 2 轮辩论，`conversationHistory` 有 4 条消息：
+
+**第 1 步：收集全量消息**
+
+```go
+allMessages = {
+    "perf-reviewer":     ["第1轮: N+1查询问题...", "第2轮: 同意SQL注入..."],
+    "security-reviewer": ["第1轮: SQL注入漏洞...", "第2轮: 补充CSRF问题..."],
+}
+```
+
+注意：收集**所有轮次**的消息，而非只取最后一轮。因为审查者可能在第 1 轮发现问题 A，第 2 轮讨论问题 B，只取最后一轮会丢失问题 A。
+
+**第 2 步：构建审查文本**
+
+```
+[perf-reviewer] Round 1:
+## Performance Review
+### 1. N+1 Query Pattern
+The login handler executes a separate query for each permission check...
+
+[perf-reviewer] Round 2:
+## Round 2 Response
+I agree with the SQL injection finding. Additionally, the query lacks connection pooling...
+
+---
+
+[security-reviewer] Round 1:
+## Security Review
+### 1. SQL Injection in auth.go:42
+The query uses string concatenation...
+
+[security-reviewer] Round 2:
+## Round 2 Response
+### 2. Missing CSRF Protection
+The POST endpoint /api/transfer lacks CSRF token...
+```
+
+**第 3 步：AI 提取（假设第 1 次就成功）**
+
+AI 收到上述文本 + JSON Schema，返回：
+
+```json
+{
+  "issues": [
+    {
+      "severity": "high",
+      "file": "internal/handler/auth.go",
+      "line": 42,
+      "title": "SQL injection vulnerability",
+      "description": "String concatenation in SQL query allows injection attacks",
+      "raisedBy": ["security-reviewer", "perf-reviewer"]
+    },
+    {
+      "severity": "medium",
+      "file": "internal/handler/auth.go",
+      "line": 55,
+      "title": "N+1 query pattern in permission check",
+      "description": "Each permission check triggers a separate database query",
+      "raisedBy": ["perf-reviewer"]
+    },
+    {
+      "severity": "medium",
+      "file": "internal/handler/transfer.go",
+      "line": 12,
+      "title": "Missing CSRF protection",
+      "description": "POST endpoint lacks CSRF token validation",
+      "raisedBy": ["security-reviewer"]
+    }
+  ],
+  "verdict": "request_changes",
+  "summary": "Found 1 high and 2 medium severity issues"
+}
+```
+
+**第 4 步：三层验证**
+
+```
+第1层 JSON 提取: ✅ 找到 ```json 代码块
+第2层 Schema 校验: ✅ 所有必填字段存在，severity 值合法
+第3层 手动验证:
+  issue[0]: severity="high" ✅, file="internal/handler/auth.go" ✅, title 非空 ✅, description 非空 ✅ → 保留
+  issue[1]: severity="medium" ✅, file="internal/handler/auth.go" ✅, title 非空 ✅, description 非空 ✅ → 保留
+  issue[2]: severity="medium" ✅, file="internal/handler/transfer.go" ✅, title 非空 ✅, description 非空 ✅ → 保留
+```
+
+**第 5 步：去重**
+
+3 个问题在不同文件或行号差异大，不触发合并 → 直接返回 3 个 `MergedIssue`。
+
+### 重试场景
+
+如果 AI 第 1 次返回了不合法的 JSON：
+
+```
+attempt 1:
+  AI 返回: "Here are the issues: {issues: [...]}"  ← JSON 语法错误（key 没引号）
+  ParseError: "JSON syntax error: invalid character 'i'"
+  lastValidationErrors = "JSON parse error: invalid character 'i'..."
+
+attempt 2:
+  使用 structurize_retry.tmpl，额外包含:
+    "Your previous attempt had these errors:
+     JSON parse error: invalid character 'i'...
+     Please fix these issues and try again."
+  AI 修正后返回合法 JSON
+  → 验证通过 → 返回结果
+```
+
+### bestEffort 兜底
+
+```
+attempt 1: 解析出 3 个 issue，但 schema 校验发现 issue[2] 缺少 description
+           手动验证: 保留 2 个有效 issue → bestEffort = [2 issues]
+           但因为有 schema errors → 继续重试
+
+attempt 2: AI 返回 Chat error（API 超时）
+           bestEffort 仍为 [2 issues]
+
+attempt 3: AI 返回合法 JSON，但只有 1 个 issue
+           1 < 2 → bestEffort 不更新
+
+→ 3 次都没完美成功，返回 bestEffort（2 issues）而非 nil
+```
+
+### ParseReviewerOutput 验证管线
+
+```
+response (原始文本)
+  │
+  ├─ 第1层: JSON 提取
+  │   ├─ 优先: 匹配 ```json ... ``` 代码块 (jsonFenceRe)
+  │   ├─ 回退: 匹配包含 "issues": [...] 的 JSON 对象 (rawJSONRe)
+  │   └─ 都找不到 → ParseError: "no JSON block found"
+  │
+  ├─ 第2层: JSON Schema 校验 (schema.ValidateIssuesJSON)
+  │   ├─ 校验 issues 数组中每个元素的必填字段: severity, file, title, description
+  │   ├─ 校验 severity 枚举值: critical|high|medium|low|nitpick
+  │   └─ 校验失败 → SchemaErrors（但仍继续尝试手动解析）
+  │
+  ├─ 第3层: 逐条手动验证
+  │   ├─ json.Unmarshal 为 map[string]interface{}（灵活解析，容忍额外字段）
+  │   ├─ severity 必须在 validSeverities 中 → 否则跳过
+  │   ├─ file 非空 → 否则跳过
+  │   ├─ 从 file 中提取嵌入行号: "auth.go:42-45" → file="auth.go", line=42, endLine=45
+  │   ├─ title 非空 → 否则跳过
+  │   ├─ description 非空 → 否则跳过
+  │   ├─ category 空 → 默认 "general"
+  │   ├─ verdict 无效 → 默认 "comment"
+  │   └─ 可选字段: line, endLine, suggestedFix, codeSnippet, raisedBy
+  │
+  └─ 返回 ParseResult { Output, RawJSON, SchemaErrors, ParseError }
+```
+
+第 2 层和第 3 层是**互补的**：Schema 校验能发现结构性错误（缺失字段、类型错误），手动验证则提供更细粒度的容错（跳过单个无效 issue 而非整体失败，从文件路径提取行号等）。即使 schema 校验失败，手动验证仍然尝试提取尽可能多的有效 issue。
+
 ## 问题去重算法
 
 跨审查者合并相似问题，避免重复报告。
+
+### 为什么 AI 提取后还需要去重
+
+`structurizeIssues` 的提示词已经要求 AI "merge similar issues"，但实际中 AI 可能：
+- 同一文件同一行的问题，因 title 措辞不同而分开列出
+- 不同审查者用不同术语描述同一问题（如 "SQL injection" vs "unsanitized input"），AI 未能识别为同一问题
+- raisedBy 字段遗漏某个审查者
+
+因此需要一道确定性的程序化去重，确保相似问题被合并。
 
 ### 判定条件
 
@@ -656,3 +980,377 @@ type AIProvider interface {
 ```
 
 支持 `SessionProvider` 的提供者可以维护对话上下文，在 Round 2+ 时只需发送增量消息。
+
+## 会话模式 vs 非会话模式
+
+### 为什么 startSessions 需要类型断言
+
+`Reviewer.Provider` 的类型是 `AIProvider`（基础接口，只有 `Chat`/`ChatStream`）。`SessionProvider` 是扩展接口，增加了 `StartSession`/`EndSession`。**不是所有提供者都支持会话**：
+
+| 提供者 | 实现 SessionProvider？ | 原因 |
+|--------|:---:|------|
+| ClaudeCodeProvider | 是 | `claude --resume` 支持会话续传 |
+| CodexCliProvider | 是 | `codex exec resume` 同理 |
+| OpenAIProvider | 否 | 无状态 HTTP API，无会话概念 |
+| MockProvider | 否 | 测试用 |
+
+类型断言 `provider.(SessionProvider)` 是 Go 的**可选能力检测**模式——有能力就用，没有就跳过：
+
+```go
+// orchestrator.go:111 — 有 StartSession 就调，没有就跳过
+if sp, ok := r.Provider.(provider.SessionProvider); ok {
+    sp.StartSession(...)
+}
+```
+
+如果把 `StartSession` 放进 `AIProvider` 基础接口，就会强迫 OpenAI 和 Mock 实现空方法，违反接口隔离原则。
+
+### 非会话模式（OpenAI）的行为
+
+用 OpenAI 时，整个流程正常运行，只是消息构建策略不同：
+
+```
+startSessions()   → 类型断言失败，跳过（无会话可启动）
+buildMessages()   → hasSession=false，走 buildFullContextDebateMessages 分支
+endAllSessions()  → 类型断言失败，跳过（无会话可释放）
+```
+
+### 两种模式的消息对比
+
+以第 2 轮为例（2 个审查者，security-reviewer 和 perf-reviewer）：
+
+**会话模式 (Claude Code)**——只发增量：
+
+```
+messages = [
+  {role: "user", content: "[perf-reviewer]: 第1轮发言...\n\n---\n\n请继续审查，挑战对方观点..."}
+]
+// 之前的 diff + 分析 + 第1轮自己的输出已在 CLI 会话中，不需要重发
+```
+
+**非会话模式 (OpenAI)**——重发完整上下文：
+
+```
+messages = [
+  {role: "user",      content: "完整 diff + 分析结果 + 辩论规则"},   // 重发
+  {role: "user",      content: "[perf-reviewer]: 第1轮发言..."},    // 其他人的历史
+  {role: "assistant",  content: "自己第1轮的输出"},                  // 自己的历史（assistant 角色）
+]
+```
+
+### Token 消耗对比
+
+```
+假设: diff + 分析 = 5000 tokens, 每轮每人输出 = 1500 tokens
+2 个审查者, 3 轮辩论:
+
+会话模式 (Claude Code):              非会话模式 (OpenAI):
+  第1轮: 5000 × 2 = 10,000            第1轮: 5000 × 2  = 10,000
+  第2轮: 1500 × 2 =  3,000            第2轮: 8000 × 2  = 16,000
+  第3轮: 3000 × 2 =  6,000            第3轮: 11000 × 2 = 22,000
+  ─────────────────────                ──────────────────────────
+  总输入:           ≈ 19,000           总输入:            ≈ 48,000
+```
+
+非会话模式 token 消耗约为会话模式的 **2~3 倍**，因为每轮都重发 diff 和所有历史。但**审查质量相同**——审查者看到的信息内容一样。
+
+### Summarizer 的 Session 生命周期
+
+Summarizer 的 `Chat` 调用看起来是无状态的（每次都传完整的 `msgs`），但如果底层是 Claude Code / Codex，有活跃 session 时 `Chat` 实际会走 `--resume`。需要看调用时 session 是否还活着：
+
+```
+startSessions()                          ← summarizer session 启动
+│
+├─ 阶段 2: 辩论
+│   ├─ checkConvergence()                ← summarizer.Chat() — session 活着，走 --resume
+│   ├─ checkConvergence()                ← 同上，前次 check 的上下文还在 session 里
+│   ...
+│
+├─ 阶段 3: 总结
+│   ├─ collectSummaries()                ← 用的是 reviewer 的 provider，不是 summarizer
+│   │
+│   ├─ summarizer.EndSession()           ← ⭐ 显式结束 session（orchestrator.go:327-329）
+│   │
+│   ├─ 并行:
+│   │   ├─ getFinalConclusion()          ← summarizer.Chat() — session 已结束，真正无状态
+│   │   └─ structurizeIssues()           ← summarizer.Chat() — session 已结束，真正无状态
+```
+
+| 调用点 | session 状态 | 实际行为 |
+|--------|:---:|------|
+| `checkConvergence` | 活着 | 走 `--resume`，前几次 check 的上下文会累积 |
+| `getFinalConclusion` | 已结束 | 真正无状态，独立请求 |
+| `structurizeIssues` | 已结束 | 真正无状态，独立请求 |
+
+**为什么 `runSummaryPhase` 要先 `EndSession`？**
+
+```go
+// orchestrator.go:327-329
+if sp, ok := o.summarizer.Provider.(provider.SessionProvider); ok {
+    sp.EndSession()
+}
+```
+
+两个原因：
+1. **无法并行** — 同一个 CLI session 不能同时接收两个请求，而 `getFinalConclusion` 和 `structurizeIssues` 需要并行执行
+2. **上下文污染** — convergence check 的残留上下文可能干扰 JSON 提取的结果
+
+**`checkConvergence` 走 session 有问题吗？**
+
+没有。虽然 prompt 是自包含的（包含所有轮次的完整辩论记录），session 里会有之前 convergence check 的上下文残留，但每次 prompt 都重新发送完整辩论记录，不依赖 session 中的历史。多了一些冗余 token，但不影响正确性。而且 convergence check 频率低（最多 `MaxRounds - 2` 次）。
+
+**如果 summarizer 用 OpenAI？** 类型断言失败，没有 session，所有 `Chat` 调用都是纯粹的无状态 HTTP 请求。
+
+## runDebateRound 逐行解析
+
+用一个具体例子跟踪每一行代码的执行。假设：
+- 2 个审查者：`security-reviewer`（用 Claude Code）、`perf-reviewer`（用 OpenAI）
+- 当前执行第 2 轮（`round=2`）
+- 第 1 轮已完成，`conversationHistory` 中有 2 条消息
+
+```go
+func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, display DisplayCallbacks) error {
+```
+
+### 第一步：快照式消息构建
+
+```go
+    type reviewerTask struct {
+        reviewer Reviewer
+        messages []provider.Message
+    }
+    tasks := make([]reviewerTask, len(o.reviewers))
+    // tasks = [空task, 空task]
+
+    for i, r := range o.reviewers {
+        tasks[i] = reviewerTask{
+            reviewer: r,
+            messages: o.buildMessages(r.ID),
+        }
+    }
+```
+
+执行过程：
+
+```
+i=0, r=security-reviewer:
+  buildMessages("security-reviewer")
+    → hasSession=true (Claude Code 支持 SessionProvider)
+    → buildSessionDebateMessages(...)
+    → messages = [{role:"user", content:"[perf-reviewer]: 第1轮发言...\n请继续审查..."}]
+  tasks[0] = {reviewer: security-reviewer, messages: [1条增量消息]}
+
+i=1, r=perf-reviewer:
+  buildMessages("perf-reviewer")
+    → hasSession=false (OpenAI 不支持 SessionProvider)
+    → buildFullContextDebateMessages(...)
+    → messages = [
+        {role:"user",      content:"完整diff + 分析 + 辩论规则"},
+        {role:"user",      content:"[security-reviewer]: 第1轮发言..."},
+        {role:"assistant", content:"perf-reviewer自己第1轮的输出"},
+      ]
+  tasks[1] = {reviewer: perf-reviewer, messages: [3条完整上下文消息]}
+```
+
+**关键**：两个 task 的消息都是基于当前 `conversationHistory` 构建的。此时还没有任何审查者执行，所以两人看到的历史是一致的。
+
+### 第二步：初始化 UI 状态
+
+```go
+    statuses := make([]ReviewerStatus, len(o.reviewers))
+    for i, r := range o.reviewers {
+        statuses[i] = ReviewerStatus{
+            ReviewerID: r.ID,
+            Status:     "pending",
+        }
+    }
+    // statuses = [
+    //   {ReviewerID: "security-reviewer", Status: "pending"},
+    //   {ReviewerID: "perf-reviewer",     Status: "pending"},
+    // ]
+
+    display.OnWaiting("round-2")
+    // 终端显示: "⏳ round-2"
+
+    display.OnParallelStatus(2, statuses)
+    // 终端显示:
+    //   security-reviewer: pending
+    //   perf-reviewer:     pending
+```
+
+### 第三步：并行执行
+
+```go
+    type roundResult struct {
+        reviewer     Reviewer
+        fullResponse string
+        inputText    string
+    }
+    results := make([]roundResult, len(tasks))
+    // results = [空result, 空result]  预分配，每个 goroutine 写自己的索引
+
+    rg, rgctx := errgroup.WithContext(ctx)
+    // 创建 errgroup，任何一个 goroutine 失败会取消其他的
+
+    for i, task := range tasks {
+        i, task := i, task   // 捕获循环变量（Go 闭包陷阱）
+        rg.Go(func() error {
+```
+
+**`i, task := i, task` 是什么？**
+Go 的 `for` 循环变量在闭包中是共享的。如果不重新声明，两个 goroutine 可能都用 `i=1`（最后一次迭代的值）。`i, task := i, task` 创建局部副本，确保 goroutine 0 用 `i=0`，goroutine 1 用 `i=1`。
+
+现在两个 goroutine 并行启动：
+
+**goroutine 0 (security-reviewer):**
+
+```go
+            startTime := time.Now().UnixMilli()   // 1705312200000
+            statuses[0] = ReviewerStatus{
+                ReviewerID: "security-reviewer",
+                Status:     "thinking",
+                StartTime:  1705312200000,
+            }
+            display.OnParallelStatus(2, copyStatuses(statuses))
+            // 终端显示:
+            //   security-reviewer: thinking ⏱ 0s
+            //   perf-reviewer:     pending
+```
+
+```go
+            ch, errCh := task.reviewer.Provider.ChatStream(
+                rgctx,
+                task.messages,                    // [1条增量消息]
+                task.reviewer.SystemPrompt,       // "You are a security-focused..."
+            )
+            // ch: 流式输出 channel，逐块返回文本
+            // errCh: 错误 channel，完成后返回 nil 或 error
+
+            var sb strings.Builder
+            for chunk := range ch {
+                sb.WriteString(chunk)
+                // chunk 1: "## Round 2 Response\n\n"
+                // chunk 2: "I agree with perf-reviewer about the N+1..."
+                // chunk 3: "Additionally, the parameterized query fix..."
+                // ... channel 关闭，循环结束
+            }
+            if err := <-errCh; err != nil {
+                return fmt.Errorf("reviewer security-reviewer failed: %w", err)
+            }
+            // err == nil，继续
+```
+
+```go
+            endTime := time.Now().UnixMilli()     // 1705312215000 (15秒后)
+            statuses[0] = ReviewerStatus{
+                ReviewerID: "security-reviewer",
+                Status:     "done",
+                StartTime:  1705312200000,
+                EndTime:    1705312215000,
+                Duration:   15.0,                 // (15000-0)/1000
+            }
+            display.OnParallelStatus(2, copyStatuses(statuses))
+            // 终端显示:
+            //   security-reviewer: done ✅ 15.0s
+            //   perf-reviewer:     thinking ⏱ 12s  (另一个 goroutine 还在跑)
+```
+
+```go
+            // 拼接所有消息内容 + 系统提示词，用于 token 估算
+            var inputParts []string
+            for _, m := range task.messages {
+                inputParts = append(inputParts, m.Content)
+            }
+            inputText := strings.Join(inputParts, "\n") + task.reviewer.SystemPrompt
+            // inputText = "[perf-reviewer]: 第1轮...\n请继续审查...\nYou are a security-focused..."
+
+            results[0] = roundResult{
+                reviewer:     security-reviewer,
+                fullResponse: "## Round 2 Response\n\nI agree with perf-reviewer...",
+                inputText:    inputText,
+            }
+            return nil
+        })
+```
+
+**goroutine 1 (perf-reviewer)** 同时执行，流程相同，写入 `results[1]`。
+
+### 第四步：等待所有 goroutine 完成
+
+```go
+    if err := rg.Wait(); err != nil {
+        return err   // 任何一个审查者失败就返回错误
+    }
+    // 两个 goroutine 都成功完成
+```
+
+`errgroup.Wait()` 阻塞直到所有 goroutine 返回。如果某个审查者的 AI 调用失败（比如 API 超时），`errgroup` 会取消其他 goroutine 的 context（`rgctx`），并返回第一个错误。
+
+### 第五步：统一写入历史
+
+```go
+    for _, r := range results {
+        o.trackTokens(r.reviewer.ID, r.inputText, r.fullResponse)
+        // 估算并累加 token 消耗（线程安全，有 mutex）
+
+        o.conversationHistory = append(o.conversationHistory, DebateMessage{
+            ReviewerID: r.reviewer.ID,
+            Content:    r.fullResponse,
+            Timestamp:  time.Now(),
+        })
+        // conversationHistory 现在有 4 条消息:
+        //   [0] security-reviewer 第1轮
+        //   [1] perf-reviewer 第1轮
+        //   [2] security-reviewer 第2轮  ← 新增
+        //   [3] perf-reviewer 第2轮      ← 新增
+
+        o.markAsSeen(r.reviewer.ID)
+        // lastSeenIndex["security-reviewer"] = 2 (消息索引)
+        // lastSeenIndex["perf-reviewer"] = 3
+
+        display.OnMessage(r.reviewer.ID, r.fullResponse)
+        // 终端显示审查者的完整响应
+    }
+
+    return nil
+}
+```
+
+**为什么在所有 goroutine 完成后才统一写入？** 如果在每个 goroutine 内部直接写 `conversationHistory`，需要加锁防并发写入，而且消息顺序不确定（取决于哪个 goroutine 先完成）。统一写入保证消息顺序始终是 `results[0]` 在前 `results[1]` 在后，且不需要额外加锁。
+
+### 完整时间线
+
+```
+时间轴 (秒)
+0s   ├─ 构建 tasks[0] 和 tasks[1] 的消息（快照）
+     ├─ UI: "round-2"，两个审查者状态 = pending
+     │
+0.1s ├─ 启动 goroutine 0 (security-reviewer) ──────────────────┐
+     ├─ 启动 goroutine 1 (perf-reviewer)    ──────────────┐    │
+     │                                                     │    │
+     │  UI: security-reviewer: thinking                    │    │
+     │      perf-reviewer:     thinking                    │    │
+     │                                                     │    │
+     │  goroutine 1:                                       │    │
+     │    ChatStream → 流式接收 chunks...                   │    │
+     │                                                     │    │
+     │  goroutine 0:                                       │    │
+     │    ChatStream → 流式接收 chunks...                   │    │
+     │                                                     │    │
+12s  │  goroutine 1 完成                                   │    │
+     │  UI: perf-reviewer: done ✅ 12.0s                   ├────┤
+     │      security-reviewer: thinking ⏱ 12s              │    │
+     │                                                     │    │
+15s  │  goroutine 0 完成                                   │    │
+     │  UI: security-reviewer: done ✅ 15.0s               ├────┤
+     │                                                          │
+     ├─ rg.Wait() 返回                                          │
+     │                                                          │
+15.1s├─ 统一写入 conversationHistory                             │
+     │  ├─ trackTokens("security-reviewer", ...)                │
+     │  ├─ append(DebateMessage{security-reviewer, ...})        │
+     │  ├─ trackTokens("perf-reviewer", ...)                    │
+     │  └─ append(DebateMessage{perf-reviewer, ...})            │
+     │                                                          │
+     └─ return nil ─────────────────────────────────────────────┘
+```

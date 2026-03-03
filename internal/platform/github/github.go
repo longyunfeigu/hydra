@@ -3,6 +3,7 @@
 package github
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/guwanhua/hydra/internal/platform"
+	"github.com/guwanhua/hydra/internal/util"
 )
 
 // repoRegex 用于从 GitHub 远程 URL 中提取 owner/repo 格式的仓库标识
@@ -35,6 +37,28 @@ func New() *GitHubPlatform {
 
 func (g *GitHubPlatform) Name() string {
 	return "github"
+}
+
+// ghPostJSON 通过 gh api 发送 JSON POST 请求。
+func ghPostJSON(endpoint string, payload []byte) ([]byte, error) {
+	cmd := exec.Command("gh", "api", endpoint,
+		"--method", "POST",
+		"--input", "-",
+		"-H", "Content-Type: application/json",
+	)
+	cmd.Stdin = strings.NewReader(string(payload))
+	return cmd.CombinedOutput()
+}
+
+// ghPatchJSON 通过 gh api 发送 JSON PATCH 请求。
+func ghPatchJSON(endpoint string, payload []byte) ([]byte, error) {
+	cmd := exec.Command("gh", "api", endpoint,
+		"--method", "PATCH",
+		"--input", "-",
+		"-H", "Content-Type: application/json",
+	)
+	cmd.Stdin = strings.NewReader(string(payload))
+	return cmd.CombinedOutput()
 }
 
 // DetectRepoFromRemote 从 git remote URL 中检测 GitHub 仓库标识。
@@ -148,6 +172,13 @@ type diffFile struct {
 	Patch    string `json:"patch"`
 }
 
+// issueComment 表示 GitHub issue comments API 的精简字段。
+// PR 的全局评论复用 issue comments API。
+type issueComment struct {
+	ID   int    `json:"id"`
+	Body string `json:"body"`
+}
+
 // GetChangedFiles 获取 PR 中的变更文件列表。
 func (g *GitHubPlatform) GetChangedFiles(mrID, repo string) ([]platform.DiffFile, error) {
 	if err := validatePRNumber(mrID); err != nil {
@@ -232,7 +263,7 @@ func (g *GitHubPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		)
 		cmd.Stdin = strings.NewReader(string(payload))
 		if err := cmd.Run(); err == nil {
-			return platform.CommentResult{Success: true, Inline: true}
+			return platform.CommentResult{Success: true, Inline: true, Mode: "inline"}
 		}
 	}
 
@@ -254,7 +285,7 @@ func (g *GitHubPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		)
 		cmd.Stdin = strings.NewReader(string(payload))
 		if err := cmd.Run(); err == nil {
-			return platform.CommentResult{Success: true, Inline: true}
+			return platform.CommentResult{Success: true, Inline: false, Mode: "file"}
 		}
 	}
 
@@ -275,7 +306,7 @@ func (g *GitHubPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		if err := cmd.Run(); err != nil {
 			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
 		}
-		return platform.CommentResult{Success: true, Inline: false}
+		return platform.CommentResult{Success: true, Inline: false, Mode: "global"}
 	}
 }
 
@@ -368,9 +399,12 @@ func (g *GitHubPlatform) PostReview(mrID string, classified []platform.Classifie
 				})
 				if cr.Success {
 					result.Posted++
-					if cr.Inline {
+					switch cr.Mode {
+					case "inline":
 						result.Inline++
-					} else {
+					case "file":
+						result.FileLevel++
+					default:
 						result.Global++
 					}
 				} else {
@@ -402,6 +436,8 @@ func (g *GitHubPlatform) PostReview(mrID string, classified []platform.Classifie
 		}
 	}
 
+	util.Debugf("PostReview final result: posted=%d inline=%d file=%d global=%d failed=%d skipped=%d",
+		result.Posted, result.Inline, result.FileLevel, result.Global, result.Failed, result.Skipped)
 	return result
 }
 
@@ -439,6 +475,97 @@ func (g *GitHubPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 
 	classified := platform.ClassifyCommentsByDiff(comments, diffInfo)
 	return g.PostReview(mrID, classified, *commitInfo, repo)
+}
+
+// PostNote 在 PR 上发布一条全局 note（评论）。
+func (g *GitHubPlatform) PostNote(mrID, repo, body string) error {
+	if err := validatePRNumber(mrID); err != nil {
+		return err
+	}
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return err
+	}
+
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	endpoint := fmt.Sprintf("repos/%s/issues/%s/comments", resolvedRepo, mrID)
+	if _, err := ghPostJSON(endpoint, payload); err != nil {
+		return fmt.Errorf("failed to post PR note: %w", err)
+	}
+	return nil
+}
+
+// UpsertSummaryNote upsert Hydra 的总结 note（通过 marker 匹配已有 note）。
+// 找到 marker 则更新该 note，否则创建新 note。
+func (g *GitHubPlatform) UpsertSummaryNote(mrID, repo, marker, body string) error {
+	if err := validatePRNumber(mrID); err != nil {
+		return err
+	}
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return err
+	}
+
+	comments, err := g.listIssueComments(mrID, resolvedRepo)
+	if err != nil {
+		return fmt.Errorf("failed to list PR notes: %w", err)
+	}
+
+	if commentID := findLatestIssueCommentIDByMarker(comments, marker); commentID > 0 {
+		payload, _ := json.Marshal(map[string]string{"body": body})
+		endpoint := fmt.Sprintf("repos/%s/issues/comments/%d", resolvedRepo, commentID)
+		if _, err := ghPatchJSON(endpoint, payload); err != nil {
+			return fmt.Errorf("failed to update summary note: %w", err)
+		}
+		return nil
+	}
+
+	return g.PostNote(mrID, resolvedRepo, body)
+}
+
+// listIssueComments 获取 PR 的 issue comments（用于 summary upsert）。
+func (g *GitHubPlatform) listIssueComments(mrID, resolvedRepo string) ([]issueComment, error) {
+	out, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/issues/%s/comments", resolvedRepo, mrID),
+		"--paginate",
+		"--jq", ".[] | @base64",
+	).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	comments := make([]issueComment, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(line)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode issue comment row: %w", err)
+		}
+		var c issueComment
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return nil, fmt.Errorf("failed to parse issue comment row: %w", err)
+		}
+		comments = append(comments, c)
+	}
+	return comments, nil
+}
+
+// findLatestIssueCommentIDByMarker 返回包含 marker 的最新 comment ID（按 ID 最大值）。
+func findLatestIssueCommentIDByMarker(comments []issueComment, marker string) int {
+	if marker == "" {
+		return 0
+	}
+	latestID := 0
+	for _, c := range comments {
+		if c.ID > latestID && strings.Contains(c.Body, marker) {
+			latestID = c.ID
+		}
+	}
+	return latestID
 }
 
 // GetMRDetails 获取单个 PR 的详细信息，用于历史 PR 关联。

@@ -232,3 +232,83 @@ func TestChatStreamHTTPError(t *testing.T) {
 		t.Errorf("expected 429 in error, got: %v", gotErr)
 	}
 }
+
+func TestReasoningEffortInRequest(t *testing.T) {
+	t.Run("reasoning_effort included when set", func(t *testing.T) {
+		var gotReq openaiRequest
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&gotReq)
+			resp := openaiResponse{
+				Choices: []openaiChoice{
+					{Message: openaiMessage{Role: "assistant", Content: "ok"}},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		}))
+		defer server.Close()
+
+		p := NewOpenAIProvider("key", "gpt-5.2", server.URL)
+		p.reasoningEffort = "medium"
+
+		_, err := p.Chat(context.Background(), []Message{
+			{Role: "user", Content: "test"},
+		}, "", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotReq.ReasoningEffort != "medium" {
+			t.Errorf("expected reasoning_effort=medium, got %q", gotReq.ReasoningEffort)
+		}
+	})
+
+	t.Run("reasoning_effort omitted when empty", func(t *testing.T) {
+		var rawBody map[string]interface{}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&rawBody)
+			resp := openaiResponse{
+				Choices: []openaiChoice{
+					{Message: openaiMessage{Role: "assistant", Content: "ok"}},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		}))
+		defer server.Close()
+
+		p := NewOpenAIProvider("key", "gpt-4o", server.URL)
+
+		_, err := p.Chat(context.Background(), []Message{
+			{Role: "user", Content: "test"},
+		}, "", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, exists := rawBody["reasoning_effort"]; exists {
+			t.Error("reasoning_effort should be omitted from JSON when empty")
+		}
+	})
+
+	t.Run("reasoning_effort in stream request", func(t *testing.T) {
+		var gotReq openaiRequest
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&gotReq)
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+		}))
+		defer server.Close()
+
+		p := NewOpenAIProvider("key", "gpt-5.2", server.URL)
+		p.reasoningEffort = "high"
+
+		chunks, errs := p.ChatStream(context.Background(), []Message{
+			{Role: "user", Content: "test"},
+		}, "")
+		for range chunks {
+		}
+		for range errs {
+		}
+
+		if gotReq.ReasoningEffort != "high" {
+			t.Errorf("expected reasoning_effort=high in stream, got %q", gotReq.ReasoningEffort)
+		}
+	})
+}

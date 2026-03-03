@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
+	"github.com/guwanhua/hydra/internal/prompt"
 	"github.com/guwanhua/hydra/internal/provider"
+	"github.com/guwanhua/hydra/internal/schema"
 	"github.com/guwanhua/hydra/internal/util"
 	"golang.org/x/sync/errgroup"
 )
@@ -26,9 +29,9 @@ type tokenCount struct {
 // 它协调多个AI审查者进行多轮辩论，通过对抗性讨论发现代码中的问题。
 //
 // 核心流程：
-//   1. 并行执行上下文收集和代码预分析
-//   2. 多轮辩论：每轮所有审查者并行执行，互相挑战对方的观点
-//   3. 收集总结并生成最终结论和结构化问题列表
+//  1. 并行执行上下文收集和代码预分析
+//  2. 多轮辩论：每轮所有审查者并行执行，互相挑战对方的观点
+//  3. 收集总结并生成最终结论和结构化问题列表
 type DebateOrchestrator struct {
 	reviewers       []Reviewer               // 参与辩论的审查者列表
 	analyzer        Reviewer                  // 预分析器
@@ -72,18 +75,38 @@ func New(cfg OrchestratorConfig) *DebateOrchestrator {
 //   - prompt: 包含代码diff的完整审查提示词
 //   - display: 终端UI回调接口，用于实时更新显示
 func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt string, display DisplayCallbacks) (*DebateResult, error) {
-	// 重置所有状态，确保每次执行都是干净的
+	o.reset(prompt)
+	o.startSessions(label)
+	defer o.endAllSessions()
+
+	// 阶段1: 并行执行上下文收集和预分析
+	if err := o.runAnalysisPhase(ctx, label, prompt, display); err != nil {
+		return nil, err
+	}
+
+	// 阶段2: 多轮辩论
+	convergedAtRound, err := o.runDebatePhase(ctx, display)
+	if err != nil {
+		return nil, err
+	}
+
+	// 阶段3: 总结 + 结论 + 问题提取
+	return o.runSummaryPhase(ctx, label, display, convergedAtRound)
+}
+
+// reset 重置所有状态，确保每次执行都是干净的。
+func (o *DebateOrchestrator) reset(prompt string) {
 	o.conversationHistory = nil
 	o.tokenUsage = make(map[string]*tokenCount)
 	o.lastSeenIndex = make(map[string]int)
 	o.analysis = ""
 	o.gatheredContext = nil
 	o.taskPrompt = prompt
+}
 
-	var convergedAtRound *int // 记录在哪一轮达成共识（nil表示未达成）
-
-	// 为支持会话的AI提供者启动会话
-	// 会话模式下，提供者可以维护对话上下文，避免重复发送完整历史
+// startSessions 为支持会话的AI提供者启动会话。
+// 会话模式下，提供者可以维护对话上下文，避免重复发送完整历史。
+func (o *DebateOrchestrator) startSessions(label string) {
 	for _, r := range o.reviewers {
 		if sp, ok := r.Provider.(provider.SessionProvider); ok {
 			sp.StartSession(fmt.Sprintf("Hydra | %s | reviewer:%s", label, r.ID))
@@ -95,11 +118,11 @@ func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt str
 	if sp, ok := o.summarizer.Provider.(provider.SessionProvider); ok {
 		sp.StartSession(fmt.Sprintf("Hydra | %s | summarizer", label))
 	}
+}
 
-	defer o.endAllSessions() // 确保所有会话在函数退出时被清理
-
-	// ========== 阶段1：并行执行上下文收集和代码预分析 ==========
-	// 上下文收集和预分析互不依赖，可以并行执行以减少总耗时
+// runAnalysisPhase 并行执行上下文收集和代码预分析。
+// 上下文收集和预分析互不依赖，可以并行执行以减少总耗时。
+func (o *DebateOrchestrator) runAnalysisPhase(ctx context.Context, label, prompt string, display DisplayCallbacks) error {
 	g, gctx := errgroup.WithContext(ctx)
 
 	// 上下文收集：从代码仓库中提取与变更相关的调用链、模块关系等信息
@@ -137,7 +160,7 @@ func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt str
 	})
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return err
 	}
 
 	// 通知UI层上下文收集已完成，可以展示相关信息
@@ -145,107 +168,17 @@ func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt str
 		display.OnContextGathered(o.gatheredContext)
 	}
 
-	// ========== 阶段2：多轮辩论 ==========
-	// 每轮辩论中，所有审查者并行执行，然后检查是否达成共识
+	return nil
+}
+
+// runDebatePhase 执行多轮辩论，返回达成共识的轮次（nil表示未达成）。
+// 每轮辩论中，所有审查者并行执行，然后检查是否达成共识。
+func (o *DebateOrchestrator) runDebatePhase(ctx context.Context, display DisplayCallbacks) (*int, error) {
+	var convergedAtRound *int
+
 	for round := 1; round <= o.options.MaxRounds; round++ {
-		// 在执行前为所有审查者构建消息（快照，确保所有审查者看到相同的信息）
-		// 这样避免了先执行的审查者的输出影响后执行审查者的输入
-		type reviewerTask struct {
-			reviewer Reviewer
-			messages []provider.Message
-		}
-		tasks := make([]reviewerTask, len(o.reviewers))
-		for i, r := range o.reviewers {
-			tasks[i] = reviewerTask{
-				reviewer: r,
-				messages: o.buildMessages(r.ID),
-			}
-		}
-
-		// 初始化每个审查者的状态追踪，用于UI实时显示
-		statuses := make([]ReviewerStatus, len(o.reviewers))
-		for i, r := range o.reviewers {
-			statuses[i] = ReviewerStatus{
-				ReviewerID: r.ID,
-				Status:     "pending",
-			}
-		}
-
-		display.OnWaiting(fmt.Sprintf("round-%d", round))
-		display.OnParallelStatus(round, statuses)
-
-		// 并行执行所有审查者，每个审查者在独立的goroutine中运行
-		type reviewerResult struct {
-			reviewer     Reviewer
-			fullResponse string
-			inputText    string
-		}
-		results := make([]reviewerResult, len(tasks))
-
-		rg, rgctx := errgroup.WithContext(ctx)
-		for i, task := range tasks {
-			i, task := i, task
-			rg.Go(func() error {
-				// 标记审查者状态为"思考中"，记录开始时间
-				startTime := time.Now().UnixMilli()
-				statuses[i] = ReviewerStatus{
-					ReviewerID: task.reviewer.ID,
-					Status:     "thinking",
-					StartTime:  startTime,
-				}
-				display.OnParallelStatus(round, copyStatuses(statuses))
-
-				// 流式接收审查者的响应，逐块读取
-				ch, errCh := task.reviewer.Provider.ChatStream(rgctx, task.messages, task.reviewer.SystemPrompt)
-				var sb strings.Builder
-				for chunk := range ch {
-					sb.WriteString(chunk)
-				}
-				if err := <-errCh; err != nil {
-					return fmt.Errorf("reviewer %s failed: %w", task.reviewer.ID, err)
-				}
-
-				// 标记审查者状态为"已完成"，记录结束时间和耗时
-				endTime := time.Now().UnixMilli()
-				statuses[i] = ReviewerStatus{
-					ReviewerID: task.reviewer.ID,
-					Status:     "done",
-					StartTime:  startTime,
-					EndTime:    endTime,
-					Duration:   float64(endTime-startTime) / 1000.0,
-				}
-				display.OnParallelStatus(round, copyStatuses(statuses))
-
-				var inputParts []string
-				for _, m := range task.messages {
-					inputParts = append(inputParts, m.Content)
-				}
-				inputText := strings.Join(inputParts, "\n") + task.reviewer.SystemPrompt
-
-				results[i] = reviewerResult{
-					reviewer:     task.reviewer,
-					fullResponse: sb.String(),
-					inputText:    inputText,
-				}
-				return nil
-			})
-		}
-
-		if err := rg.Wait(); err != nil {
+		if err := o.runDebateRound(ctx, round, display); err != nil {
 			return nil, err
-		}
-
-		// 所有审查者完成后，将结果添加到对话历史并通知UI
-		// 注意：必须在所有审查者完成后统一添加，保证消息顺序一致
-		for _, r := range results {
-			o.trackTokens(r.reviewer.ID, r.inputText, r.fullResponse)
-			o.conversationHistory = append(o.conversationHistory, DebateMessage{
-				ReviewerID: r.reviewer.ID,
-				Content:    r.fullResponse,
-				Timestamp:  time.Now(),
-			})
-			o.markAsSeen(r.reviewer.ID)
-			display.OnMessage(r.reviewer.ID, r.fullResponse)
 		}
 
 		// 共识检测：从第2轮开始（且不是最后一轮）检查审查者是否已达成共识
@@ -272,7 +205,116 @@ func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt str
 		}
 	}
 
-	// ========== 阶段3：收集总结和最终结论 ==========
+	return convergedAtRound, nil
+}
+
+// runDebateRound 执行单轮辩论：构建消息、并行执行所有审查者、收集结果到对话历史。
+func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, display DisplayCallbacks) error {
+	// 在执行前为所有审查者构建消息（快照，确保所有审查者看到相同的信息）
+	// 这样避免了先执行的审查者的输出影响后执行审查者的输入
+	type reviewerTask struct {
+		reviewer Reviewer
+		messages []provider.Message
+	}
+	tasks := make([]reviewerTask, len(o.reviewers))
+	for i, r := range o.reviewers {
+		tasks[i] = reviewerTask{
+			reviewer: r,
+			messages: o.buildMessages(r.ID),
+		}
+	}
+
+	// 初始化每个审查者的状态追踪，用于UI实时显示
+	statuses := make([]ReviewerStatus, len(o.reviewers))
+	for i, r := range o.reviewers {
+		statuses[i] = ReviewerStatus{
+			ReviewerID: r.ID,
+			Status:     "pending",
+		}
+	}
+
+	display.OnWaiting(fmt.Sprintf("round-%d", round))
+	display.OnParallelStatus(round, statuses)
+
+	// 并行执行所有审查者，每个审查者在独立的goroutine中运行
+	type roundResult struct {
+		reviewer     Reviewer
+		fullResponse string
+		inputText    string
+	}
+	results := make([]roundResult, len(tasks))
+
+	rg, rgctx := errgroup.WithContext(ctx)
+	for i, task := range tasks {
+		i, task := i, task
+		rg.Go(func() error {
+			// 标记审查者状态为"思考中"，记录开始时间
+			startTime := time.Now().UnixMilli()
+			statuses[i] = ReviewerStatus{
+				ReviewerID: task.reviewer.ID,
+				Status:     "thinking",
+				StartTime:  startTime,
+			}
+			display.OnParallelStatus(round, copyStatuses(statuses))
+
+			// 流式接收审查者的响应，逐块读取
+			ch, errCh := task.reviewer.Provider.ChatStream(rgctx, task.messages, task.reviewer.SystemPrompt)
+			var sb strings.Builder
+			for chunk := range ch {
+				sb.WriteString(chunk)
+			}
+			if err := <-errCh; err != nil {
+				return fmt.Errorf("reviewer %s failed: %w", task.reviewer.ID, err)
+			}
+
+			// 标记审查者状态为"已完成"，记录结束时间和耗时
+			endTime := time.Now().UnixMilli()
+			statuses[i] = ReviewerStatus{
+				ReviewerID: task.reviewer.ID,
+				Status:     "done",
+				StartTime:  startTime,
+				EndTime:    endTime,
+				Duration:   float64(endTime-startTime) / 1000.0,
+			}
+			display.OnParallelStatus(round, copyStatuses(statuses))
+
+			var inputParts []string
+			for _, m := range task.messages {
+				inputParts = append(inputParts, m.Content)
+			}
+			inputText := strings.Join(inputParts, "\n") + task.reviewer.SystemPrompt
+
+			results[i] = roundResult{
+				reviewer:     task.reviewer,
+				fullResponse: sb.String(),
+				inputText:    inputText,
+			}
+			return nil
+		})
+	}
+
+	if err := rg.Wait(); err != nil {
+		return err
+	}
+
+	// 所有审查者完成后，将结果添加到对话历史并通知UI
+	// 注意：必须在所有审查者完成后统一添加，保证消息顺序一致
+	for _, r := range results {
+		o.trackTokens(r.reviewer.ID, r.inputText, r.fullResponse)
+		o.conversationHistory = append(o.conversationHistory, DebateMessage{
+			ReviewerID: r.reviewer.ID,
+			Content:    r.fullResponse,
+			Timestamp:  time.Now(),
+		})
+		o.markAsSeen(r.reviewer.ID)
+		display.OnMessage(r.reviewer.ID, r.fullResponse)
+	}
+
+	return nil
+}
+
+// runSummaryPhase 收集审查者总结，生成最终结论和结构化问题列表。
+func (o *DebateOrchestrator) runSummaryPhase(ctx context.Context, label string, display DisplayCallbacks, convergedAtRound *int) (*DebateResult, error) {
 	// 辩论结束后，收集每个审查者的最终总结，然后由总结器生成统一结论
 	display.OnWaiting("summarizer")
 	summaries, err := o.collectSummaries(ctx)
@@ -320,6 +362,8 @@ func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt str
 	}, nil
 }
 
+// ========== 消息构建 ==========
+
 // buildMessages 根据当前轮次为指定审查者构建消息列表。
 // 第1轮：构建包含任务、上下文、分析结果和关注重点的独立审查提示
 // 第2轮及之后：
@@ -337,6 +381,12 @@ func (o *DebateOrchestrator) buildMessages(currentReviewerID string) []provider.
 	}
 	isFirstCall := lastSeen < 0
 
+	// 第1轮：独立审查
+	if isFirstCall {
+		return o.buildFirstRoundMessages(currentReviewerID)
+	}
+
+	// 第2轮及之后：收集辩论上下文
 	var otherIDs []string
 	for _, r := range o.reviewers {
 		if r.ID != currentReviewerID {
@@ -344,40 +394,49 @@ func (o *DebateOrchestrator) buildMessages(currentReviewerID string) []provider.
 		}
 	}
 
-	// 第1轮：独立审查 - 每个审查者独立审查代码，不受其他审查者影响
-	if isFirstCall {
-		var contextSection string
-		if o.gatheredContext != nil && o.gatheredContext.Summary != "" {
-			contextSection = fmt.Sprintf("\n## System Context\n%s\n\n", o.gatheredContext.Summary)
-		}
+	myMessageCount, previousRoundsMessages := o.collectPreviousRoundsMessages(currentReviewerID)
 
-		var focusSection string
-		focusAreas := ParseFocusAreas(o.analysis)
-		if len(focusAreas) > 0 {
-			focusSection = fmt.Sprintf("\nThe analyzer suggests focusing on: %s.\nThese are suggestions -- also flag anything else you notice beyond these areas.\n",
-				strings.Join(focusAreas, "; "))
-		}
+	if hasSession {
+		return o.buildSessionDebateMessages(currentReviewerID, myMessageCount, previousRoundsMessages)
+	}
+	return o.buildFullContextDebateMessages(currentReviewerID, otherIDs, previousRoundsMessages)
+}
 
-		var callChainSection string
-		if o.gatheredContext != nil && len(o.gatheredContext.RawReferences) > 0 {
-			callChainSection = "\n" + FormatCallChainForReviewer(o.gatheredContext.RawReferences) + "\n"
-		}
-
-		prompt := fmt.Sprintf(`Task: %s
-%s%s%sHere is the analysis:
-
-%s
-
-You are [%s]. Review EVERY changed file and EVERY changed function/block -- do not skip any.
-For each change, check: correctness, security, performance, error handling, edge cases, maintainability.
-IMPORTANT: For each issue, always reference the exact file path and line number (e.g. "base_parser.py:263" or "line 263 in base_parser.py"). Line numbers are critical for inline comments.
-If you reviewed a file and found no issues, say so briefly. Do not stop early.`,
-			o.taskPrompt, contextSection, focusSection, callChainSection, o.analysis, currentReviewerID)
-
-		return []provider.Message{{Role: "user", Content: prompt}}
+// buildFirstRoundMessages 构建第一轮独立审查的消息。
+// 每个审查者独立审查代码，不受其他审查者影响。
+func (o *DebateOrchestrator) buildFirstRoundMessages(currentReviewerID string) []provider.Message {
+	var contextSection string
+	if o.gatheredContext != nil && o.gatheredContext.Summary != "" {
+		contextSection = fmt.Sprintf("\n## System Context\n%s\n\n", o.gatheredContext.Summary)
 	}
 
-	// 第2轮及之后：审查者可以看到之前轮次的讨论内容
+	var focusSection string
+	focusAreas := ParseFocusAreas(o.analysis)
+	if len(focusAreas) > 0 {
+		focusSection = fmt.Sprintf("\nThe analyzer suggests focusing on: %s.\nThese are suggestions -- also flag anything else you notice beyond these areas.\n",
+			strings.Join(focusAreas, "; "))
+	}
+
+	var callChainSection string
+	if o.gatheredContext != nil && len(o.gatheredContext.RawReferences) > 0 {
+		callChainSection = "\n" + FormatCallChainForReviewer(o.gatheredContext.RawReferences) + "\n"
+	}
+
+	p := prompt.MustRender("reviewer_first_round.tmpl", map[string]any{
+		"TaskPrompt":       o.taskPrompt,
+		"ContextSection":   contextSection,
+		"FocusSection":     focusSection,
+		"CallChainSection": callChainSection,
+		"Analysis":         o.analysis,
+		"ReviewerID":       currentReviewerID,
+	})
+
+	return []provider.Message{{Role: "user", Content: p}}
+}
+
+// collectPreviousRoundsMessages 收集之前轮次的消息，用于辩论上下文。
+// 返回当前审查者的消息计数和其他审查者的消息列表。
+func (o *DebateOrchestrator) collectPreviousRoundsMessages(currentReviewerID string) (int, []DebateMessage) {
 	myMessageCount := 0
 	for _, m := range o.conversationHistory {
 		if m.ReviewerID == currentReviewerID {
@@ -403,47 +462,48 @@ If you reviewed a file and found no issues, say so briefly. Do not stop early.`,
 		}
 	}
 
-	if hasSession {
-		// 会话模式：仅发送最新一轮的新消息（增量更新，因为会话已有之前的上下文）
-		prevRoundCount := myMessageCount - 1
-		messageCountByReviewer2 := make(map[string]int)
-		var newMessages []DebateMessage
-		for _, msg := range previousRoundsMessages {
-			if msg.ReviewerID == "user" {
-				newMessages = append(newMessages, msg)
-				continue
-			}
-			count := messageCountByReviewer2[msg.ReviewerID]
-			messageCountByReviewer2[msg.ReviewerID] = count + 1
-			if count >= prevRoundCount {
-				newMessages = append(newMessages, msg)
-			}
+	return myMessageCount, previousRoundsMessages
+}
+
+// buildSessionDebateMessages 为会话模式构建增量消息。
+// 仅发送最新一轮的新消息（增量更新，因为会话已有之前的上下文）。
+func (o *DebateOrchestrator) buildSessionDebateMessages(currentReviewerID string, myMessageCount int, previousRoundsMessages []DebateMessage) []provider.Message {
+	prevRoundCount := myMessageCount - 1
+	messageCountByReviewer2 := make(map[string]int)
+	var newMessages []DebateMessage
+	for _, msg := range previousRoundsMessages {
+		if msg.ReviewerID == "user" {
+			newMessages = append(newMessages, msg)
+			continue
 		}
-
-		if len(newMessages) == 0 {
-			return []provider.Message{{Role: "user", Content: "Please continue with your review."}}
+		count := messageCountByReviewer2[msg.ReviewerID]
+		messageCountByReviewer2[msg.ReviewerID] = count + 1
+		if count >= prevRoundCount {
+			newMessages = append(newMessages, msg)
 		}
-
-		var parts []string
-		for _, m := range newMessages {
-			parts = append(parts, fmt.Sprintf("[%s]: %s", m.ReviewerID, m.Content))
-		}
-		newContent := strings.Join(parts, "\n\n---\n\n")
-
-		return []provider.Message{{
-			Role: "user",
-			Content: fmt.Sprintf(`You are [%s]. Here's what others said in the previous round:
-
-%s
-
-Do three things:
-1. Continue your own exhaustive review -- are there changed files or functions you haven't covered yet? Cover them now.
-2. Point out what the other reviewers MISSED -- which files or changes did they skip or gloss over?
-3. Respond to their points -- agree where valid, challenge where you disagree.`, currentReviewerID, newContent),
-		}}
 	}
 
-	// 非会话模式：发送包含所有历史轮次的完整上下文
+	if len(newMessages) == 0 {
+		return []provider.Message{{Role: "user", Content: "Please continue with your review."}}
+	}
+
+	var parts []string
+	for _, m := range newMessages {
+		parts = append(parts, fmt.Sprintf("[%s]: %s", m.ReviewerID, m.Content))
+	}
+	newContent := strings.Join(parts, "\n\n---\n\n")
+
+	p := prompt.MustRender("reviewer_debate_session.tmpl", map[string]any{
+		"ReviewerID": currentReviewerID,
+		"NewContent": newContent,
+	})
+
+	return []provider.Message{{Role: "user", Content: p}}
+}
+
+// buildFullContextDebateMessages 为非会话模式构建包含完整上下文的消息。
+// 发送完整上下文，包含所有历史轮次的消息。
+func (o *DebateOrchestrator) buildFullContextDebateMessages(currentReviewerID string, otherIDs []string, previousRoundsMessages []DebateMessage) []provider.Message {
 	otherLabel := fmt.Sprintf("[%s]", strings.Join(otherIDs, "], ["))
 	isPlural := len(otherIDs) > 1
 	otherWord := "is"
@@ -451,30 +511,16 @@ Do three things:
 		otherWord = "are"
 	}
 
-	debateContext := fmt.Sprintf(`You are [%s] in a code review debate with %s.
-Your shared goal: find ALL real issues in the code -- leave nothing uncovered.
+	p := prompt.MustRender("reviewer_debate_full.tmpl", map[string]any{
+		"TaskPrompt": o.taskPrompt,
+		"Analysis":   o.analysis,
+		"ReviewerID": currentReviewerID,
+		"OtherLabel": otherLabel,
+		"PluralS":    pluralS(isPlural),
+		"OtherWord":  otherWord,
+	})
 
-IMPORTANT:
-- You are [%s], the other reviewer%s %s %s
-- Continue your own exhaustive review -- cover any changed files or functions you haven't addressed yet
-- Point out what others MISSED -- which files or changes did they skip or gloss over?
-- Challenge weak arguments - don't agree just to be polite
-- Acknowledge good points and build on them
-- If you disagree, explain why with evidence`,
-		currentReviewerID, otherLabel,
-		currentReviewerID, pluralS(isPlural), otherWord, otherLabel)
-
-	prompt := fmt.Sprintf(`Task: %s
-
-Here is the analysis:
-
-%s
-
-%s
-
-Previous rounds discussion:`, o.taskPrompt, o.analysis, debateContext)
-
-	messages := []provider.Message{{Role: "user", Content: prompt}}
+	messages := []provider.Message{{Role: "user", Content: p}}
 
 	// 添加之前轮次的其他审查者消息作为user角色
 	for _, msg := range previousRoundsMessages {
@@ -501,6 +547,8 @@ Previous rounds discussion:`, o.taskPrompt, o.analysis, debateContext)
 	return messages
 }
 
+// ========== 共识检测与总结 ==========
+
 // checkConvergence 请求总结器判断审查者是否已达成共识。
 // 共识条件非常严格：所有审查者必须就最终结论达成一致，
 // 关键问题必须被所有人确认，不能有被忽略的意见分歧。
@@ -515,64 +563,80 @@ func (o *DebateOrchestrator) checkConvergence(ctx context.Context, display Displ
 		return false, nil
 	}
 
-	// 获取最后一轮的所有审查者消息用于共识判断
-	lastRoundMessages := o.conversationHistory[len(o.conversationHistory)-len(o.reviewers):]
+	// 使用所有已完成轮次的消息，避免仅看最后一轮导致误判提前收敛
+	roundByReviewer := make(map[string]int)
 	var parts []string
-	for _, m := range lastRoundMessages {
-		parts = append(parts, fmt.Sprintf("[%s]: %s", m.ReviewerID, m.Content))
+	for _, m := range o.conversationHistory {
+		if m.ReviewerID == "user" {
+			continue
+		}
+		roundByReviewer[m.ReviewerID]++
+		parts = append(parts, fmt.Sprintf("[%s] Round %d: %s", m.ReviewerID, roundByReviewer[m.ReviewerID], m.Content))
 	}
 	messagesText := strings.Join(parts, "\n\n---\n\n")
 
-	prompt := fmt.Sprintf(`You are a strict consensus judge. Analyze whether these %d reviewers have reached TRUE CONSENSUS.
+	convergencePrompt := prompt.MustRender("convergence_check.tmpl", map[string]any{
+		"ReviewerCount":   len(o.reviewers),
+		"RoundsCompleted": roundsCompleted,
+		"MessagesText":    messagesText,
+	})
 
-IMPORTANT: This is Round %d. Reviewers have now seen each other's opinions.
+	systemPrompt := prompt.MustRender("convergence_system.tmpl", nil)
 
-TRUE CONSENSUS requires ALL of the following:
-1. All reviewers agree on the SAME final verdict (all approve OR all request changes)
-2. Critical/blocking issues identified by ANY reviewer are acknowledged by ALL others
-3. No reviewer has raised a concern that others have ignored or dismissed without addressing
-4. They explicitly agree on what actions to take (not just "no disagreement")
-
-NOT CONSENSUS if ANY of these:
-- One reviewer identified a Critical/Important issue that others didn't address
-- Reviewers found DIFFERENT sets of issues without cross-validating each other's findings
-- One reviewer says "I disagree" or challenges another's reasoning
-- Reviewers give different verdicts or severity assessments
-- Silence on another's point (not responding to it) - silence is NOT agreement
-- They list problems but haven't confirmed they agree on the complete list
-
-Reviews from Round %d:
-%s
-
-First, provide a brief reasoning (2-3 sentences) explaining your judgment.
-Then on the LAST line, respond with EXACTLY one word: CONVERGED or NOT_CONVERGED`,
-		len(o.reviewers), roundsCompleted, roundsCompleted, messagesText)
-
-	systemPrompt := "You are a strict consensus judge. Be VERY conservative - if there is ANY doubt, respond NOT_CONVERGED. Provide brief reasoning, then on the last line respond with exactly one word: CONVERGED or NOT_CONVERGED."
-
-	msgs := []provider.Message{{Role: "user", Content: prompt}}
+	msgs := []provider.Message{{Role: "user", Content: convergencePrompt}}
 	response, err := o.summarizer.Provider.Chat(ctx, msgs, systemPrompt, nil)
 	if err != nil {
 		return false, err
 	}
 
-	// 解析响应：提取最后一行的判定结果（CONVERGED或NOT_CONVERGED）和推理过程
-	lines := strings.Split(strings.TrimSpace(response), "\n")
-	lastLine := strings.TrimSpace(lines[len(lines)-1])
-	verdict := strings.ToUpper(strings.Fields(lastLine)[0])
+	// 解析响应：提取最后一条非空行的首词作为判定结果（CONVERGED/NOT_CONVERGED）
+	trimmed := strings.TrimSpace(response)
+	if trimmed == "" {
+		reasoning := "Convergence judge returned empty response."
+		display.OnConvergenceJudgment("NOT_CONVERGED", reasoning)
+		util.Warnf("checkConvergence: empty response, treating as NOT_CONVERGED")
+		return false, nil
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	verdictLineIdx := -1
+	verdict := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		verdict = strings.ToUpper(fields[0])
+		verdictLineIdx = i
+		break
+	}
+
+	if verdict == "" {
+		reasoning := "Convergence judge returned no verdict token."
+		display.OnConvergenceJudgment("NOT_CONVERGED", reasoning)
+		util.Warnf("checkConvergence: no verdict token found, treating as NOT_CONVERGED")
+		return false, nil
+	}
+
 	isConverged := verdict == "CONVERGED"
+	if verdict != "CONVERGED" && verdict != "NOT_CONVERGED" {
+		util.Warnf("checkConvergence: invalid verdict token %q, treating as NOT_CONVERGED", verdict)
+		verdict = "NOT_CONVERGED"
+		isConverged = false
+	}
 
-	// 提取推理过程（除最后一行外的所有内容）
-	reasoning := strings.TrimSpace(strings.Join(lines[:len(lines)-1], "\n"))
+	reasoning := trimmed
+	if verdictLineIdx > 0 {
+		reasoning = strings.TrimSpace(strings.Join(lines[:verdictLineIdx], "\n"))
+	}
 	if reasoning == "" {
-		reasoning = strings.TrimSpace(response)
+		reasoning = trimmed
 	}
-
-	verdictStr := "NOT_CONVERGED"
-	if isConverged {
-		verdictStr = "CONVERGED"
-	}
-	display.OnConvergenceJudgment(verdictStr, reasoning)
+	display.OnConvergenceJudgment(verdict, reasoning)
 
 	return isConverged, nil
 }
@@ -580,8 +644,6 @@ Then on the LAST line, respond with EXACTLY one word: CONVERGED or NOT_CONVERGED
 // collectSummaries 并行请求每个审查者提供最终总结。
 // 在辩论结束后，每个审查者总结自己的核心观点和结论，不透露身份。
 func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
-	summaryPrompt := "Please summarize your key points and conclusions. Do not reveal your identity or role."
-
 	// 预分配结果切片，每个 goroutine 写入自己的索引位置，无需加锁
 	summaries := make([]DebateSummary, len(o.reviewers))
 
@@ -590,7 +652,26 @@ func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSumm
 		i, reviewer := i, reviewer
 		g.Go(func() error {
 			messages := o.buildMessages(reviewer.ID)
-			messages = append(messages, provider.Message{Role: "user", Content: summaryPrompt})
+			summaryPrompt := prompt.MustRender("reviewer_summary.tmpl", nil)
+
+			// 会话模式下续传只会发送最后一条 user 消息，将最新上下文与总结要求合并到同一条消息中
+			if _, ok := reviewer.Provider.(provider.SessionProvider); ok {
+				var contextParts []string
+				for _, m := range messages {
+					content := strings.TrimSpace(m.Content)
+					if content == "" {
+						continue
+					}
+					contextParts = append(contextParts, content)
+				}
+				if len(contextParts) > 0 {
+					summaryPrompt = fmt.Sprintf("Latest debate context:\n\n%s\n\n%s",
+						strings.Join(contextParts, "\n\n---\n\n"), summaryPrompt)
+				}
+				messages = []provider.Message{{Role: "user", Content: summaryPrompt}}
+			} else {
+				messages = append(messages, provider.Message{Role: "user", Content: summaryPrompt})
+			}
 
 			summary, err := reviewer.Provider.Chat(gctx, messages, reviewer.SystemPrompt, nil)
 			if err != nil {
@@ -625,23 +706,25 @@ func (o *DebateOrchestrator) getFinalConclusion(ctx context.Context, summaries [
 		parts = append(parts, fmt.Sprintf("Reviewer %d:\n%s", i+1, s.Summary))
 	}
 	summaryText := strings.Join(parts, "\n\n---\n\n")
+	debateText := o.buildDebateTranscript(16000)
 
-	prompt := fmt.Sprintf(`There are exactly %d reviewers in this debate. Based on their anonymous summaries below, provide a final conclusion including:
-- Points of consensus
-- Points of disagreement with analysis
-- Recommended action items
+	conclusionPrompt := prompt.MustRender("final_conclusion.tmpl", map[string]any{
+		"ReviewerCount": len(summaries),
+		"SummaryText":   summaryText,
+		"DebateText":    debateText,
+	})
 
-%s`, len(summaries), summaryText)
-
-	msgs := []provider.Message{{Role: "user", Content: prompt}}
+	msgs := []provider.Message{{Role: "user", Content: conclusionPrompt}}
 	response, err := o.summarizer.Provider.Chat(ctx, msgs, o.summarizer.SystemPrompt, nil)
 	if err != nil {
 		return "", err
 	}
 
-	o.trackTokens("summarizer", prompt+o.summarizer.SystemPrompt, response)
+	o.trackTokens("summarizer", conclusionPrompt+o.summarizer.SystemPrompt, response)
 	return response, nil
 }
+
+// ========== 问题提取 ==========
 
 // structurizeIssues 使用AI从审查文本中提取结构化的问题列表。
 // 如果JSON解析失败，最多重试3次。每次重试会使用更明确的提示词引导模型输出正确格式。
@@ -662,10 +745,15 @@ func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display Disp
 	}
 	util.Debugf("structurizeIssues: collected messages from %d reviewers", len(allMessages))
 
-	var reviewParts []string
 	var reviewerIDs []string
-	for id, rounds := range allMessages {
+	for id := range allMessages {
 		reviewerIDs = append(reviewerIDs, id)
+	}
+	sort.Strings(reviewerIDs)
+
+	var reviewParts []string
+	for _, id := range reviewerIDs {
+		rounds := allMessages[id]
 		if len(rounds) == 1 {
 			reviewParts = append(reviewParts, fmt.Sprintf("[%s]:\n%s", id, rounds[0]))
 		} else {
@@ -679,67 +767,43 @@ func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display Disp
 	reviewText := strings.Join(reviewParts, "\n\n---\n\n")
 	reviewerIDsStr := strings.Join(reviewerIDs, ", ")
 
-	basePrompt := fmt.Sprintf(`Based on these code review discussions, extract ALL concrete issues mentioned by the reviewers into a structured JSON format.
+	issuesSchema := schema.GetSchemaString("issues")
+	basePrompt := prompt.MustRender("structurize_issues.tmpl", map[string]any{
+		"ReviewText":  reviewText,
+		"ReviewerIDs": reviewerIDsStr,
+		"Schema":      issuesSchema,
+	})
 
-%s
-
-Output ONLY a JSON block (no other text):
-`+"```json"+`
-{
-  "issues": [
-    {
-      "severity": "critical|high|medium|low|nitpick",
-      "category": "security|performance|error-handling|style|correctness|architecture",
-      "file": "path/to/file",
-      "line": 42,
-      "title": "One-line summary",
-      "description": "Detailed markdown explanation (see rules below)",
-      "suggestedFix": "Brief one-line fix summary",
-      "raisedBy": ["reviewer-id-1", "reviewer-id-2"]
-    }
-  ]
-}
-`+"```"+`
-
-Rules:
-- Include every issue mentioned by any reviewer
-- The "description" field will be posted as a review comment. Make it comprehensive markdown covering: (1) What the problem is, (2) Why it matters (impact/risk), (3) The original problematic code quoted in a code block, (4) The suggested fix shown as code, (5) Why the fix is correct
-- If multiple reviewers mention the same issue, list all their IDs in raisedBy
-- Use the exact reviewer IDs: %s
-- IMPORTANT: Always include the "file" field with the full path and the "line" field with the exact line number from the reviewer's text. Search the review text carefully for line references (e.g. "line 42", "L42", ":42", "at 42"). If you truly cannot find a line number, omit the "line" field, but try hard to find one.
-- Severity: critical = blocks merge, high = should fix, medium = worth fixing, low = minor, nitpick = style only`, reviewText, reviewerIDsStr)
-
-	systemPrompt := "You extract structured issues from code review text. Output only valid JSON."
+	systemPrompt := prompt.MustRender("structurize_system.tmpl", nil)
 	chatOpts := &provider.ChatOptions{DisableTools: true}
 	const maxAttempts = 3
+
+	var lastValidationErrors string
+	var bestEffort []MergedIssue
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		display.OnWaiting("structurizer")
 
-		var prompt string
+		var attemptPrompt string
 		if attempt == 1 {
-			prompt = basePrompt
+			attemptPrompt = basePrompt
 		} else {
-			prompt = fmt.Sprintf(`Your previous response was not valid JSON. Output ONLY a fenced JSON block with the issues array. No other text.
-
-Here are the review discussions again:
-
-%s
-
-Required JSON format:
-`+"```json"+`
-{"issues": [{"severity": "critical|high|medium|low|nitpick", "category": "string", "file": "path", "title": "summary", "description": "details", "raisedBy": ["%s"]}]}
-`+"```"+`
-Use reviewer IDs: %s`, reviewText, reviewerIDs[0], reviewerIDsStr)
+			attemptPrompt = prompt.MustRender("structurize_retry.tmpl", map[string]any{
+				"ValidationErrors": lastValidationErrors,
+				"ReviewText":       reviewText,
+				"ReviewerIDs":      reviewerIDsStr,
+				"Schema":           issuesSchema,
+			})
 		}
 
-		msgs := []provider.Message{{Role: "user", Content: prompt}}
+		msgs := []provider.Message{{Role: "user", Content: attemptPrompt}}
 		response, err := o.summarizer.Provider.Chat(ctx, msgs, systemPrompt, chatOpts)
 		if err != nil {
 			util.Warnf("structurizeIssues: attempt %d/%d Chat error: %v", attempt, maxAttempts, err)
+			lastValidationErrors = fmt.Sprintf("Chat error: %v", err)
 			continue
 		}
-		o.trackTokens("summarizer", prompt, response)
+		o.trackTokens("summarizer", attemptPrompt, response)
 
 		// 截取前 500 字符用于调试
 		preview := response
@@ -749,29 +813,55 @@ Use reviewer IDs: %s`, reviewText, reviewerIDs[0], reviewerIDsStr)
 		util.Debugf("structurizeIssues: attempt %d/%d response preview: %s", attempt, maxAttempts, preview)
 
 		parsed := ParseReviewerOutput(response)
-		if parsed == nil {
-			util.Warnf("structurizeIssues: attempt %d/%d ParseReviewerOutput returned nil (no valid JSON found)", attempt, maxAttempts)
-		} else if len(parsed.Issues) == 0 {
-			util.Warnf("structurizeIssues: attempt %d/%d parsed OK but 0 valid issues (all filtered by validation)", attempt, maxAttempts)
-		}
-		if parsed != nil && len(parsed.Issues) > 0 {
-			result := make([]MergedIssue, 0, len(parsed.Issues))
-			for _, issue := range parsed.Issues {
-				raisedBy := issue.RaisedBy
-				if len(raisedBy) == 0 {
-					raisedBy = []string{"summarizer"}
-				}
-				result = append(result, MergedIssue{
-					ReviewIssue:  issue,
-					RaisedBy:     raisedBy,
-					Descriptions: []string{issue.Description},
-				})
+		var parsedIssues []MergedIssue
+		if parsed.Output != nil && len(parsed.Output.Issues) > 0 {
+			parsedIssues = DeduplicateMergedIssues(issuesToMerged(parsed.Output.Issues))
+			if len(parsedIssues) > len(bestEffort) {
+				bestEffort = parsedIssues
 			}
-			return DeduplicateMergedIssues(result)
+		}
+
+		// 根据解析结果决定是否重试
+		switch {
+		case parsed.ParseError != nil:
+			util.Warnf("structurizeIssues: attempt %d/%d parse error: %v", attempt, maxAttempts, parsed.ParseError)
+			lastValidationErrors = fmt.Sprintf("JSON parse error: %v", parsed.ParseError)
+		case len(parsed.SchemaErrors) > 0:
+			vr := &schema.ValidationResult{Errors: parsed.SchemaErrors}
+			lastValidationErrors = schema.FormatErrorsForRetry(vr)
+			util.Warnf("structurizeIssues: attempt %d/%d schema errors: %s", attempt, maxAttempts, lastValidationErrors)
+		case parsed.Output == nil || len(parsed.Output.Issues) == 0:
+			util.Warnf("structurizeIssues: attempt %d/%d parsed OK but 0 valid issues", attempt, maxAttempts)
+			lastValidationErrors = "JSON was valid but contained 0 issues. Please include all issues found in the review."
+		default:
+			// 成功
+			return parsedIssues
 		}
 	}
 
+	if len(bestEffort) > 0 {
+		util.Warnf("structurizeIssues: returning best-effort issues after retries (%d issues)", len(bestEffort))
+		return bestEffort
+	}
+
 	return nil
+}
+
+// issuesToMerged 将 ReviewIssue 列表转换为 MergedIssue 列表。
+func issuesToMerged(issues []ReviewIssue) []MergedIssue {
+	result := make([]MergedIssue, 0, len(issues))
+	for _, issue := range issues {
+		raisedBy := issue.RaisedBy
+		if len(raisedBy) == 0 {
+			raisedBy = []string{"summarizer"}
+		}
+		result = append(result, MergedIssue{
+			ReviewIssue:  issue,
+			RaisedBy:     raisedBy,
+			Descriptions: []string{issue.Description},
+		})
+	}
+	return result
 }
 
 // ========== 辅助方法 ==========
@@ -837,6 +927,27 @@ func (o *DebateOrchestrator) endAllSessions() {
 	if sp, ok := o.summarizer.Provider.(provider.SessionProvider); ok {
 		sp.EndSession()
 	}
+}
+
+func (o *DebateOrchestrator) buildDebateTranscript(maxLen int) string {
+	if len(o.conversationHistory) == 0 {
+		return ""
+	}
+
+	roundByReviewer := make(map[string]int)
+	var parts []string
+	for _, msg := range o.conversationHistory {
+		if msg.ReviewerID == "user" {
+			continue
+		}
+		roundByReviewer[msg.ReviewerID]++
+		parts = append(parts, fmt.Sprintf("[%s] Round %d:\n%s", msg.ReviewerID, roundByReviewer[msg.ReviewerID], msg.Content))
+	}
+	transcript := strings.Join(parts, "\n\n---\n\n")
+	if maxLen > 0 && len(transcript) > maxLen {
+		return fmt.Sprintf("[Truncated: showing last %d chars of transcript]\n\n%s", maxLen, transcript[len(transcript)-maxLen:])
+	}
+	return transcript
 }
 
 // GetReviewers 暴露审查者列表，用于辩论后的后续讨论。

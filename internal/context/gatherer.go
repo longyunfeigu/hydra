@@ -14,12 +14,8 @@ import (
 )
 
 // GathererOptions 控制上下文收集的行为参数。
-// 包含调用链分析深度、历史记录范围和文档收集规则等配置。
+// 包含历史记录范围和文档收集规则等配置。
 type GathererOptions struct {
-	CallChain struct {
-		MaxDepth          int // 调用链追踪的最大深度
-		MaxFilesToAnalyze int // 最多分析的文件数量
-	}
 	History struct {
 		MaxDays int // 查询历史 PR 的最大天数范围
 		MaxPRs  int // 最多返回的关联 PR 数量
@@ -45,8 +41,6 @@ func NewContextGatherer(p provider.AIProvider, cfg *config.ContextGathererConfig
 	opts := GathererOptions{}
 
 	// 设置默认值
-	opts.CallChain.MaxDepth = 2
-	opts.CallChain.MaxFilesToAnalyze = 20
 	opts.History.MaxDays = 30
 	opts.History.MaxPRs = 10
 	opts.Docs.Patterns = []string{"docs", "README.md", "ARCHITECTURE.md", "DESIGN.md"}
@@ -54,14 +48,6 @@ func NewContextGatherer(p provider.AIProvider, cfg *config.ContextGathererConfig
 
 	// 用配置文件中的值覆盖默认值（仅覆盖非零值）
 	if cfg != nil {
-		if cfg.CallChain != nil {
-			if cfg.CallChain.MaxDepth > 0 {
-				opts.CallChain.MaxDepth = cfg.CallChain.MaxDepth
-			}
-			if cfg.CallChain.MaxFilesToAnalyze > 0 {
-				opts.CallChain.MaxFilesToAnalyze = cfg.CallChain.MaxFilesToAnalyze
-			}
-		}
 		if cfg.History != nil {
 			if cfg.History.MaxDays > 0 {
 				opts.History.MaxDays = cfg.History.MaxDays

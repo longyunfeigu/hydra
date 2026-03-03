@@ -3,6 +3,8 @@ package context
 import (
 	"fmt"
 	"strings"
+
+	"github.com/guwanhua/hydra/internal/prompt"
 )
 
 // maxDiffLength 是发送给 AI 分析的 diff 文本最大长度。
@@ -27,64 +29,13 @@ func BuildAnalysisPrompt(diff string, changedFiles []string, refs []RawReference
 
 	docsText := formatDocs(docs)
 
-	return fmt.Sprintf(`You are a senior software architect analyzing a PR's impact on the system.
-
-## PR Diff
-`+"```diff\n%s\n```"+`
-
-## Changed Files
-%s
-
-## Code References (grep results)
-These are all the places where the changed functions/classes are referenced:
-
-%s
-
-## Related Recent PRs
-%s
-
-## Project Documentation
-%s
-
----
-
-Based on the above information, analyze and provide:
-
-1. **Affected Modules**: Identify which logical modules/features this PR affects. For each:
-   - name: module name
-   - path: base path
-   - description: what this module does
-   - affectedFiles: which PR files belong to this module
-   - impactLevel: "core" (critical path), "moderate" (important but not critical), or "peripheral" (utilities/helpers)
-
-2. **Call Chain Analysis**: From the grep results, identify the REAL call chains (not just string matches). For key functions/classes being modified:
-   - Who calls them? (callers)
-   - What's the calling context? (API endpoint, background job, test, etc.)
-
-3. **Design Patterns**: Based on the code and documentation:
-   - What design patterns are used in the affected areas?
-   - Are there any conventions that this PR should follow?
-   - Note if the pattern was found in documentation or inferred from code.
-
-4. **Summary**: Write a 2-3 paragraph summary for code reviewers explaining:
-   - What system areas this PR touches
-   - What the impact and risks are
-   - What reviewers should pay attention to
-
-Respond in JSON format:
-`+"```json\n"+`{
-  "affectedModules": [...],
-  "callChain": [...],
-  "designPatterns": [...],
-  "summary": "..."
-}
-`+"```",
-		truncatedDiff,
-		formatChangedFiles(changedFiles),
-		referencesText,
-		relatedPRsText,
-		docsText,
-	)
+	return prompt.MustRender("context_analysis.tmpl", map[string]any{
+		"Diff":         truncatedDiff,
+		"ChangedFiles": formatChangedFiles(changedFiles),
+		"References":   referencesText,
+		"RelatedPRs":   relatedPRsText,
+		"Docs":         docsText,
+	})
 }
 
 // formatChangedFiles 将变更文件列表格式化为 Markdown 无序列表。

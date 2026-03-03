@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -135,6 +136,38 @@ func TestStructurizeIssues_RetrySuccess(t *testing.T) {
 	}
 	if issues[0].Title != "Unused import" {
 		t.Errorf("issues[0].Title = %q, want %q", issues[0].Title, "Unused import")
+	}
+}
+
+func TestStructurizeIssues_SchemaErrorsRetryAndKeepBest(t *testing.T) {
+	firstResp := "```json\n" + `{
+  "issues": [
+    {"severity": "high", "file": "a.go", "title": "Valid one", "description": "valid desc"},
+    {"severity": "invalid-severity", "file": "b.go", "title": "Invalid one", "description": "invalid desc"}
+  ]
+}` + "\n```"
+	secondResp := "```json\n" + `{
+  "issues": [
+    {"severity": "high", "file": "a.go", "title": "Valid one", "description": "valid desc"},
+    {"severity": "medium", "file": "c.go", "title": "Valid two", "description": "another desc"}
+  ]
+}` + "\n```"
+
+	mp := &mockProvider{responses: []string{firstResp, secondResp}}
+	o := &DebateOrchestrator{
+		summarizer: Reviewer{ID: "summarizer", Provider: mp, SystemPrompt: "extract"},
+		conversationHistory: []DebateMessage{
+			{ReviewerID: "claude", Content: "review text"},
+		},
+		tokenUsage: make(map[string]*tokenCount),
+	}
+
+	issues := o.structurizeIssues(context.Background(), &noopDisplay{})
+	if len(issues) != 2 {
+		t.Fatalf("expected 2 issues after retry, got %d", len(issues))
+	}
+	if mp.callCount != 2 {
+		t.Fatalf("expected 2 calls (retry after schema error), got %d", mp.callCount)
 	}
 }
 
@@ -299,6 +332,34 @@ func TestStructurizeIssues_FiltersInvalidIssues(t *testing.T) {
 	}
 	if issues[0].Title != "Valid issue" {
 		t.Errorf("expected the valid issue to survive, got %q", issues[0].Title)
+	}
+}
+
+func TestStructurizeIssues_ReviewerOrderDeterministic(t *testing.T) {
+	var captured string
+	resp := "```json\n" + `{"issues":[{"severity":"low","file":"a.go","title":"t","description":"d"}]}` + "\n```"
+	mp := &mockProvider{responses: []string{resp}}
+	captureProvider := &promptCaptureProvider{inner: mp, captured: &captured}
+
+	o := &DebateOrchestrator{
+		summarizer: Reviewer{
+			ID:           "summarizer",
+			Provider:     captureProvider,
+			SystemPrompt: "extract",
+		},
+		conversationHistory: []DebateMessage{
+			{ReviewerID: "z", Content: "z review"},
+			{ReviewerID: "a", Content: "a review"},
+		},
+		tokenUsage: make(map[string]*tokenCount),
+	}
+
+	_ = o.structurizeIssues(context.Background(), &noopDisplay{})
+	if !strings.Contains(captured, "Use the exact reviewer IDs: a, z") {
+		t.Fatalf("expected sorted reviewer IDs in prompt, got: %s", captured)
+	}
+	if idxA, idxZ := strings.Index(captured, "[a]:"), strings.Index(captured, "[z]:"); idxA == -1 || idxZ == -1 || idxA > idxZ {
+		t.Fatalf("expected reviewer sections in sorted order ([a] before [z]); prompt: %s", captured)
 	}
 }
 

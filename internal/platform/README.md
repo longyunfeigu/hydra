@@ -47,6 +47,7 @@ type RepoDetector interface {
 // HistoryProvider 查询 MR/PR 历史信息（用于 context gathering）。
 type HistoryProvider interface {
     GetMRDetails(mrNumber int, cwd string) (*MRDetail, error)
+    GetMRsForCommit(commitSHA string, cwd string) ([]int, error)
 }
 
 // Platform 组合了所有子接口，代表一个完整的代码托管平台。
@@ -203,3 +204,104 @@ _Raised by: security-reviewer, perf-reviewer_
 "low"      → 🟢
 其他       → ⚪
 ```
+
+## HistoryProvider：GitHub 与 GitLab 的实现差异
+
+`HistoryProvider` 只有两个方法，但两个平台在 CLI 工具、API 端点、数据结构上都有差异。
+
+### GetMRsForCommit — 通过 commit SHA 反查 PR/MR
+
+**GitHub**（`github.go:491`）：
+
+```bash
+gh api repos/{owner}/{repo}/commits/{sha}/pulls --jq ".[].number"
+```
+
+`--jq` 直接在 CLI 层过滤 JSON，stdout 输出纯数字（每行一个），然后逐行 `strconv.Atoi`。
+
+**GitLab**（`gitlab.go:714`）：
+
+```bash
+glab api projects/{encoded_project}/repository/commits/{sha}/merge_requests
+```
+
+返回完整 JSON 数组，需要 `json.Unmarshal` 后手动提取 `iid` 字段。GitLab 的 API 路径多了 `repository/` 层级，且项目路径需要 URL 编码（`group/subgroup/project` → `group%2Fsubgroup%2Fproject`）。
+
+### GetMRDetails — 获取 PR/MR 详情
+
+**GitHub**（`github.go:451`）— 一次调用拿到所有信息：
+
+```bash
+gh pr view 38 --json number,title,author,mergedAt,files
+```
+
+`gh` 的 `--json` 参数支持指定返回字段，文件列表也包含在内。
+
+**GitLab**（`gitlab.go:659`）— 需要两次 API 调用：
+
+```bash
+# 第一次：MR 基本信息（标题、作者、合并时间）
+glab api projects/{encoded}/merge_requests/{iid}
+
+# 第二次：变更文件列表（GitLab MR API 不包含文件列表）
+glab api projects/{encoded}/merge_requests/{iid}/diffs
+```
+
+GitLab 的 MR 详情 API 不返回文件列表，必须单独调 `/diffs` 端点获取。
+
+### 对比总结
+
+| 维度 | GitHub | GitLab |
+|------|--------|--------|
+| CLI 工具 | `gh` | `glab` |
+| commit → PR API | `repos/{repo}/commits/{sha}/pulls` | `projects/{encoded}/repository/commits/{sha}/merge_requests` |
+| PR/MR 编号字段 | `number`（全局唯一） | `iid`（项目内唯一） |
+| 获取详情的 API 调用次数 | 1 次（`gh pr view --json`） | 2 次（MR 信息 + diffs 分开） |
+| 文件列表来源 | `files[].path`（在详情 API 中） | 需额外调 `/diffs` → `[].new_path` |
+| 作者字段 | `author.login` | `author.username` |
+| 项目标识 | `owner/repo` 原样传递 | 需要 `url.PathEscape` 编码（支持嵌套组） |
+
+### glab 如何知道是哪个 repo
+
+GitLab 实现中有两种调用模式：
+
+**CLI 模式**（不传 repo）— 依赖 git 上下文：
+
+```go
+exec.Command("glab", "mr", "diff", mrID)
+exec.Command("glab", "mr", "view", mrID, "--output", "json")
+```
+
+`glab` 自动从当前目录的 `git remote get-url origin` 推断项目路径。前提是进程必须在 git 仓库目录下运行。
+
+**API 模式**（显式传 repo）— 不依赖 git 上下文：
+
+```go
+exec.Command("glab", "api",
+    fmt.Sprintf("projects/%s/merge_requests/%s/diffs", encodeProject(repo), mrID),
+)
+```
+
+项目路径直接编码到 API URL 中，不需要 git 上下文。适用于 server/webhook 模式。
+
+代码中通过 `resolveRepo` 统一处理这两种情况：
+
+```go
+func (g *GitLabPlatform) resolveRepo(repo string) (string, error) {
+    if repo != "" {
+        return repo, nil               // 调用方给了就直接用（server 模式）
+    }
+    return g.DetectRepoFromRemote()     // 没给就从 git remote 推断（本地模式）
+}
+```
+
+`gh` 也有同样的机制：有 `--repo` 参数就用显式指定的，没有就从 git remote 推断。
+
+### 为什么通过 CLI 工具而不是直接调 HTTP API
+
+两个平台都是通过 CLI 工具（`gh`/`glab`）间接调 REST API，而不是直接用 `net/http`。好处是 CLI 工具自动处理了：
+
+- **认证** — token 的存储和注入（`gh auth`、`glab auth`），不需要 Hydra 管理密钥
+- **分页** — `gh api --paginate` 自动处理多页结果
+- **重试** — CLI 内置对 429/5xx 的重试逻辑
+- **主机配置** — GitLab 自托管实例的 host 配置由 `glab` 管理

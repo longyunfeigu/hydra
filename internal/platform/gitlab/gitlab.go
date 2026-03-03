@@ -91,6 +91,17 @@ func glabPostJSON(endpoint string, payload []byte) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+// glabPutJSON 通过 glab api 发送 JSON PUT 请求。
+func glabPutJSON(endpoint string, payload []byte) ([]byte, error) {
+	cmd := exec.Command("glab", "api", endpoint,
+		"--method", "PUT",
+		"--input", "-",
+		"-H", "Content-Type: application/json",
+	)
+	cmd.Stdin = strings.NewReader(string(payload))
+	return cmd.CombinedOutput()
+}
+
 // GetDiff 获取 MR 的 diff 内容。
 // 有 repo 参数时用 glab api（server 模式），否则用 glab mr（CLI 模式，向后兼容）。
 func (g *GitLabPlatform) GetDiff(mrID, repo string) (string, error) {
@@ -326,19 +337,12 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
 		payload, _ := json.Marshal(map[string]interface{}{
 			"body": opts.Body,
-			"position": map[string]interface{}{
-				"position_type": "text",
-				"new_path":      opts.Path,
-				"old_path":      opts.Path,
-				"new_line":      *opts.Line,
-				"head_sha":      opts.CommitInfo.HeadSHA,
-				"base_sha":      opts.CommitInfo.BaseSHA,
-				"start_sha":     opts.CommitInfo.StartSHA,
-			},
+			"position": buildTextPosition(opts.Path, *opts.Line, opts.CommitInfo),
 		})
 		out, err := glabPostJSON(endpoint, payload)
 		if err == nil {
-			return platform.CommentResult{Success: true, Inline: true}
+			util.Debugf("PostComment success mode=inline path=%s line=%d", opts.Path, *opts.Line)
+			return platform.CommentResult{Success: true, Inline: true, Mode: "inline"}
 		}
 		util.Debugf("PostComment inline failed for %s:%d: %v | response: %s", opts.Path, *opts.Line, err, string(out))
 	}
@@ -352,18 +356,12 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
 		payload, _ := json.Marshal(map[string]interface{}{
 			"body": lineRef + opts.Body,
-			"position": map[string]interface{}{
-				"position_type": "file",
-				"new_path":      opts.Path,
-				"old_path":      opts.Path,
-				"head_sha":      opts.CommitInfo.HeadSHA,
-				"base_sha":      opts.CommitInfo.BaseSHA,
-				"start_sha":     opts.CommitInfo.StartSHA,
-			},
+			"position": buildFilePosition(opts.Path, opts.CommitInfo),
 		})
 		out, err := glabPostJSON(endpoint, payload)
 		if err == nil {
-			return platform.CommentResult{Success: true, Inline: true}
+			util.Debugf("PostComment success mode=file path=%s", opts.Path)
+			return platform.CommentResult{Success: true, Inline: false, Mode: "file"}
 		}
 		util.Debugf("PostComment file-level failed for %s: %v | response: %s", opts.Path, err, string(out))
 	}
@@ -380,7 +378,31 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		if err := cmd.Run(); err != nil {
 			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
 		}
-		return platform.CommentResult{Success: true, Inline: false}
+		util.Debugf("PostComment success mode=global path=%s", opts.Path)
+		return platform.CommentResult{Success: true, Inline: false, Mode: "global"}
+	}
+}
+
+func buildTextPosition(path string, line int, commitInfo platform.CommitInfo) map[string]interface{} {
+	return map[string]interface{}{
+		"position_type": "text",
+		"new_path":      path,
+		"old_path":      path,
+		"new_line":      line,
+		"head_sha":      commitInfo.HeadSHA,
+		"base_sha":      commitInfo.BaseSHA,
+		"start_sha":     commitInfo.StartSHA,
+	}
+}
+
+func buildFilePosition(path string, commitInfo platform.CommitInfo) map[string]interface{} {
+	return map[string]interface{}{
+		"position_type": "file",
+		"new_path":      path,
+		"old_path":      path,
+		"head_sha":      commitInfo.HeadSHA,
+		"base_sha":      commitInfo.BaseSHA,
+		"start_sha":     commitInfo.StartSHA,
 	}
 }
 
@@ -433,9 +455,12 @@ func (g *GitLabPlatform) PostReview(mrID string, classified []platform.Classifie
 			})
 			if cr.Success {
 				result.Posted++
-				if cr.Inline {
+				switch cr.Mode {
+				case "inline":
 					result.Inline++
-				} else {
+				case "file":
+					result.FileLevel++
+				default:
 					result.Global++
 				}
 			} else {
@@ -455,7 +480,14 @@ func (g *GitLabPlatform) PostReview(mrID string, classified []platform.Classifie
 			})
 			if cr.Success {
 				result.Posted++
-				result.FileLevel++
+				switch cr.Mode {
+				case "inline":
+					result.Inline++
+				case "file":
+					result.FileLevel++
+				default:
+					result.Global++
+				}
 			} else {
 				result.Failed++
 			}
@@ -479,6 +511,8 @@ func (g *GitLabPlatform) PostReview(mrID string, classified []platform.Classifie
 		}
 	}
 
+	util.Debugf("PostReview final result: posted=%d inline=%d file=%d global=%d failed=%d skipped=%d",
+		result.Posted, result.Inline, result.FileLevel, result.Global, result.Failed, result.Skipped)
 	return result
 }
 
@@ -489,16 +523,12 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 
 	// 创建 draft notes
 	for _, cc := range inlineEntries {
+		if cc.Input.Line == nil {
+			return false
+		}
 		payload, _ := json.Marshal(map[string]interface{}{
 			"note": cc.Input.Body,
-			"position": map[string]interface{}{
-				"position_type": "text",
-				"new_path":      cc.Input.Path,
-				"new_line":      *cc.Input.Line,
-				"head_sha":      commitInfo.HeadSHA,
-				"base_sha":      commitInfo.BaseSHA,
-				"start_sha":     commitInfo.StartSHA,
-			},
+			"position": buildTextPosition(cc.Input.Path, *cc.Input.Line, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
 		out, err := glabPostJSON(endpoint, payload)
@@ -520,13 +550,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 		}
 		payload, _ := json.Marshal(map[string]interface{}{
 			"note": lineRef + cc.Input.Body,
-			"position": map[string]interface{}{
-				"position_type": "file",
-				"new_path":      cc.Input.Path,
-				"head_sha":      commitInfo.HeadSHA,
-				"base_sha":      commitInfo.BaseSHA,
-				"start_sha":     commitInfo.StartSHA,
-			},
+			"position": buildFilePosition(cc.Input.Path, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
 		out, err := glabPostJSON(endpoint, payload)
@@ -542,24 +566,27 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 	}
 
 	// 批量发布所有 draft notes
-	if len(draftIDs) > 0 {
-		cmd := exec.Command("glab", "api",
-			fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes/bulk_publish", encodedProject, mrID),
-			"--method", "POST",
-		)
-		if err := cmd.Run(); err != nil {
-			// bulk_publish 失败，但 draft notes 已创建 — 仍然算成功
-			// draft notes 可以在 GitLab UI 中看到
-		}
-		for _, cc := range inlineEntries {
-			_ = cc
-			result.Posted++
-			result.Inline++
-		}
-		for range fileEntries {
-			result.Posted++
-			result.FileLevel++
-		}
+	if len(draftIDs) == 0 {
+		util.Warnf("tryDraftNotes: no draft note IDs returned, fallback to Discussions API")
+		return false
+	}
+
+	cmd := exec.Command("glab", "api",
+		fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes/bulk_publish", encodedProject, mrID),
+		"--method", "POST",
+	)
+	if err := cmd.Run(); err != nil {
+		util.Warnf("tryDraftNotes: bulk_publish failed, fallback to Discussions API: %v", err)
+		return false
+	}
+
+	for range inlineEntries {
+		result.Posted++
+		result.Inline++
+	}
+	for range fileEntries {
+		result.Posted++
+		result.FileLevel++
 	}
 
 	return true
@@ -637,6 +664,43 @@ func (g *GitLabPlatform) PostNote(mrID, repo, body string) error {
 		return fmt.Errorf("failed to post MR note: %w", err)
 	}
 	return nil
+}
+
+// UpsertSummaryNote upsert Hydra 的总结 note（通过 marker 匹配已有 note）。
+// 找到 marker 则更新该 note，否则创建新 note。
+func (g *GitLabPlatform) UpsertSummaryNote(mrID, repo, marker, body string) error {
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return err
+	}
+	encoded := encodeProject(resolvedRepo)
+
+	listEndpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes", encoded, mrID)
+	out, err := exec.Command("glab", "api", listEndpoint).Output()
+	if err != nil {
+		return fmt.Errorf("failed to list MR notes: %w", err)
+	}
+
+	var notes []struct {
+		ID   int    `json:"id"`
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &notes); err != nil {
+		return fmt.Errorf("failed to parse MR notes: %w", err)
+	}
+
+	for _, note := range notes {
+		if marker != "" && strings.Contains(note.Body, marker) {
+			payload, _ := json.Marshal(map[string]string{"body": body})
+			updateEndpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes/%d", encoded, mrID, note.ID)
+			if _, err := glabPutJSON(updateEndpoint, payload); err != nil {
+				return fmt.Errorf("failed to update summary note: %w", err)
+			}
+			return nil
+		}
+	}
+
+	return g.PostNote(mrID, repo, body)
 }
 
 // GetMRDetails 获取单个 MR 的详细信息，用于历史关联。

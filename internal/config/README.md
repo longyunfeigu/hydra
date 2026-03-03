@@ -99,9 +99,6 @@ summarizer:
 contextGatherer:
   enabled: true
   model: gpt-4o                # 用于上下文分析的模型（为空时使用 analyzer 的模型）
-  callChain:
-    maxDepth: 3                # 调用链最大追踪深度
-    maxFilesToAnalyze: 20      # 最多分析的文件数量
   history:
     maxDays: 30                # 回溯历史天数
     maxPRs: 5                  # 最多分析的历史 PR 数量
@@ -149,9 +146,6 @@ HydraConfig
 +-- ContextGatherer: *ContextGathererConfig   // 上下文收集器（可选，nil 表示禁用）
 |   +-- Enabled: bool                  // 是否启用上下文收集
 |   +-- Model: string                  // 用于分析的模型（空则使用 Analyzer 的模型）
-|   +-- CallChain: *CallChainConfig    // 调用链分析配置
-|   |   +-- MaxDepth: int              // 调用链最大追踪深度
-|   |   +-- MaxFilesToAnalyze: int     // 最多分析的文件数
 |   +-- History: *HistoryConfig        // Git 历史记录分析配置
 |   |   +-- MaxDays: int               // 回溯天数
 |   |   +-- MaxPRs: int                // 最多分析的 PR 数

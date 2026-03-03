@@ -143,9 +143,41 @@ echo "Here are other reviewers' opinions..." | claude -p - \
 ```
 
 **事件类型**：
+- `system`：系统初始化消息
 - `assistant`：AI 生成的消息，文本在 `message.content[].text` 中
 - `result`：最终结果，完整文本在 `result` 字段中
 - 所有事件都可能携带 `session_id`，Provider 从中提取并保存
+
+### 为什么同时需要 `assistant` 和 `result` 两种类型
+
+一次对话中可能产生**多条** `assistant` 消息，特别是涉及工具调用时：
+
+```
+assistant: 我来帮你读取文件          ← 文本
+assistant: [tool_use: Read file]     ← 调用工具
+assistant: [tool_result: 文件内容]    ← 工具返回
+assistant: 我来修改第10行            ← 文本
+assistant: [tool_use: Edit file]     ← 又调用工具
+assistant: [tool_result: 修改成功]    ← 工具返回
+assistant: 修改完成了                 ← 文本
+```
+
+而 `result` 是整个交互结束后的**唯一一条**汇总消息：
+
+```json
+{"type": "result", "subtype": "success", "result": "修改完成了", "session_id": "abc-123", "cost_usd": 0.003, "total_tokens": 1500, "is_error": false}
+```
+
+两者职责不同：
+
+| 维度 | `assistant` | `result` |
+|------|-------------|----------|
+| 数量 | 一次对话中可能有多条 | 始终只有一条，在流的末尾 |
+| 内容 | 中间过程的文本片段、工具调用 | 最终完整结果文本 |
+| 元数据 | 仅携带 `session_id` | 携带 `session_id`、费用、token 用量、错误状态等 |
+| 用途 | 流式展示中间过程 | 提供终止信号 + 最终答案提取 + 聚合元数据 |
+
+简单类比：`assistant` 消息相当于 HTTP chunked streaming 的数据块，`result` 相当于最终响应摘要。Hydra 的 `ClaudeCodeProvider` 在解析时，从 `assistant` 事件中提取流式文本片段，从 `result` 事件中提取最终完整结果和 `session_id`。
 
 ### 核心流程
 
@@ -166,6 +198,127 @@ Chat() / ChatStream()
   |- 6. SetSessionID() 保存会话 ID，MarkMessageSent() 标记非首次
   '- 7. WithRetry 包装（仅 Chat 同步模式）
 ```
+
+## Codex CLI Provider
+
+### CLI 调用方式
+
+```bash
+# 首次调用（新会话）— 通过 stdin 发送完整 prompt（系统提示拼在 prompt 内）
+echo "System: You are a security reviewer...\n\nuser: Please review..." | codex exec \
+  --json \
+  --dangerously-bypass-approvals-and-sandbox \
+  -
+
+# 后续调用（复用会话）— 使用 exec resume 子命令续传
+echo "Here are other reviewers' opinions..." | codex exec resume <thread-id> \
+  --json \
+  --dangerously-bypass-approvals-and-sandbox \
+  -
+```
+
+**参数说明**：
+- `exec`：执行子命令，末尾的 `-` 表示从 stdin 读取 prompt
+- `exec resume <thread-id>`：会话续传是 `exec` 的子命令，thread-id 是位置参数
+- `--json`：输出 JSONL 格式（每行一个事件），Codex 只有这一种结构化输出格式
+- `--dangerously-bypass-approvals-and-sandbox`：跳过权限确认和沙箱限制
+- **无 `--system-prompt` 参数**：系统提示词拼进 stdin 的 prompt 一起发送
+
+### JSONL 响应格式
+
+```
+{"type":"thread.started","thread_id":"thread_xyz"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Looking at the diff..."}}
+{"type":"item.completed","item":{"type":"agent_message","text":"I found a SQL injection..."}}
+```
+
+**事件类型**：
+- `thread.started`：线程启动事件，包含 `thread_id`，Provider 从中提取并保存会话 ID
+- `item.completed`（`item.type == "agent_message"`）：AI 生成的消息，文本在 `item.text` 中
+- **无 `result` 终止事件**：进程退出即表示响应结束
+
+### 核心流程
+
+```
+Chat() / ChatStream()
+  |
+  |- 1. Snapshot() 原子读取会话状态（解决 TOCTOU 竞态）
+  |- 2. 构建 prompt
+  |     |- ShouldSendFull() == true  -> BuildPrompt()（系统提示拼在 prompt 内 + 全部消息历史）
+  |     '- ShouldSendFull() == false -> BuildPromptLastOnly()（仅最后一条 user 消息）
+  |- 3. buildArgs() 构建 CLI 参数
+  |     |- 首次：exec --json -
+  |     '- 续传：exec resume <thread-id> --json -
+  |- 4. os/exec 执行 codex 命令，stdin 传入 prompt
+  |- 5. 解析输出
+  |     |- Chat:       进程结束后一次性解析 JSONL -> 提取 thread_id + item.text
+  |     '- ChatStream: 逐行读取 JSONL -> 解析 thread.started/item.completed 事件 -> 发送到 channel
+  |- 6. SetSessionID() 保存 thread_id，MarkMessageSent() 标记非首次
+  '- 7. WithRetry 包装（仅 Chat 同步模式）
+```
+
+## Claude Code 与 Codex CLI 的调用差异
+
+两者整体架构相同（子进程 + stdin 传 prompt + stdout 读结果），但在 CLI 接口设计和事件协议上有明显差异：
+
+### 命令结构
+
+```bash
+# Claude Code 用 flags
+claude -p - --resume <session-id> --output-format stream-json
+
+# Codex CLI 用子命令
+codex exec resume <thread-id> --json -
+```
+
+Claude Code 的会话续传是 `--resume` flag，Codex 是 `exec resume` 子命令 + 位置参数。
+
+### 系统提示词传递
+
+Claude Code 有专门的 `--system-prompt` 参数，系统提示和用户消息分开传递，CLI 内部区分两者的角色。Codex CLI 没有这个参数，Hydra 通过 `BuildPrompt()` 将系统提示拼进 stdin 的 prompt 文本中：
+
+```
+// BuildPrompt 输出：
+"[session-name]\n\nSystem: You are a security reviewer...\n\nuser: Please review..."
+```
+
+### 输出格式
+
+Claude Code 支持两种格式：
+- `--output-format json` → 非流式，完整 JSON 数组 `[event, event, ...]`
+- `--output-format stream-json` → 流式 JSONL
+
+Codex CLI 只有一种：`--json` → 始终输出 JSONL。同步 `Chat()` 也是等进程结束后解析 JSONL，没有 JSON 数组模式。
+
+### 事件协议
+
+| 维度 | Claude Code | Codex CLI |
+|------|------------|-----------|
+| 会话 ID 来源 | 任意事件的 `session_id` 字段 | `thread.started` 事件的 `thread_id` |
+| 文本位置 | `message.content[].text`（嵌套数组） | `item.text`（扁平结构） |
+| 终止信号 | `result` 事件（携带完整结果 + 元数据） | 无，进程退出即结束 |
+| 错误指示 | `result.is_error` 字段 | CLI 退出码非零 |
+
+### 共享层：CliSessionHelper
+
+虽然 CLI 接口差异不小，但会话管理的核心逻辑是复用的。两个 Provider 都内嵌 `CliSessionHelper`，共享以下能力：
+
+```
+CliSessionHelper（共享）
+  ├─ Start() / End()          — 会话生命周期
+  ├─ Snapshot()               — 原子读取状态（解决 TOCTOU）
+  ├─ BuildPrompt()            — 构建完整 prompt
+  ├─ BuildPromptLastOnly()    — 构建增量 prompt
+  ├─ SetSessionID()           — 保存会话 ID（无论是 session_id 还是 thread_id）
+  └─ MarkMessageSent()        — 标记非首次
+
+ClaudeCodeProvider（独有）         CodexCliProvider（独有）
+  ├─ buildArgs()                    ├─ buildArgs()
+  ├─ handleStreamEvent()            ├─ 内联事件解析
+  └─ 解析 JSON 数组 / JSONL          └─ 仅解析 JSONL
+```
+
+每个 Provider 只需要实现自己特有的部分：CLI 参数构建和事件解析。会话状态管理、prompt 构建、并发安全这些通用逻辑全部委托给 `CliSessionHelper`。
 
 ## OpenAI Provider
 
@@ -222,6 +375,136 @@ Chat() / ChatStream()
 ```
 
 **与 CLI Provider 的区别**：OpenAI Provider 是无状态的，每次调用发送完整消息历史，不维护会话。因此它只实现 `AIProvider` 接口，不实现 `SessionProvider`。
+
+## 为什么需要 SessionProvider
+
+### 问题：CLI 提供者的多轮对话成本爆炸
+
+Hydra 的辩论式审查流程中，每个审查者需要进行**多轮对话**（预分析 → 第1轮独立审查 → 第2轮辩论 → ... → 最终总结）。
+
+对于 OpenAI API 这种**无状态**提供者，每次调用必须发送完整的消息历史：
+
+```
+第1轮: [system_prompt + diff + 分析结果]                    → 发送 ~5K tokens
+第2轮: [system_prompt + diff + 分析结果 + 第1轮所有人的意见]  → 发送 ~15K tokens
+第3轮: [system_prompt + diff + 分析结果 + 第1轮 + 第2轮...]  → 发送 ~30K tokens
+总结:  [system_prompt + diff + 全部历史 + 总结请求]           → 发送 ~40K tokens
+                                                           ──────────────
+                                                           累计输入 ~90K tokens
+```
+
+问题在于：每一轮都在**重复发送之前已经发过的内容**，token 费用随轮次线性增长。
+
+### 解决：CLI 的 `--resume` 会话复用
+
+Claude Code CLI 和 Codex CLI 都支持**会话续传**（`--resume <session_id>`）。CLI 进程内部会记住之前的对话上下文，后续调用只需要发送**增量消息**：
+
+```
+第1轮: [system_prompt + diff + 分析结果]     → 发送 ~5K tokens（首次，完整发送）
+第2轮: [仅本轮其他审查者的新意见]              → 发送 ~3K tokens（增量）
+第3轮: [仅本轮其他审查者的新意见]              → 发送 ~3K tokens（增量）
+总结:  [总结请求]                             → 发送 ~0.5K tokens（增量）
+                                             ──────────────
+                                             累计输入 ~11.5K tokens（节省 ~87%）
+```
+
+### SessionProvider 的设计
+
+`SessionProvider` 在 `AIProvider` 基础上扩展了会话管理能力，让编排器能够**透明地**利用 CLI 的会话复用：
+
+```go
+type SessionProvider interface {
+    AIProvider                        // 继承基础的 Chat/ChatStream 能力
+    StartSession(name string)         // 开始新会话
+    EndSession()                      // 结束会话，释放资源
+    SessionID() string                // 获取 CLI 返回的会话 ID
+    IsFirstMessage() bool             // 是否为首条消息（决定是否发送完整历史）
+    MarkMessageSent()                 // 标记已发送，后续走增量模式
+    ShouldSendFullHistory() bool      // 综合判断：无会话或首条消息 → true
+}
+```
+
+**关键设计决策**：不是所有提供者都需要会话。OpenAI API 是无状态的，天然不支持会话续传。因此 `SessionProvider` 是一个**可选接口**，编排器通过类型断言来判断是否启用会话模式：
+
+```go
+// 只有支持会话的提供者才启动会话
+if sp, ok := reviewer.Provider.(provider.SessionProvider); ok {
+    sp.StartSession("Hydra | PR #42 | reviewer:security")
+}
+```
+
+### 编排器如何使用 SessionProvider
+
+在 `orchestrator.go` 中，SessionProvider 影响三个关键流程：
+
+**1. 会话生命周期管理**
+
+```
+RunStreaming()
+  ├─ startSessions(label)      ← 为所有 CLI 提供者启动会话
+  │    ├─ reviewer1.StartSession("Hydra | PR #42 | reviewer:security")
+  │    ├─ reviewer2.StartSession("Hydra | PR #42 | reviewer:logic")
+  │    ├─ analyzer.StartSession("Hydra | PR #42 | analyzer")
+  │    └─ summarizer.StartSession("Hydra | PR #42 | summarizer")
+  │
+  ├─ 阶段1: 预分析
+  ├─ 阶段2: 多轮辩论
+  ├─ 阶段3: 总结
+  │
+  └─ defer endAllSessions()    ← 无论成功失败，都清理所有会话
+```
+
+**2. 消息构建策略分叉**
+
+编排器根据是否有 SessionProvider 选择不同的消息构建策略：
+
+```
+buildMessages(reviewerID)
+  │
+  ├─ 第1轮（所有提供者相同）:
+  │    └─ buildFirstRoundMessages()  → 完整的审查 prompt
+  │
+  └─ 第2轮及之后（策略分叉）:
+       │
+       ├─ 有 SessionProvider:
+       │    └─ buildSessionDebateMessages()
+       │         → 只发送本轮其他审查者的新消息（~3K tokens）
+       │         → CLI 通过 --resume 自动拥有之前的上下文
+       │
+       └─ 无 SessionProvider（如 OpenAI）:
+            └─ buildFullContextDebateMessages()
+                 → 发送完整上下文 + 所有历史消息（~30K tokens）
+                 → 每次从头构建完整对话
+```
+
+**3. CLI 参数的自动适配**
+
+在 `ClaudeCodeProvider` 内部，会话状态决定了 CLI 的调用方式：
+
+```
+Chat() / ChatStream()
+  │
+  ├─ snap := session.Snapshot()     ← 原子读取会话状态
+  │
+  ├─ snap.ShouldSendFull() == true（首次或无会话）:
+  │    ├─ prompt = BuildPrompt()    ← 系统提示 + 全部消息
+  │    └─ args: --system-prompt "..." --output-format stream-json
+  │
+  └─ snap.ShouldSendFull() == false（续传）:
+       ├─ prompt = BuildPromptLastOnly()  ← 仅最后一条 user 消息
+       └─ args: --resume <session-id> --output-format stream-json
+```
+
+### 对比总结
+
+| 维度 | 无 SessionProvider（OpenAI） | 有 SessionProvider（Claude/Codex CLI） |
+|------|------|------|
+| 状态 | 无状态，每次发完整历史 | 有状态，CLI 记住上下文 |
+| 第 N 轮输入量 | O(N) — 随轮次线性增长 | O(1) — 只发增量消息 |
+| 3轮辩论总 token | ~90K | ~11.5K（节省 ~87%） |
+| 延迟 | 随历史增长而增加 | 基本恒定 |
+| 接口 | 仅实现 `AIProvider` | 实现 `AIProvider` + `SessionProvider` |
+| 消息构建 | `buildFullContextDebateMessages` | `buildSessionDebateMessages` |
 
 ## SessionProvider 生命周期
 

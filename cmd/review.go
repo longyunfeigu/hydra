@@ -49,7 +49,10 @@ func init() {
 	f.BoolP("all", "a", false, "Use all reviewers")
 	f.Bool("skip-context", false, "Skip context gathering")
 	f.Bool("no-post", false, "Skip posting review comments")
+	f.Bool("no-post-summary", false, "Skip posting review summary note")
 }
+
+const hydraSummaryMarker = "<!-- hydra:summary -->"
 
 // reviewTarget 封装了审查目标的所有必要信息。
 type reviewTarget struct {
@@ -101,7 +104,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 	reviewers := make([]orchestrator.Reviewer, 0, len(selectedIDs))
 	for _, id := range selectedIDs {
 		rc := cfg.Reviewers[id]
-		p, err := provider.CreateProvider(rc.Model, rc.ModelName, cfg)
+		p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, cfg)
 		if err != nil {
 			return fmt.Errorf("failed to create provider for reviewer %s: %w", id, err)
 		}
@@ -112,7 +115,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	analyzerProvider, err := provider.CreateProvider(cfg.Analyzer.Model, cfg.Analyzer.ModelName, cfg)
+	analyzerProvider, err := provider.CreateProvider(cfg.Analyzer.Model, cfg.Analyzer.ModelName, cfg.Analyzer.ReasoningEffort, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create analyzer provider: %w", err)
 	}
@@ -122,7 +125,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 		SystemPrompt: cfg.Analyzer.Prompt,
 	}
 
-	summarizerProvider, err := provider.CreateProvider(cfg.Summarizer.Model, cfg.Summarizer.ModelName, cfg)
+	summarizerProvider, err := provider.CreateProvider(cfg.Summarizer.Model, cfg.Summarizer.ModelName, cfg.Summarizer.ReasoningEffort, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create summarizer provider: %w", err)
 	}
@@ -139,7 +142,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 		if contextModel == "" {
 			contextModel = cfg.Analyzer.Model
 		}
-		contextProvider, err := provider.CreateProvider(contextModel, "", cfg)
+		contextProvider, err := provider.CreateProvider(contextModel, "", "", cfg)
 		if err != nil {
 			util.Warnf("Failed to create context gatherer provider: %v", err)
 		} else {
@@ -202,6 +205,34 @@ func runReview(cmd *cobra.Command, args []string) error {
 		}
 		if len(result.ParsedIssues) == 0 {
 			util.Warnf("Skipped posting comments: no structured issues parsed from reviewers")
+		}
+	}
+
+	// 发布最终总结（PR/MR 模式），默认开启，可通过 --no-post-summary 关闭
+	noPostSummary, _ := cmd.Flags().GetBool("no-post-summary")
+	if shouldPostSummary(noPost, noPostSummary, target.Type, result.FinalConclusion, plat) {
+		prNum := extractPRNumber(target.Label)
+		if prNum == "" {
+			util.Warnf("Skipped posting summary: failed to extract PR/MR number from label %q", target.Label)
+		} else {
+			d.SpinnerStart("Posting review summary...")
+			summaryBody := buildSummaryNoteBody(result.FinalConclusion)
+			if err := upsertSummaryNote(plat, prNum, target.Repo, summaryBody); err != nil {
+				d.SpinnerFail("Failed to post review summary")
+				util.Warnf("Failed posting review summary: %v", err)
+			} else {
+				d.SpinnerSucceed("Review summary posted")
+			}
+		}
+	} else if !noPost && !noPostSummary && target.Type == "pr" {
+		if plat == nil {
+			util.Warnf("Skipped posting summary: platform not detected (check platform config)")
+		}
+		if plat != nil && !supportsSummaryPosting(plat) {
+			util.Warnf("Skipped posting summary: platform %q does not support summary posting", plat.Name())
+		}
+		if strings.TrimSpace(result.FinalConclusion) == "" {
+			util.Warnf("Skipped posting summary: final conclusion is empty")
 		}
 	}
 
@@ -460,4 +491,53 @@ func convertIssuesToPlatform(issues []orchestrator.MergedIssue) []platform.Issue
 		})
 	}
 	return result
+}
+
+func shouldPostSummary(noPost, noPostSummary bool, targetType, finalConclusion string, plat platform.Platform) bool {
+	return !noPost &&
+		!noPostSummary &&
+		targetType == "pr" &&
+		strings.TrimSpace(finalConclusion) != "" &&
+		plat != nil &&
+		supportsSummaryPosting(plat)
+}
+
+func buildSummaryNoteBody(finalConclusion string) string {
+	return hydraSummaryMarker + "\n## Hydra Code Review Summary\n\n" + strings.TrimSpace(finalConclusion)
+}
+
+func upsertSummaryNote(plat platform.Platform, mrID, repo, body string) error {
+	type summaryUpserter interface {
+		UpsertSummaryNote(mrID, repo, marker, body string) error
+	}
+	type summaryPoster interface {
+		PostNote(mrID, repo, body string) error
+	}
+
+	if upserter, ok := plat.(summaryUpserter); ok {
+		return upserter.UpsertSummaryNote(mrID, repo, hydraSummaryMarker, body)
+	}
+	if poster, ok := plat.(summaryPoster); ok {
+		return poster.PostNote(mrID, repo, body)
+	}
+	return fmt.Errorf("platform %q does not support summary posting", plat.Name())
+}
+
+func supportsSummaryPosting(plat platform.Platform) bool {
+	if plat == nil {
+		return false
+	}
+	type summaryUpserter interface {
+		UpsertSummaryNote(mrID, repo, marker, body string) error
+	}
+	type summaryPoster interface {
+		PostNote(mrID, repo, body string) error
+	}
+	if _, ok := plat.(summaryUpserter); ok {
+		return true
+	}
+	if _, ok := plat.(summaryPoster); ok {
+		return true
+	}
+	return false
 }

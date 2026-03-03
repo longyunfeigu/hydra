@@ -19,10 +19,11 @@ const defaultOpenAIBaseURL = "https://api.openai.com/v1"
 // OpenAIProvider 通过 OpenAI Chat Completions API 进行交互的无状态提供者。
 // 每次调用发送完整消息历史，不维护会话状态。
 type OpenAIProvider struct {
-	apiKey  string
-	model   string
-	baseURL string
-	client  *http.Client
+	apiKey          string
+	model           string
+	baseURL         string
+	client          *http.Client
+	reasoningEffort string // 推理深度（none|low|medium|high|xhigh），空值表示不发送此参数
 }
 
 // NewOpenAIProvider 创建一个新的 OpenAI API 提供者。
@@ -46,9 +47,10 @@ func (p *OpenAIProvider) Name() string { return "openai" }
 
 // openaiRequest 是发送给 OpenAI API 的请求体结构。
 type openaiRequest struct {
-	Model    string          `json:"model"`
-	Messages []openaiMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
+	Model           string          `json:"model"`
+	Messages        []openaiMessage `json:"messages"`
+	Stream          bool            `json:"stream"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // 推理深度，仅推理模型有效
 }
 
 // openaiMessage 是 OpenAI API 消息格式。
@@ -107,9 +109,10 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []Message, systemPro
 // doChat 执行实际的 API 调用（非流式）。
 func (p *OpenAIProvider) doChat(ctx context.Context, messages []Message, systemPrompt string) (string, error) {
 	reqBody := openaiRequest{
-		Model:    p.model,
-		Messages: buildMessages(messages, systemPrompt),
-		Stream:   false,
+		Model:           p.model,
+		Messages:        buildMessages(messages, systemPrompt),
+		Stream:          false,
+		ReasoningEffort: p.reasoningEffort,
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -166,9 +169,10 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, sys
 		defer close(errs)
 
 		reqBody := openaiRequest{
-			Model:    p.model,
-			Messages: buildMessages(messages, systemPrompt),
-			Stream:   true,
+			Model:           p.model,
+			Messages:        buildMessages(messages, systemPrompt),
+			Stream:          true,
+			ReasoningEffort: p.reasoningEffort,
 		}
 
 		body, err := json.Marshal(reqBody)

@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/guwanhua/hydra/internal/schema"
 )
 
 var (
@@ -52,30 +55,50 @@ var (
 	rawJSONRe   = regexp.MustCompile(`(?s)\{[\s\S]*"issues"\s*:\s*\[[\s\S]*\][\s\S]*\}`)
 	// focusRe 匹配"## Suggested Review Focus"章节，提取审查关注重点
 	focusRe     = regexp.MustCompile(`(?s)## Suggested Review Focus\s*\n(.*?)(?:\n##|\z)`)
+	// fileLineRe 匹配文件路径中嵌入的行号范围，如 "file.py:37" 或 "file.py:37-48"
+	fileLineRe  = regexp.MustCompile(`^(.+):(\d+)(?:-(\d+))?$`)
 )
+
+// ParseResult 包含解析结果、原始 JSON 和可能的错误信息。
+type ParseResult struct {
+	Output       *ReviewerOutput            // 成功解析的结构化输出
+	RawJSON      string                     // 提取到的原始 JSON
+	SchemaErrors []schema.ValidationError   // schema 校验错误
+	ParseError   error                      // JSON 语法级错误
+}
 
 // ParseReviewerOutput 从审查者的响应文本中解析结构化的ReviewerOutput。
 // 解析策略：
 //   1. 优先查找```json代码块中的JSON内容
 //   2. 回退方案：查找包含"issues"数组的原始JSON对象
+//   3. 使用 JSON Schema 校验结构有效性
 // 对每个问题进行严格验证：必须包含有效的严重程度、文件路径、标题和描述。
-// 如果未找到有效的JSON块则返回nil。
-func ParseReviewerOutput(response string) *ReviewerOutput {
+// 返回 ParseResult，包含解析结果和错误详情，便于重试时提供具体反馈。
+func ParseReviewerOutput(response string) *ParseResult {
+	result := &ParseResult{}
+
 	// 优先尝试匹配```json代码块格式
-	var jsonStr string
 	if m := jsonFenceRe.FindStringSubmatch(response); len(m) > 1 {
-		jsonStr = m[1]
+		result.RawJSON = m[1]
 	}
 
 	// 回退方案：尝试匹配未包裹在代码块中的原始JSON对象
-	if jsonStr == "" {
+	if result.RawJSON == "" {
 		if m := rawJSONRe.FindString(response); m != "" {
-			jsonStr = m
+			result.RawJSON = m
 		}
 	}
 
-	if jsonStr == "" {
-		return nil
+	if result.RawJSON == "" {
+		result.ParseError = fmt.Errorf("no JSON block found in response")
+		return result
+	}
+
+	// Schema 校验：在深度解析之前检查结构有效性
+	vr := schema.ValidateIssuesJSON(result.RawJSON)
+	if !vr.Valid {
+		result.SchemaErrors = vr.Errors
+		// 即使 schema 校验失败，仍然尝试手动解析以提取尽可能多的有效 issue
 	}
 
 	// 先解析为通用结构体进行灵活验证，避免严格结构体解析导致丢失数据
@@ -84,12 +107,14 @@ func ParseReviewerOutput(response string) *ReviewerOutput {
 		Verdict string            `json:"verdict"`
 		Summary string            `json:"summary"`
 	}
-	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
-		return nil
+	if err := json.Unmarshal([]byte(result.RawJSON), &raw); err != nil {
+		result.ParseError = fmt.Errorf("JSON syntax error: %w", err)
+		return result
 	}
 
 	if raw.Issues == nil {
-		return nil
+		result.ParseError = fmt.Errorf("missing 'issues' key in JSON")
+		return result
 	}
 
 	verdict := raw.Verdict
@@ -112,6 +137,20 @@ func ParseReviewerOutput(response string) *ReviewerOutput {
 		file, _ := m["file"].(string)
 		if file == "" {
 			continue
+		}
+
+		// 从文件路径中提取嵌入的行号范围，如 "file.py:37-48" → file="file.py", line=37, endLine=48
+		var fileLine, fileEndLine *int
+		if match := fileLineRe.FindStringSubmatch(file); match != nil {
+			file = match[1]
+			if v, err := strconv.Atoi(match[2]); err == nil && v > 0 {
+				fileLine = &v
+			}
+			if match[3] != "" {
+				if v, err := strconv.Atoi(match[3]); err == nil && v > 0 {
+					fileEndLine = &v
+				}
+			}
 		}
 
 		title, _ := m["title"].(string)
@@ -139,18 +178,22 @@ func ParseReviewerOutput(response string) *ReviewerOutput {
 			Description: description,
 		}
 
-		// 可选字段：起始行号
+		// 可选字段：起始行号（JSON 中的 "line" 字段优先，路径中提取的行号作为 fallback）
 		if lineVal, ok := m["line"].(float64); ok && lineVal > 0 {
 			line := int(lineVal)
 			issue.Line = &line
+		} else if fileLine != nil {
+			issue.Line = fileLine
 		}
 
-		// 可选字段：结束行号（必须大于等于起始行号）
+		// 可选字段：结束行号（JSON 中的 "endLine" 字段优先，路径中提取的结束行号作为 fallback）
 		if endVal, ok := m["endLine"].(float64); ok && endVal > 0 {
 			endLine := int(endVal)
 			if issue.Line != nil && endLine >= *issue.Line {
 				issue.EndLine = &endLine
 			}
+		} else if fileEndLine != nil && issue.Line != nil && *fileEndLine >= *issue.Line {
+			issue.EndLine = fileEndLine
 		}
 
 		if sf, ok := m["suggestedFix"].(string); ok {
@@ -170,11 +213,12 @@ func ParseReviewerOutput(response string) *ReviewerOutput {
 		issues = append(issues, issue)
 	}
 
-	return &ReviewerOutput{
+	result.Output = &ReviewerOutput{
 		Issues:  issues,
 		Verdict: verdict,
 		Summary: raw.Summary,
 	}
+	return result
 }
 
 // ParseFocusAreas 从分析器输出中提取建议的审查关注重点。
@@ -281,10 +325,16 @@ func isSimilarIssue(a, b *ReviewIssue) bool {
 }
 
 // linesOverlap 检查两个问题的行号范围是否重叠或在5行的邻近范围内。
-// 如果任一问题没有行号信息，则不拒绝（返回true），因为缺少行号不应阻止合并。
+// 合并策略：
+//   - 两边都有行号：要求范围重叠或相邻（5行内）
+//   - 两边都没有行号：允许继续由文本相似度决定
+//   - 仅一边有行号：视为不重叠，避免过度合并
 func linesOverlap(a, b *ReviewIssue) bool {
+	if a.Line == nil && b.Line == nil {
+		return true
+	}
 	if a.Line == nil || b.Line == nil {
-		return true // 无行号信息 -> 不拒绝合并
+		return false
 	}
 	aStart := *a.Line
 	aEnd := aStart

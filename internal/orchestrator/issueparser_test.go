@@ -26,14 +26,14 @@ func TestParseReviewerOutput(t *testing.T) {
   "summary": "Found a security issue."
 }` + "\n```\nThat's all."
 
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 1 {
-			t.Fatalf("expected 1 issue, got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 1 {
+			t.Fatalf("expected 1 issue, got %d", len(pr.Output.Issues))
 		}
-		issue := out.Issues[0]
+		issue := pr.Output.Issues[0]
 		if issue.Severity != "high" {
 			t.Errorf("severity = %q, want %q", issue.Severity, "high")
 		}
@@ -46,86 +46,93 @@ func TestParseReviewerOutput(t *testing.T) {
 		if issue.Line == nil || *issue.Line != 42 {
 			t.Errorf("line = %v, want 42", issue.Line)
 		}
-		if out.Verdict != "request_changes" {
-			t.Errorf("verdict = %q, want %q", out.Verdict, "request_changes")
+		if pr.Output.Verdict != "request_changes" {
+			t.Errorf("verdict = %q, want %q", pr.Output.Verdict, "request_changes")
 		}
-		if out.Summary != "Found a security issue." {
-			t.Errorf("summary = %q, want %q", out.Summary, "Found a security issue.")
+		if pr.Output.Summary != "Found a security issue." {
+			t.Errorf("summary = %q, want %q", pr.Output.Summary, "Found a security issue.")
+		}
+		if pr.ParseError != nil {
+			t.Errorf("unexpected parse error: %v", pr.ParseError)
 		}
 	})
 
 	t.Run("raw JSON object without code fence", func(t *testing.T) {
 		response := `Some preamble text. {"issues": [{"severity":"medium","category":"style","file":"main.go","title":"Naming convention","description":"Variable name is unclear."}], "verdict":"comment", "summary":"Minor style issue."}`
 
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 1 {
-			t.Fatalf("expected 1 issue, got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 1 {
+			t.Fatalf("expected 1 issue, got %d", len(pr.Output.Issues))
 		}
-		if out.Issues[0].Severity != "medium" {
-			t.Errorf("severity = %q, want %q", out.Issues[0].Severity, "medium")
+		if pr.Output.Issues[0].Severity != "medium" {
+			t.Errorf("severity = %q, want %q", pr.Output.Issues[0].Severity, "medium")
 		}
 	})
 
-	t.Run("invalid JSON returns nil", func(t *testing.T) {
+	t.Run("invalid JSON returns parse error", func(t *testing.T) {
 		response := "```json\n{not valid json}\n```"
-		out := ParseReviewerOutput(response)
-		if out != nil {
-			t.Errorf("expected nil for invalid JSON, got %+v", out)
+		pr := ParseReviewerOutput(response)
+		if pr.ParseError == nil {
+			t.Error("expected parse error for invalid JSON")
 		}
 	})
 
-	t.Run("no JSON block returns nil", func(t *testing.T) {
+	t.Run("no JSON block returns parse error", func(t *testing.T) {
 		response := "This is just plain text with no JSON."
-		out := ParseReviewerOutput(response)
-		if out != nil {
-			t.Errorf("expected nil, got %+v", out)
+		pr := ParseReviewerOutput(response)
+		if pr.ParseError == nil {
+			t.Error("expected parse error for missing JSON")
 		}
 	})
 
 	t.Run("missing required field: no title", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"high","file":"a.go","title":"","description":"desc"}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 0 {
-			t.Errorf("expected 0 issues (title empty), got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 0 {
+			t.Errorf("expected 0 issues (title empty), got %d", len(pr.Output.Issues))
 		}
 	})
 
 	t.Run("missing required field: no file", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"high","file":"","title":"Bug","description":"desc"}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 0 {
-			t.Errorf("expected 0 issues (file empty), got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 0 {
+			t.Errorf("expected 0 issues (file empty), got %d", len(pr.Output.Issues))
 		}
 	})
 
 	t.Run("missing required field: invalid severity", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"urgent","file":"a.go","title":"Bug","description":"desc"}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 0 {
-			t.Errorf("expected 0 issues (invalid severity), got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 0 {
+			t.Errorf("expected 0 issues (invalid severity), got %d", len(pr.Output.Issues))
+		}
+		// Should also have schema errors
+		if len(pr.SchemaErrors) == 0 {
+			t.Error("expected schema validation errors for invalid severity")
 		}
 	})
 
 	t.Run("missing required field: no description", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"high","file":"a.go","title":"Bug","description":""}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 0 {
-			t.Errorf("expected 0 issues (description empty), got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 0 {
+			t.Errorf("expected 0 issues (description empty), got %d", len(pr.Output.Issues))
 		}
 	})
 
@@ -133,12 +140,12 @@ func TestParseReviewerOutput(t *testing.T) {
 		severities := []string{"critical", "high", "medium", "low", "nitpick"}
 		for _, sev := range severities {
 			response := "```json\n" + `{"issues":[{"severity":"` + sev + `","file":"x.go","title":"T","description":"D"}],"verdict":"comment","summary":"s"}` + "\n```"
-			out := ParseReviewerOutput(response)
-			if out == nil {
-				t.Fatalf("expected non-nil for severity %q", sev)
+			pr := ParseReviewerOutput(response)
+			if pr.Output == nil {
+				t.Fatalf("expected non-nil output for severity %q", sev)
 			}
-			if len(out.Issues) != 1 {
-				t.Errorf("severity %q: expected 1 issue, got %d", sev, len(out.Issues))
+			if len(pr.Output.Issues) != 1 {
+				t.Errorf("severity %q: expected 1 issue, got %d", sev, len(pr.Output.Issues))
 			}
 		}
 	})
@@ -160,14 +167,14 @@ func TestParseReviewerOutput(t *testing.T) {
   "summary": "Minor suggestion."
 }` + "\n```"
 
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 1 {
-			t.Fatalf("expected 1 issue, got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 1 {
+			t.Fatalf("expected 1 issue, got %d", len(pr.Output.Issues))
 		}
-		issue := out.Issues[0]
+		issue := pr.Output.Issues[0]
 		if issue.Line == nil || *issue.Line != 10 {
 			t.Errorf("line = %v, want 10", issue.Line)
 		}
@@ -184,48 +191,102 @@ func TestParseReviewerOutput(t *testing.T) {
 
 	t.Run("endLine ignored if less than line", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"low","file":"a.go","line":20,"endLine":10,"title":"T","description":"D"}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 1 {
-			t.Fatalf("expected 1 issue, got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 1 {
+			t.Fatalf("expected 1 issue, got %d", len(pr.Output.Issues))
 		}
-		if out.Issues[0].EndLine != nil {
-			t.Errorf("endLine should be nil when less than line, got %d", *out.Issues[0].EndLine)
+		if pr.Output.Issues[0].EndLine != nil {
+			t.Errorf("endLine should be nil when less than line, got %d", *pr.Output.Issues[0].EndLine)
 		}
 	})
 
 	t.Run("invalid verdict defaults to comment", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[],"verdict":"invalid_verdict","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if out.Verdict != "comment" {
-			t.Errorf("verdict = %q, want %q", out.Verdict, "comment")
+		if pr.Output.Verdict != "comment" {
+			t.Errorf("verdict = %q, want %q", pr.Output.Verdict, "comment")
 		}
 	})
 
 	t.Run("default category is general", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"low","file":"a.go","title":"T","description":"D"}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil || len(out.Issues) != 1 {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil || len(pr.Output.Issues) != 1 {
 			t.Fatal("unexpected parse result")
 		}
-		if out.Issues[0].Category != "general" {
-			t.Errorf("category = %q, want %q", out.Issues[0].Category, "general")
+		if pr.Output.Issues[0].Category != "general" {
+			t.Errorf("category = %q, want %q", pr.Output.Issues[0].Category, "general")
 		}
 	})
 
 	t.Run("raisedBy field parsed from JSON", func(t *testing.T) {
 		response := "```json\n" + `{"issues":[{"severity":"low","file":"a.go","title":"T","description":"D","raisedBy":["reviewer-1","reviewer-2"]}],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil || len(out.Issues) != 1 {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil || len(pr.Output.Issues) != 1 {
 			t.Fatal("unexpected parse result")
 		}
-		if len(out.Issues[0].RaisedBy) != 2 {
-			t.Errorf("raisedBy len = %d, want 2", len(out.Issues[0].RaisedBy))
+		if len(pr.Output.Issues[0].RaisedBy) != 2 {
+			t.Errorf("raisedBy len = %d, want 2", len(pr.Output.Issues[0].RaisedBy))
+		}
+	})
+
+	t.Run("line range extracted from file path when no line field", func(t *testing.T) {
+		response := "```json\n" + `{"issues":[{"severity":"high","file":"backend/services/base.py:37-48","title":"Bug","description":"Issue found"}],"verdict":"comment","summary":"s"}` + "\n```"
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil || len(pr.Output.Issues) != 1 {
+			t.Fatal("unexpected parse result")
+		}
+		issue := pr.Output.Issues[0]
+		if issue.File != "backend/services/base.py" {
+			t.Errorf("file = %q, want %q", issue.File, "backend/services/base.py")
+		}
+		if issue.Line == nil || *issue.Line != 37 {
+			t.Errorf("line = %v, want 37", issue.Line)
+		}
+		if issue.EndLine == nil || *issue.EndLine != 48 {
+			t.Errorf("endLine = %v, want 48", issue.EndLine)
+		}
+	})
+
+	t.Run("single line extracted from file path", func(t *testing.T) {
+		response := "```json\n" + `{"issues":[{"severity":"low","file":"main.go:100","title":"T","description":"D"}],"verdict":"comment","summary":"s"}` + "\n```"
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil || len(pr.Output.Issues) != 1 {
+			t.Fatal("unexpected parse result")
+		}
+		issue := pr.Output.Issues[0]
+		if issue.File != "main.go" {
+			t.Errorf("file = %q, want %q", issue.File, "main.go")
+		}
+		if issue.Line == nil || *issue.Line != 100 {
+			t.Errorf("line = %v, want 100", issue.Line)
+		}
+		if issue.EndLine != nil {
+			t.Errorf("endLine = %v, want nil", issue.EndLine)
+		}
+	})
+
+	t.Run("explicit line field takes priority over path-embedded line", func(t *testing.T) {
+		response := "```json\n" + `{"issues":[{"severity":"low","file":"main.go:100-200","line":50,"endLine":60,"title":"T","description":"D"}],"verdict":"comment","summary":"s"}` + "\n```"
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil || len(pr.Output.Issues) != 1 {
+			t.Fatal("unexpected parse result")
+		}
+		issue := pr.Output.Issues[0]
+		if issue.File != "main.go" {
+			t.Errorf("file = %q, want %q", issue.File, "main.go")
+		}
+		if issue.Line == nil || *issue.Line != 50 {
+			t.Errorf("line = %v, want 50 (explicit field should take priority)", issue.Line)
+		}
+		if issue.EndLine == nil || *issue.EndLine != 60 {
+			t.Errorf("endLine = %v, want 60 (explicit field should take priority)", issue.EndLine)
 		}
 	})
 
@@ -236,12 +297,32 @@ func TestParseReviewerOutput(t *testing.T) {
   {"severity":"low","file":"","title":"No file","description":"D"},
   {"severity":"medium","file":"c.go","title":"Also valid","description":"Another good one"}
 ],"verdict":"comment","summary":"s"}` + "\n```"
-		out := ParseReviewerOutput(response)
-		if out == nil {
+		pr := ParseReviewerOutput(response)
+		if pr.Output == nil {
 			t.Fatal("expected non-nil output")
 		}
-		if len(out.Issues) != 2 {
-			t.Errorf("expected 2 valid issues, got %d", len(out.Issues))
+		if len(pr.Output.Issues) != 2 {
+			t.Errorf("expected 2 valid issues, got %d", len(pr.Output.Issues))
+		}
+		// Should have schema errors for the invalid issues
+		if len(pr.SchemaErrors) == 0 {
+			t.Error("expected schema validation errors for mixed valid/invalid")
+		}
+	})
+
+	t.Run("ParseResult contains RawJSON", func(t *testing.T) {
+		response := "```json\n{\"issues\":[]}\n```"
+		pr := ParseReviewerOutput(response)
+		if pr.RawJSON == "" {
+			t.Error("expected non-empty RawJSON")
+		}
+	})
+
+	t.Run("ParseResult schema errors for missing required fields", func(t *testing.T) {
+		response := "```json\n" + `{"issues":[{"severity":"high"}]}` + "\n```"
+		pr := ParseReviewerOutput(response)
+		if len(pr.SchemaErrors) == 0 {
+			t.Error("expected schema errors for missing required fields")
 		}
 	})
 }
@@ -546,6 +627,35 @@ func TestDeduplicateIssues(t *testing.T) {
 		}
 	})
 
+	t.Run("one side missing line should not merge", func(t *testing.T) {
+		issues := map[string][]ReviewIssue{
+			"reviewer-1": {
+				{
+					Severity:    "high",
+					File:        "api.go",
+					Line:        intPtr(42),
+					Title:       "Missing authorization check in admin endpoint",
+					Description: "Admin endpoint executes sensitive action without role guard",
+					Category:    "security",
+				},
+			},
+			"reviewer-2": {
+				{
+					Severity:    "high",
+					File:        "api.go",
+					Title:       "Missing authorization check in admin endpoint",
+					Description: "Admin endpoint executes sensitive action without role guard",
+					Category:    "security",
+				},
+			},
+		}
+
+		merged := DeduplicateIssues(issues)
+		if len(merged) != 2 {
+			t.Fatalf("expected 2 issues (one side has no line), got %d", len(merged))
+		}
+	})
+
 	t.Run("empty input returns empty", func(t *testing.T) {
 		merged := DeduplicateIssues(map[string][]ReviewIssue{})
 		if len(merged) != 0 {
@@ -800,7 +910,7 @@ func TestLinesOverlap(t *testing.T) {
 			name: "one nil line overlaps",
 			a:    ReviewIssue{Line: intPtr(10)},
 			b:    ReviewIssue{},
-			want: true,
+			want: false,
 		},
 		{
 			name: "exact same line",

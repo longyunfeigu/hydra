@@ -25,6 +25,8 @@
 | `GetExistingComments` | `gh api repos/<repo>/pulls/<num>/comments --paginate` |
 | `PostReview` | `gh api repos/<repo>/pulls/<num>/reviews --input -`（批量） |
 | `PostComment` | 三级降级策略（见下方） |
+| `PostNote` | `gh api repos/<repo>/issues/<num>/comments --method POST --input -` |
+| `UpsertSummaryNote` | `gh api repos/<repo>/issues/<num>/comments`（列举）+ `gh api repos/<repo>/issues/comments/<id> --method PATCH --input -`（更新） |
 | `GetMRDetails` | `gh pr view <num> --json number,title,author,mergedAt,files` |
 
 ## gh CLI 调用示例

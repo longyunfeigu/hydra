@@ -2,6 +2,8 @@ package gitlab
 
 import (
 	"testing"
+
+	"github.com/guwanhua/hydra/internal/platform"
 )
 
 func TestParseMRURL(t *testing.T) {
@@ -119,5 +121,46 @@ func TestGetHost(t *testing.T) {
 	g2 := New("gitlab.company.com")
 	if g2.getHost() != "gitlab.company.com" {
 		t.Errorf("getHost() = %q, want %q", g2.getHost(), "gitlab.company.com")
+	}
+}
+
+func TestBuildTextPosition_IncludesOldPath(t *testing.T) {
+	commitInfo := platform.CommitInfo{
+		HeadSHA:  "head",
+		BaseSHA:  "base",
+		StartSHA: "start",
+	}
+	pos := buildTextPosition("backend/a.go", 42, commitInfo)
+
+	if got, _ := pos["position_type"].(string); got != "text" {
+		t.Fatalf("position_type = %q, want %q", got, "text")
+	}
+	if got, _ := pos["new_path"].(string); got != "backend/a.go" {
+		t.Fatalf("new_path = %q, want %q", got, "backend/a.go")
+	}
+	if got, _ := pos["old_path"].(string); got != "backend/a.go" {
+		t.Fatalf("old_path = %q, want %q", got, "backend/a.go")
+	}
+	if got, ok := pos["new_line"].(int); !ok || got != 42 {
+		t.Fatalf("new_line = %v (ok=%v), want %d", pos["new_line"], ok, 42)
+	}
+}
+
+func TestBuildFilePosition_IncludesOldPath(t *testing.T) {
+	commitInfo := platform.CommitInfo{
+		HeadSHA:  "head",
+		BaseSHA:  "base",
+		StartSHA: "start",
+	}
+	pos := buildFilePosition("backend/a.go", commitInfo)
+
+	if got, _ := pos["position_type"].(string); got != "file" {
+		t.Fatalf("position_type = %q, want %q", got, "file")
+	}
+	if got, _ := pos["new_path"].(string); got != "backend/a.go" {
+		t.Fatalf("new_path = %q, want %q", got, "backend/a.go")
+	}
+	if got, _ := pos["old_path"].(string); got != "backend/a.go" {
+		t.Fatalf("old_path = %q, want %q", got, "backend/a.go")
 	}
 }

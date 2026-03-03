@@ -6,6 +6,7 @@ import (
 	"github.com/guwanhua/hydra/internal/orchestrator"
 	"github.com/guwanhua/hydra/internal/platform"
 	"github.com/guwanhua/hydra/internal/platform/detect"
+	gh "github.com/guwanhua/hydra/internal/platform/github"
 	gl "github.com/guwanhua/hydra/internal/platform/gitlab"
 )
 
@@ -232,6 +233,206 @@ func TestShouldPostComments(t *testing.T) {
 				t.Errorf("shouldPostComments() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- summary 发布条件逻辑测试 ---
+
+func TestShouldPostSummary(t *testing.T) {
+	fakePlat := gl.New("39.99.155.169")
+
+	tests := []struct {
+		name           string
+		noPost         bool
+		noPostSummary  bool
+		targetType     string
+		finalConclusion string
+		plat           platform.Platform
+		want           bool
+	}{
+		{
+			name:            "all conditions met -> post",
+			noPost:          false,
+			noPostSummary:   false,
+			targetType:      "pr",
+			finalConclusion: "Looks good overall.",
+			plat:            fakePlat,
+			want:            true,
+		},
+		{
+			name:            "github should post summary too",
+			noPost:          false,
+			noPostSummary:   false,
+			targetType:      "pr",
+			finalConclusion: "summary",
+			plat:            gh.New(),
+			want:            true,
+		},
+		{
+			name:            "no-post -> skip",
+			noPost:          true,
+			noPostSummary:   false,
+			targetType:      "pr",
+			finalConclusion: "summary",
+			plat:            fakePlat,
+			want:            false,
+		},
+		{
+			name:            "no-post-summary -> skip",
+			noPost:          false,
+			noPostSummary:   true,
+			targetType:      "pr",
+			finalConclusion: "summary",
+			plat:            fakePlat,
+			want:            false,
+		},
+		{
+			name:            "empty conclusion -> skip",
+			noPost:          false,
+			noPostSummary:   false,
+			targetType:      "pr",
+			finalConclusion: "   ",
+			plat:            fakePlat,
+			want:            false,
+		},
+		{
+			name:            "non-pr target -> skip",
+			noPost:          false,
+			noPostSummary:   false,
+			targetType:      "local",
+			finalConclusion: "summary",
+			plat:            fakePlat,
+			want:            false,
+		},
+		{
+			name:            "nil platform -> skip",
+			noPost:          false,
+			noPostSummary:   false,
+			targetType:      "pr",
+			finalConclusion: "summary",
+			plat:            nil,
+			want:            false,
+		},
+		{
+			name:            "unsupported platform -> skip",
+			noPost:          false,
+			noPostSummary:   false,
+			targetType:      "pr",
+			finalConclusion: "summary",
+			plat:            &fakeUnsupportedSummaryPlatform{Platform: gl.New("39.99.155.169")},
+			want:            false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldPostSummary(tt.noPost, tt.noPostSummary, tt.targetType, tt.finalConclusion, tt.plat)
+			if got != tt.want {
+				t.Errorf("shouldPostSummary() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSupportsSummaryPosting(t *testing.T) {
+	if supportsSummaryPosting(nil) {
+		t.Fatal("nil platform should not support summary posting")
+	}
+	if !supportsSummaryPosting(gl.New("39.99.155.169")) {
+		t.Fatal("gitlab platform should support summary posting")
+	}
+	if !supportsSummaryPosting(gh.New()) {
+		t.Fatal("github platform should support summary posting")
+	}
+	if supportsSummaryPosting(&fakeUnsupportedSummaryPlatform{Platform: gl.New("39.99.155.169")}) {
+		t.Fatal("fake unsupported platform should not support summary posting")
+	}
+}
+
+func TestBuildSummaryNoteBody(t *testing.T) {
+	body := buildSummaryNoteBody("  Final conclusion here.  ")
+	if !contains(body, hydraSummaryMarker) {
+		t.Fatalf("expected body to contain summary marker, got %q", body)
+	}
+	if !contains(body, "## Hydra Code Review Summary") {
+		t.Fatalf("expected body to contain heading, got %q", body)
+	}
+	if !contains(body, "Final conclusion here.") {
+		t.Fatalf("expected body to contain trimmed conclusion, got %q", body)
+	}
+}
+
+type fakeUpsertPlatform struct {
+	platform.Platform
+	called bool
+	mrID   string
+	repo   string
+	marker string
+	body   string
+}
+
+type fakeUnsupportedSummaryPlatform struct {
+	platform.Platform
+}
+
+func (f *fakeUpsertPlatform) UpsertSummaryNote(mrID, repo, marker, body string) error {
+	f.called = true
+	f.mrID = mrID
+	f.repo = repo
+	f.marker = marker
+	f.body = body
+	return nil
+}
+
+type fakePostNotePlatform struct {
+	platform.Platform
+	called bool
+	mrID   string
+	repo   string
+	body   string
+}
+
+func (f *fakePostNotePlatform) PostNote(mrID, repo, body string) error {
+	f.called = true
+	f.mrID = mrID
+	f.repo = repo
+	f.body = body
+	return nil
+}
+
+func TestUpsertSummaryNote_UsesUpserter(t *testing.T) {
+	fp := &fakeUpsertPlatform{Platform: gl.New("39.99.155.169")}
+	body := buildSummaryNoteBody("summary")
+	if err := upsertSummaryNote(fp, "123", "group/repo", body); err != nil {
+		t.Fatalf("upsertSummaryNote returned error: %v", err)
+	}
+	if !fp.called {
+		t.Fatal("expected UpsertSummaryNote to be called")
+	}
+	if fp.marker != hydraSummaryMarker {
+		t.Fatalf("marker = %q, want %q", fp.marker, hydraSummaryMarker)
+	}
+}
+
+func TestUpsertSummaryNote_FallsBackToPostNote(t *testing.T) {
+	fp := &fakePostNotePlatform{Platform: gh.New()}
+	body := buildSummaryNoteBody("summary")
+	if err := upsertSummaryNote(fp, "123", "group/repo", body); err != nil {
+		t.Fatalf("upsertSummaryNote returned error: %v", err)
+	}
+	if !fp.called {
+		t.Fatal("expected PostNote fallback to be called")
+	}
+}
+
+func TestUpsertSummaryNote_UnsupportedPlatform(t *testing.T) {
+	unsupported := &fakeUnsupportedSummaryPlatform{Platform: gl.New("39.99.155.169")}
+	err := upsertSummaryNote(unsupported, "123", "owner/repo", "summary")
+	if err == nil {
+		t.Fatal("expected error for unsupported platform")
+	}
+	if !contains(err.Error(), "does not support summary posting") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -70,6 +70,7 @@ type DiffFile struct {
 type CommentResult struct {
 	Success bool
 	Inline  bool
+	Mode    string // "inline" | "file" | "global"
 	Error   string
 }
 
@@ -125,9 +126,9 @@ type IssueForComment struct {
 
 // MRDetail 包含历史 MR/PR 的详细信息，用于 context gathering。
 type MRDetail struct {
-	Number int
-	Title  string
-	Author string
+	Number   int
+	Title    string
+	Author   string
 	MergedAt string
-	Files  []string
+	Files    []string
 }

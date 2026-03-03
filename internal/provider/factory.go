@@ -18,7 +18,7 @@ import (
 // modelName 为可选的底层模型名称（如 "claude-sonnet-4-5-20250514"），
 // 对 CLI 提供者会通过 --model 参数传递。
 // 如果全局 Mock 模式开启，则所有模型都会被替换为 MockProvider。
-func CreateProvider(model, modelName string, cfg *config.HydraConfig) (AIProvider, error) {
+func CreateProvider(model, modelName, reasoningEffort string, cfg *config.HydraConfig) (AIProvider, error) {
 	// 全局模拟模式：将所有模型替换为 MockProvider，用于测试和开发
 	if cfg.Mock {
 		return NewMockProvider(), nil
@@ -48,7 +48,9 @@ func CreateProvider(model, modelName string, cfg *config.HydraConfig) (AIProvide
 		if provCfg.APIKey == "" {
 			return nil, fmt.Errorf("openai provider requires api_key in config (providers.openai.api_key)")
 		}
-		return NewOpenAIProvider(provCfg.APIKey, model, provCfg.BaseURL), nil
+		p := NewOpenAIProvider(provCfg.APIKey, model, provCfg.BaseURL)
+		p.reasoningEffort = reasoningEffort
+		return p, nil
 	case strings.HasPrefix(model, "mock"):
 		// 以 "mock" 开头的模型名称均使用模拟提供者
 		return NewMockProvider(), nil

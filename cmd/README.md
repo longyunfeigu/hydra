@@ -102,6 +102,7 @@ hydra init
 | `--all` | `-a` | bool | false | 使用所有审查者 |
 | `--no-converge` | - | bool | false | 禁用收敛检测 |
 | `--no-post` | - | bool | false | 不发布评论到 PR/MR |
+| `--no-post-summary` | - | bool | false | 不发布总结 note 到 PR/MR |
 | `--skip-context` | - | bool | false | 跳过上下文收集 |
 
 ### hydra serve
@@ -152,11 +153,13 @@ runReview(cmd, args)
   |     +-- d.IssuesTable(result.ParsedIssues)             以表格展示结构化问题
   |     +-- d.TokenUsage(result.TokenUsage, ...)           显示 Token 消耗统计
   |
-  +-- 7. 发布评论到 PR/MR (可选) -------------------------- platform
+  +-- 7. 发布评论/总结到 PR/MR (可选) --------------------- platform
   |     条件: !noPost && type=="pr" && len(issues)>0 && plat!=nil
   |     convertIssuesToPlatform(issues) -> []platform.IssueForComment
   |     plat.PostIssuesAsComments(prNum, platIssues, repo) -> ReviewResult
   |     输出: "Posted N comments (M inline, ...)"
+  |     条件: !noPost && !noPostSummary && type=="pr" && finalConclusion!=""
+  |     upsertSummaryNote(prNum, repo, "<!-- hydra:summary -->", body)
   |
   +-- 8. 保存到文件 (可选) -------------------------------- saveOutput(path, format, result)
         --output 指定路径，支持 markdown / json 两种格式

@@ -4,6 +4,15 @@ import (
 	"testing"
 )
 
+var (
+	_ interface {
+		PostNote(mrID, repo, body string) error
+	} = (*GitHubPlatform)(nil)
+	_ interface {
+		UpsertSummaryNote(mrID, repo, marker, body string) error
+	} = (*GitHubPlatform)(nil)
+)
+
 func TestParseMRURL(t *testing.T) {
 	g := New()
 
@@ -101,5 +110,26 @@ func TestValidatePRNumber(t *testing.T) {
 		if !tt.wantErr && err != nil {
 			t.Errorf("validatePRNumber(%q) unexpected error: %v", tt.input, err)
 		}
+	}
+}
+
+func TestFindLatestIssueCommentIDByMarker(t *testing.T) {
+	comments := []issueComment{
+		{ID: 11, Body: "normal comment"},
+		{ID: 12, Body: "<!-- hydra:summary -->\nold summary"},
+		{ID: 18, Body: "another comment"},
+		{ID: 20, Body: "<!-- hydra:summary -->\nnew summary"},
+	}
+
+	if got := findLatestIssueCommentIDByMarker(comments, ""); got != 0 {
+		t.Fatalf("empty marker should return 0, got %d", got)
+	}
+
+	if got := findLatestIssueCommentIDByMarker(comments, "<!-- hydra:summary -->"); got != 20 {
+		t.Fatalf("expected latest marker comment ID 20, got %d", got)
+	}
+
+	if got := findLatestIssueCommentIDByMarker(comments, "<!-- not-exist -->"); got != 0 {
+		t.Fatalf("marker not found should return 0, got %d", got)
 	}
 }

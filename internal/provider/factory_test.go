@@ -9,7 +9,7 @@ import (
 
 func TestCreateProvider_ClaudeCode(t *testing.T) {
 	cfg := &config.HydraConfig{}
-	p, err := CreateProvider("claude-code", "", cfg)
+	p, err := CreateProvider("claude-code", "", "", cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestCreateProvider_ClaudeCode(t *testing.T) {
 
 func TestCreateProvider_CodexCli(t *testing.T) {
 	cfg := &config.HydraConfig{}
-	p, err := CreateProvider("codex-cli", "", cfg)
+	p, err := CreateProvider("codex-cli", "", "", cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestCreateProvider_CodexCli(t *testing.T) {
 
 func TestCreateProvider_Mock(t *testing.T) {
 	cfg := &config.HydraConfig{}
-	p, err := CreateProvider("mock", "", cfg)
+	p, err := CreateProvider("mock", "", "", cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestCreateProvider_Mock(t *testing.T) {
 
 func TestCreateProvider_MockPrefix(t *testing.T) {
 	cfg := &config.HydraConfig{}
-	p, err := CreateProvider("mock-test", "", cfg)
+	p, err := CreateProvider("mock-test", "", "", cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestCreateProvider_MockPrefix(t *testing.T) {
 
 func TestCreateProvider_GlobalMock(t *testing.T) {
 	cfg := &config.HydraConfig{Mock: true}
-	p, err := CreateProvider("claude-code", "", cfg)
+	p, err := CreateProvider("claude-code", "", "", cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestCreateProvider_GlobalMock(t *testing.T) {
 
 func TestCreateProvider_Unknown(t *testing.T) {
 	cfg := &config.HydraConfig{}
-	_, err := CreateProvider("unknown-model", "", cfg)
+	_, err := CreateProvider("unknown-model", "", "", cfg)
 	if err == nil {
 		t.Fatal("expected error for unknown model, got nil")
 	}

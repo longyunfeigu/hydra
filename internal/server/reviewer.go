@@ -10,8 +10,11 @@ import (
 	"github.com/guwanhua/hydra/internal/display"
 	"github.com/guwanhua/hydra/internal/orchestrator"
 	"github.com/guwanhua/hydra/internal/platform"
+	"github.com/guwanhua/hydra/internal/prompt"
 	"github.com/guwanhua/hydra/internal/provider"
 )
+
+const hydraSummaryMarker = "<!-- hydra:summary -->"
 
 // RunServerReview 执行 server 模式下的审查流程。
 // 镜像 cmd/review.go:runReview，但不依赖 CLI 交互。
@@ -36,10 +39,13 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 	}
 
 	// 构建 review prompt（格式同 cmd/review.go）
-	prompt := fmt.Sprintf(
-		"Please review %s.\n\nTitle: %s\n\nDescription:\n%s\n\nHere is the full diff:\n\n```diff\n%s```\n\nAnalyze these changes and provide your feedback. You already have the complete diff above — do NOT attempt to fetch it again.",
-		mrURL, mrInfo.Title, mrInfo.Description, mrDiff,
-	)
+	annotatedDiff := platform.AnnotateDiffWithLineNumbers(mrDiff)
+	reviewPrompt := prompt.MustRender("server_review.tmpl", map[string]any{
+		"MRURL":       mrURL,
+		"Title":       mrInfo.Title,
+		"Description": mrInfo.Description,
+		"Diff":        annotatedDiff,
+	})
 
 	// 创建 reviewers
 	allIDs := make([]string, 0, len(cfg.Reviewers))
@@ -50,7 +56,7 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 	reviewers := make([]orchestrator.Reviewer, 0, len(allIDs))
 	for _, id := range allIDs {
 		rc := cfg.Reviewers[id]
-		p, err := provider.CreateProvider(rc.Model, rc.ModelName, cfg)
+		p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, cfg)
 		if err != nil {
 			return fmt.Errorf("failed to create provider for reviewer %s: %w", id, err)
 		}
@@ -62,7 +68,7 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 	}
 
 	// 创建 analyzer
-	analyzerProvider, err := provider.CreateProvider(cfg.Analyzer.Model, cfg.Analyzer.ModelName, cfg)
+	analyzerProvider, err := provider.CreateProvider(cfg.Analyzer.Model, cfg.Analyzer.ModelName, cfg.Analyzer.ReasoningEffort, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create analyzer provider: %w", err)
 	}
@@ -73,7 +79,7 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 	}
 
 	// 创建 summarizer
-	summarizerProvider, err := provider.CreateProvider(cfg.Summarizer.Model, cfg.Summarizer.ModelName, cfg)
+	summarizerProvider, err := provider.CreateProvider(cfg.Summarizer.Model, cfg.Summarizer.ModelName, cfg.Summarizer.ReasoningEffort, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create summarizer provider: %w", err)
 	}
@@ -106,7 +112,7 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 	noopDisplay := display.NewNoopDisplay(logger)
 
 	label := fmt.Sprintf("MR !%s", mrID)
-	result, err := orch.RunStreaming(ctx, label, prompt, noopDisplay)
+	result, err := orch.RunStreaming(ctx, label, reviewPrompt, noopDisplay)
 	if err != nil {
 		return fmt.Errorf("review failed: %w", err)
 	}
@@ -122,18 +128,16 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent,
 			postResult.Posted, postResult.Inline, postResult.FileLevel, postResult.Global, postResult.Failed, postResult.Skipped)
 	}
 
-	// 发布 summary note
-	if result.FinalConclusion != "" {
-		if noter, ok := plat.(interface {
-			PostNote(mrID, repo, body string) error
-		}); ok {
-			summaryBody := "## Hydra Code Review Summary\n\n" + result.FinalConclusion
-			if err := noter.PostNote(mrID, repo, summaryBody); err != nil {
-				logger.Printf("[review] failed to post summary note: %v", err)
-			} else {
-				logger.Printf("[review] summary note posted to MR !%s", mrID)
-			}
+	// 发布 summary note（upsert，避免重复刷屏）
+	if shouldPostServerSummary(result.FinalConclusion, plat) {
+		summaryBody := buildServerSummaryNoteBody(result.FinalConclusion)
+		if err := upsertServerSummaryNote(plat, mrID, repo, summaryBody); err != nil {
+			logger.Printf("[review] failed to post summary note: %v", err)
+		} else {
+			logger.Printf("[review] summary note posted to MR !%s", mrID)
 		}
+	} else if strings.TrimSpace(result.FinalConclusion) != "" {
+		logger.Printf("[review] skipped summary note: platform %q does not support summary posting", plat.Name())
 	}
 
 	return nil
@@ -158,4 +162,48 @@ func convertIssuesToPlatform(issues []orchestrator.MergedIssue) []platform.Issue
 		})
 	}
 	return result
+}
+
+func shouldPostServerSummary(finalConclusion string, plat platform.Platform) bool {
+	return strings.TrimSpace(finalConclusion) != "" && supportsServerSummaryPosting(plat)
+}
+
+func buildServerSummaryNoteBody(finalConclusion string) string {
+	return hydraSummaryMarker + "\n## Hydra Code Review Summary\n\n" + strings.TrimSpace(finalConclusion)
+}
+
+func upsertServerSummaryNote(plat platform.Platform, mrID, repo, body string) error {
+	type summaryUpserter interface {
+		UpsertSummaryNote(mrID, repo, marker, body string) error
+	}
+	type summaryPoster interface {
+		PostNote(mrID, repo, body string) error
+	}
+
+	if upserter, ok := plat.(summaryUpserter); ok {
+		return upserter.UpsertSummaryNote(mrID, repo, hydraSummaryMarker, body)
+	}
+	if poster, ok := plat.(summaryPoster); ok {
+		return poster.PostNote(mrID, repo, body)
+	}
+	return fmt.Errorf("platform %q does not support summary posting", plat.Name())
+}
+
+func supportsServerSummaryPosting(plat platform.Platform) bool {
+	if plat == nil {
+		return false
+	}
+	type summaryUpserter interface {
+		UpsertSummaryNote(mrID, repo, marker, body string) error
+	}
+	type summaryPoster interface {
+		PostNote(mrID, repo, body string) error
+	}
+	if _, ok := plat.(summaryUpserter); ok {
+		return true
+	}
+	if _, ok := plat.(summaryPoster); ok {
+		return true
+	}
+	return false
 }

@@ -55,7 +55,8 @@ type DefaultsConfig struct {
 type ReviewerConfig struct {
 	Model     string `yaml:"model"`                // AI 提供者标识（如 "claude-code"、"codex-cli"、"gpt-4o"）
 	ModelName string `yaml:"model_name,omitempty"`  // 底层模型名称，传给 CLI 的 --model 参数（如 "claude-sonnet-4-5-20250514"）
-	Prompt    string `yaml:"prompt"`                // 系统提示词，指导模型的审查角度和风格
+	Prompt          string `yaml:"prompt"`                      // 系统提示词，指导模型的审查角度和风格
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty"`  // 推理深度（none|low|medium|high|xhigh），仅 OpenAI 推理模型有效
 }
 
 // ContextGathererConfig 保存上下文收集器的配置。
@@ -63,17 +64,9 @@ type ReviewerConfig struct {
 // 帮助审查者更全面地理解代码变更。
 type ContextGathererConfig struct {
 	Enabled   bool              `yaml:"enabled"`              // 是否启用上下文收集
-	CallChain *CallChainConfig  `yaml:"callChain,omitempty"`  // 调用链分析配置
 	History   *HistoryConfig    `yaml:"history,omitempty"`    // Git 历史记录分析配置
 	Docs      *DocsConfig       `yaml:"docs,omitempty"`       // 相关文档收集配置
 	Model     string            `yaml:"model,omitempty"`      // 用于上下文分析的 AI 模型
-}
-
-// CallChainConfig 配置调用链分析的参数。
-// 通过分析函数调用关系，找到与变更相关的上下游代码。
-type CallChainConfig struct {
-	MaxDepth          int `yaml:"maxDepth,omitempty"`          // 调用链的最大追踪深度
-	MaxFilesToAnalyze int `yaml:"maxFilesToAnalyze,omitempty"` // 最多分析的文件数量
 }
 
 // HistoryConfig 配置 Git 历史记录分析的参数。
@@ -118,15 +111,18 @@ func expandEnvVarsInConfig(cfg *HydraConfig) {
 		v.Model = expandEnvVars(v.Model)
 		v.ModelName = expandEnvVars(v.ModelName)
 		v.Prompt = expandEnvVars(v.Prompt)
+		v.ReasoningEffort = expandEnvVars(v.ReasoningEffort)
 		cfg.Reviewers[k] = v
 	}
 	// 替换分析器和汇总器配置中的环境变量
 	cfg.Analyzer.Model = expandEnvVars(cfg.Analyzer.Model)
 	cfg.Analyzer.ModelName = expandEnvVars(cfg.Analyzer.ModelName)
 	cfg.Analyzer.Prompt = expandEnvVars(cfg.Analyzer.Prompt)
+	cfg.Analyzer.ReasoningEffort = expandEnvVars(cfg.Analyzer.ReasoningEffort)
 	cfg.Summarizer.Model = expandEnvVars(cfg.Summarizer.Model)
 	cfg.Summarizer.ModelName = expandEnvVars(cfg.Summarizer.ModelName)
 	cfg.Summarizer.Prompt = expandEnvVars(cfg.Summarizer.Prompt)
+	cfg.Summarizer.ReasoningEffort = expandEnvVars(cfg.Summarizer.ReasoningEffort)
 }
 
 // GetConfigPath 返回配置文件的路径。
