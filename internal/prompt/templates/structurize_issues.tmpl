@@ -17,3 +17,6 @@ Rules:
 - Use the exact reviewer IDs: {{.ReviewerIDs}}
 - IMPORTANT: Always include the "file" field with the full path and the "line" field with the exact line number from the reviewer's text. Search the review text carefully for line references (e.g. "line 42", "L42", ":42", "at 42"). If you truly cannot find a line number, omit the "line" field, but try hard to find one.
 - Severity: critical = blocks merge, high = should fix, medium = worth fixing, low = minor, nitpick = style only
+{{- if .Language}}
+- IMPORTANT: Write the "title", "description", and "suggestedFix" fields in {{.Language}}. All JSON keys, "severity" values, and "category" values MUST remain in English.
+{{- end}}

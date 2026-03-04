@@ -47,6 +47,9 @@ summarizer:
 	if !cfg.Defaults.CheckConvergence {
 		t.Error("CheckConvergence = false, want true")
 	}
+	if cfg.Defaults.StructurizeMode != "ledger" {
+		t.Errorf("StructurizeMode = %q, want %q", cfg.Defaults.StructurizeMode, "ledger")
+	}
 	if len(cfg.Reviewers) != 2 {
 		t.Errorf("len(Reviewers) = %d, want 2", len(cfg.Reviewers))
 	}
@@ -193,12 +196,23 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: HydraConfig{
-				Defaults:   DefaultsConfig{MaxRounds: 2},
+				Defaults:   DefaultsConfig{MaxRounds: 2, StructurizeMode: "ledger"},
 				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
 				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
 				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: "p"},
 			},
 			wantErr: false,
+		},
+		{
+			name: "invalid structurize mode",
+			cfg: HydraConfig{
+				Defaults:   DefaultsConfig{MaxRounds: 2, StructurizeMode: "unknown"},
+				Reviewers:  map[string]ReviewerConfig{"r1": {Model: "m", Prompt: "p"}},
+				Analyzer:   ReviewerConfig{Model: "m", Prompt: "p"},
+				Summarizer: ReviewerConfig{Model: "gpt-4o", Prompt: "p"},
+			},
+			wantErr: true,
+			errMsg:  "defaults.structurize_mode must be one of: legacy, ledger",
 		},
 	}
 

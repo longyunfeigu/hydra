@@ -231,8 +231,8 @@ func TestParseReviewerOutput(t *testing.T) {
 		if pr.Output == nil || len(pr.Output.Issues) != 1 {
 			t.Fatal("unexpected parse result")
 		}
-		if len(pr.Output.Issues[0].RaisedBy) != 2 {
-			t.Errorf("raisedBy len = %d, want 2", len(pr.Output.Issues[0].RaisedBy))
+		if len(pr.Output.Issues[0].ClaimedBy) != 2 {
+			t.Errorf("raisedBy len = %d, want 2", len(pr.Output.Issues[0].ClaimedBy))
 		}
 	})
 
@@ -676,11 +676,11 @@ func TestDeduplicateIssues(t *testing.T) {
 			},
 			"reviewer-2": {
 				{
-					Severity:    "high",
-					File:        "db.go",
-					Title:       "SQL injection vulnerability in database query builder",
-					Description: "User input is concatenated directly into SQL query strings",
-					Category:    "security",
+					Severity:     "high",
+					File:         "db.go",
+					Title:        "SQL injection vulnerability in database query builder",
+					Description:  "User input is concatenated directly into SQL query strings",
+					Category:     "security",
 					SuggestedFix: "Use parameterized queries",
 				},
 			},
@@ -983,6 +983,25 @@ func TestFilterStopWords(t *testing.T) {
 		got := filterStopWords(nil)
 		if got != nil {
 			t.Errorf("expected nil, got %v", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// TestTokenize
+// ---------------------------------------------------------------------------
+
+func TestTokenize(t *testing.T) {
+	t.Run("strips punctuation and keeps alnum words", func(t *testing.T) {
+		got := tokenize("Potential vulnerability. Please fix SQL-injection, now!")
+		want := []string{"Potential", "vulnerability", "Please", "fix", "SQL", "injection", "now"}
+		if len(got) != len(want) {
+			t.Fatalf("len = %d, want %d, got=%v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("got[%d] = %q, want %q", i, got[i], want[i])
+			}
 		}
 	})
 }

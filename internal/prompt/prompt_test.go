@@ -70,6 +70,31 @@ func TestRender(t *testing.T) {
 		}
 	})
 
+	t.Run("renders structurize_delta with optional ledger summary", func(t *testing.T) {
+		result, err := Render("structurize_delta.tmpl", map[string]any{
+			"ReviewerID":    "r1",
+			"Round":         2,
+			"RoundContent":  "new round findings",
+			"LedgerSummary": "| ID | Severity | File:Line | Title |",
+			"Schema":        `{"type":"object"}`,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(result, "reviewer \"r1\"") {
+			t.Error("missing ReviewerID")
+		}
+		if !strings.Contains(result, "round 2") {
+			t.Error("missing round")
+		}
+		if !strings.Contains(result, "new round findings") {
+			t.Error("missing round content")
+		}
+		if !strings.Contains(result, "Previously tracked active issues") {
+			t.Error("missing ledger summary section")
+		}
+	})
+
 	t.Run("renders reviewer_first_round with all sections", func(t *testing.T) {
 		result, err := Render("reviewer_first_round.tmpl", map[string]any{
 			"TaskPrompt":       "Review this PR",

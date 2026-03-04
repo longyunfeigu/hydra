@@ -182,6 +182,101 @@ func TestClassifyCommentsByDiff(t *testing.T) {
 	}
 }
 
+// --- FindNearestLine 测试 ---
+
+func TestFindNearestLine_ExactMatch(t *testing.T) {
+	diffLines := map[int]bool{10: true, 20: true, 30: true}
+	line, found := FindNearestLine(diffLines, 20, 20)
+	if !found || line != 20 {
+		t.Errorf("expected (20, true), got (%d, %v)", line, found)
+	}
+}
+
+func TestFindNearestLine_NearbyMatch(t *testing.T) {
+	diffLines := map[int]bool{10: true, 20: true, 30: true}
+	line, found := FindNearestLine(diffLines, 25, 20)
+	if !found || line != 20 {
+		t.Errorf("expected nearest line 20, got (%d, %v)", line, found)
+	}
+}
+
+func TestFindNearestLine_BeyondThreshold(t *testing.T) {
+	diffLines := map[int]bool{10: true, 100: true}
+	_, found := FindNearestLine(diffLines, 50, 20)
+	if found {
+		t.Error("expected no match beyond threshold")
+	}
+}
+
+func TestFindNearestLine_EmptyDiffLines(t *testing.T) {
+	_, found := FindNearestLine(map[int]bool{}, 10, 20)
+	if found {
+		t.Error("expected no match for empty diff lines")
+	}
+}
+
+func TestFindNearestLine_PicksClosest(t *testing.T) {
+	diffLines := map[int]bool{5: true, 15: true, 25: true}
+	line, found := FindNearestLine(diffLines, 14, 20)
+	if !found || line != 15 {
+		t.Errorf("expected nearest line 15, got (%d, %v)", line, found)
+	}
+}
+
+// --- ClassifyCommentsByDiff near-line matching 测试 ---
+
+func TestClassifyCommentsByDiff_NearLineMatching(t *testing.T) {
+	line15 := 15
+
+	diffInfo := map[string]map[int]bool{
+		"main.go": {10: true, 11: true, 12: true},
+	}
+
+	comments := []ReviewCommentInput{
+		{Path: "main.go", Line: &line15, Body: "issue near diff"},
+	}
+
+	classified := ClassifyCommentsByDiff(comments, diffInfo)
+
+	if len(classified) != 1 {
+		t.Fatalf("expected 1 classified comment, got %d", len(classified))
+	}
+	if classified[0].Mode != "inline" {
+		t.Errorf("expected inline via near-line matching, got %s", classified[0].Mode)
+	}
+	if *classified[0].Input.Line != 12 {
+		t.Errorf("expected line to be remapped to 12, got %d", *classified[0].Input.Line)
+	}
+	if !strings.Contains(classified[0].Input.Body, "**Line 15:**") {
+		t.Errorf("expected body to contain original line reference, got %s", classified[0].Input.Body)
+	}
+}
+
+func TestClassifyCommentsByDiff_NearLineBeyondThreshold(t *testing.T) {
+	line50 := 50
+
+	diffInfo := map[string]map[int]bool{
+		"main.go": {10: true, 11: true},
+	}
+
+	comments := []ReviewCommentInput{
+		{Path: "main.go", Line: &line50, Body: "too far from diff"},
+	}
+
+	classified := ClassifyCommentsByDiff(comments, diffInfo)
+
+	if len(classified) != 1 {
+		t.Fatalf("expected 1, got %d", len(classified))
+	}
+	// Beyond ±20 threshold, should fall back to firstDiffLine
+	if classified[0].Mode != "inline" {
+		t.Errorf("expected inline (fallback to first diff line), got %s", classified[0].Mode)
+	}
+	if *classified[0].Input.Line != 10 {
+		t.Errorf("expected fallback to first diff line 10, got %d", *classified[0].Input.Line)
+	}
+}
+
 // --- resolvePathByDiff 测试 ---
 
 func TestResolvePathByDiff_ExactMatch(t *testing.T) {
@@ -453,4 +548,107 @@ func containsImpl(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// --- Issue Marker 幂等去重测试 ---
+
+func TestBuildIssueMarker_Deterministic(t *testing.T) {
+	line := 42
+	m1 := BuildIssueMarker("main.go", &line, "high", "SQL injection")
+	m2 := BuildIssueMarker("main.go", &line, "high", "SQL injection")
+	if m1 != m2 {
+		t.Fatalf("same input should produce same marker: %q vs %q", m1, m2)
+	}
+	if !strings.HasPrefix(m1, IssueMarkerPrefix) {
+		t.Fatalf("marker should start with prefix, got: %q", m1)
+	}
+	if !strings.HasSuffix(m1, "-->") {
+		t.Fatalf("marker should end with -->, got: %q", m1)
+	}
+}
+
+func TestBuildIssueMarker_DifferentInputs(t *testing.T) {
+	line := 42
+	m1 := BuildIssueMarker("main.go", &line, "high", "SQL injection")
+	m2 := BuildIssueMarker("main.go", &line, "high", "XSS vulnerability")
+	if m1 == m2 {
+		t.Fatal("different titles should produce different markers")
+	}
+}
+
+func TestBuildIssueMarker_NilLine(t *testing.T) {
+	m := BuildIssueMarker("main.go", nil, "medium", "issue")
+	if m == "" {
+		t.Fatal("marker should not be empty for nil line")
+	}
+}
+
+func TestFormatIssueBody_ContainsMarker(t *testing.T) {
+	line := 10
+	issue := IssueForComment{
+		File:     "main.go",
+		Line:     &line,
+		Title:    "Missing error check",
+		Severity: "high",
+	}
+	body := FormatIssueBody(issue)
+	if !strings.Contains(body, IssueMarkerPrefix) {
+		t.Fatal("formatted body should contain issue marker")
+	}
+	if !strings.Contains(body, "Missing error check") {
+		t.Fatal("formatted body should still contain title")
+	}
+}
+
+func TestIsDuplicateComment_MarkerMatch(t *testing.T) {
+	line10 := 10
+	line12 := 12 // 不同行号
+
+	issue := IssueForComment{
+		File:     "main.go",
+		Line:     &line10,
+		Title:    "SQL injection",
+		Severity: "high",
+	}
+	body := FormatIssueBody(issue)
+
+	comment := ReviewCommentInput{Path: "main.go", Line: &line12, Body: body}
+	existing := []ExistingComment{
+		// 旧评论在 line 10，但 marker 相同
+		{Path: "main.go", Line: &line10, Body: body},
+	}
+
+	// marker 匹配应该成功，即使行号不同
+	if !IsDuplicateComment(comment, existing) {
+		t.Fatal("expected duplicate via marker match despite different line numbers")
+	}
+}
+
+func TestIsDuplicateComment_MarkerMismatch(t *testing.T) {
+	line := 10
+	issue1 := IssueForComment{File: "main.go", Line: &line, Title: "SQL injection", Severity: "high"}
+	issue2 := IssueForComment{File: "main.go", Line: &line, Title: "XSS vulnerability", Severity: "high"}
+
+	body1 := FormatIssueBody(issue1)
+	body2 := FormatIssueBody(issue2)
+
+	comment := ReviewCommentInput{Path: "main.go", Line: &line, Body: body1}
+	existing := []ExistingComment{{Path: "main.go", Line: &line, Body: body2}}
+
+	// 不同 marker，不应被判为重复
+	if IsDuplicateComment(comment, existing) {
+		t.Fatal("different markers should not be duplicate")
+	}
+}
+
+func TestIsDuplicateComment_LegacyBodyPrefixStillWorks(t *testing.T) {
+	line := 10
+	body := "some old comment without marker"
+
+	comment := ReviewCommentInput{Path: "main.go", Line: &line, Body: body}
+	existing := []ExistingComment{{Path: "main.go", Line: &line, Body: body}}
+
+	if !IsDuplicateComment(comment, existing) {
+		t.Fatal("legacy body prefix matching should still detect duplicates")
+	}
 }

@@ -25,8 +25,9 @@ type ClaudeCodeProvider struct {
 	cwd             string           // CLI 的工作目录
 	timeout         time.Duration    // 无活动超时时间（默认 15 分钟）
 	session         CliSessionHelper // 会话状态管理
-	skipPermissions bool             // 是否跳过 CLI 的权限确认（非交互模式必须为 true）
-	modelName       string           // 底层模型名称，传给 --model 参数（如 "claude-sonnet-4-5-20250514"）
+	skipPermissions     bool             // 是否跳过 CLI 的权限确认（非交互模式必须为 true）
+	modelName           string           // 底层模型名称，传给 --model 参数（如 "claude-sonnet-4-5-20250514"）
+	promptSizeThreshold int              // 大 prompt 写临时文件的阈值（字节），0 表示使用默认值
 }
 
 func NewClaudeCodeProvider() *ClaudeCodeProvider {
@@ -62,7 +63,9 @@ func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, syste
 			// 会话续传：只发最后一条 user 消息
 			prompt = p.session.BuildPromptLastOnly(messages)
 		}
-		result, err := p.runClaude(ctx, prompt, systemPrompt, snap)
+		prepared := PreparePromptForCli(prompt, p.promptSizeThreshold)
+		defer prepared.Cleanup()
+		result, err := p.runClaude(ctx, prepared.Prompt, systemPrompt, snap)
 		if err != nil {
 			return "", err
 		}
@@ -81,14 +84,17 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 		prompt = p.session.BuildPromptLastOnly(messages)
 	}
 
+	prepared := PreparePromptForCli(prompt, p.promptSizeThreshold)
+
 	chunks := make(chan string, 64)
 	errs := make(chan error, 1)
 
 	go func() {
 		defer close(chunks)
 		defer close(errs)
+		defer prepared.Cleanup()
 
-		err := p.runClaudeStream(ctx, prompt, systemPrompt, snap, chunks)
+		err := p.runClaudeStream(ctx, prepared.Prompt, systemPrompt, snap, chunks)
 		if err != nil {
 			errs <- err
 			return
@@ -109,8 +115,7 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 //   --system-prompt <prompt>  : 系统提示（仅首次消息时传入）
 func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool, snap SessionSnapshot) []string {
 	args := []string{"-p", "-",
-		"--strict-mcp-config",       // 不加载用户配置的 MCP servers，节省内存
-		"--no-session-persistence",  // 不持久化会话到磁盘
+		"--strict-mcp-config", // 不加载用户配置的 MCP servers，节省内存
 	}
 
 	if p.skipPermissions {
@@ -286,11 +291,15 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 		}()
 	}
 
-	// 后台读取 stderr（仅用于更新活动时间戳）
+	// 后台读取 stderr（更新活动时间戳 + 捕获错误信息）
+	var stderrBuf bytes.Buffer
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			_, readErr := stderrPipe.Read(buf)
+			n, readErr := stderrPipe.Read(buf)
+			if n > 0 {
+				stderrBuf.Write(buf[:n])
+			}
 			if readErr != nil {
 				return
 			}
@@ -334,6 +343,10 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 	}
 
 	if err := cmd.Wait(); err != nil {
+		stderr := strings.TrimSpace(stderrBuf.String())
+		if stderr != "" {
+			return fmt.Errorf("claude CLI exited with error: %w: %s", err, stderr)
+		}
 		return fmt.Errorf("claude CLI exited with error: %w", err)
 	}
 	return nil

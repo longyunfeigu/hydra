@@ -2,10 +2,20 @@
 // 支持 GitHub 和 GitLab 等平台的统一操作，包括 MR/PR 管理、评论发布和仓库检测。
 package platform
 
-// MRProvider 获取 MR/PR 的元数据和 diff 信息。
-type MRProvider interface {
+// Named 暴露平台名称。
+type Named interface {
+	Name() string // "github" | "gitlab"
+}
+
+// MRMetadataProvider 获取 MR/PR 的元数据和 diff 信息。
+type MRMetadataProvider interface {
 	GetDiff(mrID, repo string) (string, error)
 	GetInfo(mrID, repo string) (*MRInfo, error)
+}
+
+// MRProvider 获取 MR/PR 的元数据、diff 和评论定位所需的提交信息。
+type MRProvider interface {
+	MRMetadataProvider
 	GetHeadCommitInfo(mrID, repo string) (*CommitInfo, error)
 	GetChangedFiles(mrID, repo string) ([]DiffFile, error)
 }
@@ -37,7 +47,7 @@ type IssueCommenter interface {
 
 // Platform 组合了所有子接口，代表一个完整的代码托管平台。
 type Platform interface {
-	Name() string // "github" | "gitlab"
+	Named
 	MRProvider
 	MRCommenter
 	IssueCommenter
@@ -83,8 +93,9 @@ type ReviewCommentInput struct {
 
 // ClassifiedComment 是经过分类后的评论，包含放置模式信息。
 type ClassifiedComment struct {
-	Input ReviewCommentInput
-	Mode  string // "inline"、"file"、"global"
+	Input   ReviewCommentInput
+	Mode    string // "inline"、"file"、"global"
+	OldLine *int   // context 行的旧文件行号（GitLab 需要同时设置 old_line 和 new_line）
 }
 
 // ReviewResult 汇总批量发布评审评论的结果统计。
@@ -101,6 +112,7 @@ type ReviewResult struct {
 type PostCommentOpts struct {
 	Path       string
 	Line       *int
+	OldLine    *int // context 行的旧文件行号（GitLab 需要）
 	Body       string
 	CommitInfo CommitInfo
 	Repo       string

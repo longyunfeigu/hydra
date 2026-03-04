@@ -312,3 +312,82 @@ func TestReasoningEffortInRequest(t *testing.T) {
 		}
 	})
 }
+
+func TestChatMaxTokensParamSelection(t *testing.T) {
+	tests := []struct {
+		name              string
+		model             string
+		wantMaxTokens     bool
+		wantMaxCompletion bool
+	}{
+		{
+			name:              "legacy model uses max_tokens",
+			model:             "gpt-4o",
+			wantMaxTokens:     true,
+			wantMaxCompletion: false,
+		},
+		{
+			name:              "gpt-5 model uses max_completion_tokens",
+			model:             "gpt-5.2",
+			wantMaxTokens:     false,
+			wantMaxCompletion: true,
+		},
+		{
+			name:              "o1-mini uses max_completion_tokens",
+			model:             "o1-mini",
+			wantMaxTokens:     false,
+			wantMaxCompletion: true,
+		},
+		{
+			name:              "o3 uses max_completion_tokens",
+			model:             "o3",
+			wantMaxTokens:     false,
+			wantMaxCompletion: true,
+		},
+		{
+			name:              "o3-mini uses max_completion_tokens",
+			model:             "o3-mini",
+			wantMaxTokens:     false,
+			wantMaxCompletion: true,
+		},
+		{
+			name:              "gpt-4.1 uses max_completion_tokens",
+			model:             "gpt-4.1-mini",
+			wantMaxTokens:     false,
+			wantMaxCompletion: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var rawBody map[string]interface{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
+					t.Fatalf("failed to decode request body: %v", err)
+				}
+				resp := openaiResponse{
+					Choices: []openaiChoice{
+						{Message: openaiMessage{Role: "assistant", Content: "ok"}},
+					},
+				}
+				json.NewEncoder(w).Encode(resp)
+			}))
+			defer server.Close()
+
+			p := NewOpenAIProvider("key", tt.model, server.URL)
+			_, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, "", &ChatOptions{MaxTokens: 2048})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			_, hasMaxTokens := rawBody["max_tokens"]
+			_, hasMaxCompletion := rawBody["max_completion_tokens"]
+			if hasMaxTokens != tt.wantMaxTokens {
+				t.Fatalf("max_tokens present = %v, want %v; body=%v", hasMaxTokens, tt.wantMaxTokens, rawBody)
+			}
+			if hasMaxCompletion != tt.wantMaxCompletion {
+				t.Fatalf("max_completion_tokens present = %v, want %v; body=%v", hasMaxCompletion, tt.wantMaxCompletion, rawBody)
+			}
+		})
+	}
+}

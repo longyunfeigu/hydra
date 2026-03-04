@@ -50,8 +50,9 @@ type openaiRequest struct {
 	Model           string          `json:"model"`
 	Messages        []openaiMessage `json:"messages"`
 	Stream          bool            `json:"stream"`
-	MaxTokens       int             `json:"max_tokens,omitempty"`       // 最大输出 token 数（0 表示使用模型默认值）
-	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // 推理深度，仅推理模型有效
+	MaxTokens       int             `json:"max_tokens,omitempty"`            // 最大输出 token 数（0 表示使用模型默认值）
+	MaxCompletion   int             `json:"max_completion_tokens,omitempty"` // gpt-5 系列使用的最大输出 token 参数
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`      // 推理深度，仅推理模型有效
 }
 
 // openaiMessage 是 OpenAI API 消息格式。
@@ -116,7 +117,11 @@ func (p *OpenAIProvider) doChat(ctx context.Context, messages []Message, systemP
 		ReasoningEffort: p.reasoningEffort,
 	}
 	if opts != nil && opts.MaxTokens > 0 {
-		reqBody.MaxTokens = opts.MaxTokens
+		if usesMaxCompletionTokens(p.model) {
+			reqBody.MaxCompletion = opts.MaxTokens
+		} else {
+			reqBody.MaxTokens = opts.MaxTokens
+		}
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -160,6 +165,21 @@ func (p *OpenAIProvider) doChat(ctx context.Context, messages []Message, systemP
 	}
 
 	return result.Choices[0].Message.Content, nil
+}
+
+// usesMaxCompletionTokens 判断模型是否应使用 max_completion_tokens 参数。
+// 以下模型系列使用 max_completion_tokens 而非 max_tokens：
+//   - o1* / o3* / o4*（推理模型，如 o1-mini, o3, o3-mini, o4-mini）
+//   - gpt-4.1 系列
+//   - gpt-5 系列
+func usesMaxCompletionTokens(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{"o1", "o3", "o4", "gpt-5", "gpt-4.1"} {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // ChatStream 发送消息并以流式方式返回响应片段（异步）。

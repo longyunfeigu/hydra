@@ -25,8 +25,9 @@ type CodexCliProvider struct {
 	timeout         time.Duration    // 无活动超时时间，超过此时间将终止 CLI 进程
 	session         CliSessionHelper // 会话辅助器，管理会话状态和提示词构建
 	sessionEnabled  bool             // 是否启用会话模式（支持多轮对话）
-	skipPermissions bool             // 是否跳过 CLI 的权限确认提示
-	modelName       string           // 底层模型名称，传给 --model 参数
+	skipPermissions     bool             // 是否跳过 CLI 的权限确认提示
+	modelName           string           // 底层模型名称，传给 --model 参数
+	promptSizeThreshold int              // 大 prompt 写临时文件的阈值（字节），0 表示使用默认值
 }
 
 // NewCodexCliProvider 创建一个新的 CodexCliProvider 实例。
@@ -85,7 +86,9 @@ func (p *CodexCliProvider) Chat(ctx context.Context, messages []Message, systemP
 			// 首次消息或无会话：发送完整的消息历史和系统提示词
 			prompt = p.session.BuildPrompt(messages, systemPrompt)
 		}
-		result, err := p.runCodex(ctx, prompt, snap)
+		prepared := PreparePromptForCli(prompt, p.promptSizeThreshold)
+		defer prepared.Cleanup()
+		result, err := p.runCodex(ctx, prepared.Prompt, snap)
 		if err != nil {
 			return "", err
 		}
@@ -108,14 +111,17 @@ func (p *CodexCliProvider) ChatStream(ctx context.Context, messages []Message, s
 		prompt = p.session.BuildPrompt(messages, systemPrompt)
 	}
 
+	prepared := PreparePromptForCli(prompt, p.promptSizeThreshold)
+
 	chunks := make(chan string, 64) // 响应片段缓冲 channel
 	errs := make(chan error, 1)     // 错误 channel
 
 	go func() {
 		defer close(chunks)
 		defer close(errs)
+		defer prepared.Cleanup()
 
-		err := p.runCodexStream(ctx, prompt, snap, chunks)
+		err := p.runCodexStream(ctx, prepared.Prompt, snap, chunks)
 		if err != nil {
 			errs <- err
 			return

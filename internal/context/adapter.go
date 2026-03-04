@@ -16,12 +16,8 @@ type ContextGathererAdapter struct {
 }
 
 // NewContextGathererAdapter 创建一个满足 orchestrator.ContextGathererInterface 接口的适配器。
-// plat 可为 nil（当平台检测失败或不在 PR 模式时）。
-func NewContextGathererAdapter(p provider.AIProvider, cfg *config.ContextGathererConfig, plat platform.Platform) *ContextGathererAdapter {
-	var historyProvider platform.HistoryProvider
-	if plat != nil {
-		historyProvider = plat
-	}
+// historyProvider 可为 nil（当平台检测失败或不在 PR 模式时）。
+func NewContextGathererAdapter(p provider.AIProvider, cfg *config.ContextGathererConfig, historyProvider platform.HistoryProvider) *ContextGathererAdapter {
 	return &ContextGathererAdapter{
 		inner: NewContextGatherer(p, cfg, historyProvider),
 	}

@@ -42,10 +42,16 @@ func TestHealthEndpoint(t *testing.T) {
 		t.Errorf("health check status = %d, want %d", w.Code, http.StatusOK)
 	}
 
-	var resp map[string]string
+	var resp map[string]any
 	json.NewDecoder(w.Body).Decode(&resp)
 	if resp["status"] != "ok" {
 		t.Errorf("health status = %q, want %q", resp["status"], "ok")
+	}
+	if resp["active_reviews"] != float64(0) {
+		t.Errorf("active_reviews = %v, want 0", resp["active_reviews"])
+	}
+	if resp["max_concurrent"] != float64(2) {
+		t.Errorf("max_concurrent = %v, want 2", resp["max_concurrent"])
 	}
 }
 
@@ -127,6 +133,39 @@ func TestWebhookSkippedEvent(t *testing.T) {
 	json.NewDecoder(w.Body).Decode(&resp)
 	if resp["status"] != "skipped" {
 		t.Errorf("response status = %q, want %q", resp["status"], "skipped")
+	}
+}
+
+func TestPanicRecovery(t *testing.T) {
+	// 关闭 sem channel，使 triggerReview 在 select send 时触发真实 panic（send on closed channel）。
+	// 验证 panic 被 recover 捕获，goroutine 正常退出且 inFlight 被清理。
+	srv := newTestServer()
+	close(srv.sem) // send on closed channel → panic
+
+	event := &MergeRequestEvent{
+		Project:          ProjectInfo{PathWithNamespace: "test/panic"},
+		ObjectAttributes: MRAttributes{IID: 99},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.triggerReview(event)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// goroutine 正常退出，panic 被捕获
+	case <-time.After(5 * time.Second):
+		t.Fatal("triggerReview did not return after panic — recovery failed")
+	}
+
+	// 验证 inFlight 已被清理
+	srv.mu.Lock()
+	_, exists := srv.inFlight["test/panic/99"]
+	srv.mu.Unlock()
+	if exists {
+		t.Error("expected inFlight entry to be cleaned up after panic")
 	}
 }
 

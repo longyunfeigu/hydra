@@ -40,12 +40,27 @@ type DebateOrchestrator struct {
 
 	options OrchestratorOptions // 辩论行为配置
 
+	// RunStreaming 不再复用这些字段；单次执行状态保存在 debateRun 中。
+	// 保留这些字段是为了兼容同包测试和直接调用内部 helper 的场景。
+	conversationHistory []DebateMessage
+	tokenUsage          map[string]*tokenCount
+	analysis            string
+	gatheredContext     *GatheredContext
+	taskPrompt          string
+	lastSeenIndex       map[string]int
+	issueLedgers        map[string]*IssueLedger
+}
+
+// debateRun 保存单次 review 执行期的可变状态。
+type debateRun struct {
+	*DebateOrchestrator
 	conversationHistory []DebateMessage        // 完整的辩论对话历史
 	tokenUsage          map[string]*tokenCount // 每个审查者的Token使用量
 	analysis            string                 // 预分析结果
 	gatheredContext     *GatheredContext       // 收集到的代码上下文
 	taskPrompt          string                 // 原始任务提示词（包含diff等）
 	lastSeenIndex       map[string]int         // 每个审查者最后看到的消息索引
+	issueLedgers        map[string]*IssueLedger
 
 	mu sync.Mutex // 保护tokenUsage的并发访问锁
 }
@@ -64,6 +79,46 @@ func New(cfg OrchestratorConfig) *DebateOrchestrator {
 	}
 }
 
+func (o *DebateOrchestrator) newRun(prompt string) *debateRun {
+	return &debateRun{
+		DebateOrchestrator: o,
+		tokenUsage:         make(map[string]*tokenCount),
+		lastSeenIndex:      make(map[string]int),
+		taskPrompt:         prompt,
+	}
+}
+
+func (o *DebateOrchestrator) legacyRun() *debateRun {
+	tokenUsage := o.tokenUsage
+	if tokenUsage == nil {
+		tokenUsage = make(map[string]*tokenCount)
+	}
+	lastSeen := o.lastSeenIndex
+	if lastSeen == nil {
+		lastSeen = make(map[string]int)
+	}
+	return &debateRun{
+		DebateOrchestrator:  o,
+		conversationHistory: o.conversationHistory,
+		tokenUsage:          tokenUsage,
+		analysis:            o.analysis,
+		gatheredContext:     o.gatheredContext,
+		taskPrompt:          o.taskPrompt,
+		lastSeenIndex:       lastSeen,
+		issueLedgers:        o.issueLedgers,
+	}
+}
+
+func (o *DebateOrchestrator) syncLegacyRun(run *debateRun) {
+	o.conversationHistory = run.conversationHistory
+	o.tokenUsage = run.tokenUsage
+	o.analysis = run.analysis
+	o.gatheredContext = run.gatheredContext
+	o.taskPrompt = run.taskPrompt
+	o.lastSeenIndex = run.lastSeenIndex
+	o.issueLedgers = run.issueLedgers
+}
+
 // RunStreaming 执行完整的辩论循环，支持并行审查者执行和流式输出。
 // 这是Hydra的核心算法，包含三个阶段：
 //
@@ -76,38 +131,75 @@ func New(cfg OrchestratorConfig) *DebateOrchestrator {
 //   - prompt: 包含代码diff的完整审查提示词
 //   - display: 终端UI回调接口，用于实时更新显示
 func (o *DebateOrchestrator) RunStreaming(ctx context.Context, label, prompt string, display DisplayCallbacks) (*DebateResult, error) {
-	o.reset(prompt)
-	o.startSessions(label)
-	defer o.endAllSessions()
+	run := o.newRun(prompt)
+	run.startSessions(label)
+	defer run.endAllSessions()
 
 	// 阶段1: 并行执行上下文收集和预分析
-	if err := o.runAnalysisPhase(ctx, label, prompt, display); err != nil {
+	if err := run.runAnalysisPhase(ctx, label, prompt, display); err != nil {
 		return nil, err
 	}
 
 	// 阶段2: 多轮辩论
-	convergedAtRound, err := o.runDebatePhase(ctx, display)
+	convergedAtRound, err := run.runDebatePhase(ctx, display)
 	if err != nil {
 		return nil, err
 	}
 
 	// 阶段3: 总结 + 结论 + 问题提取
-	return o.runSummaryPhase(ctx, label, display, convergedAtRound)
+	return run.runSummaryPhase(ctx, label, display, convergedAtRound)
 }
 
-// reset 重置所有状态，确保每次执行都是干净的。
-func (o *DebateOrchestrator) reset(prompt string) {
-	o.conversationHistory = nil
-	o.tokenUsage = make(map[string]*tokenCount)
-	o.lastSeenIndex = make(map[string]int)
-	o.analysis = ""
-	o.gatheredContext = nil
-	o.taskPrompt = prompt
+func (o *DebateOrchestrator) checkConvergence(ctx context.Context, display DisplayCallbacks) (bool, error) {
+	run := o.legacyRun()
+	converged, err := run.checkConvergence(ctx, display)
+	o.syncLegacyRun(run)
+	return converged, err
+}
+
+func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
+	run := o.legacyRun()
+	summaries, err := run.collectSummaries(ctx)
+	o.syncLegacyRun(run)
+	return summaries, err
+}
+
+func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display DisplayCallbacks) []MergedIssue {
+	run := o.legacyRun()
+	issues := run.structurizeIssues(ctx, display)
+	o.syncLegacyRun(run)
+	return issues
+}
+
+func (o *DebateOrchestrator) extractRoundIssueDeltas(ctx context.Context, round int, roundOutputs map[string]string, display DisplayCallbacks) {
+	run := o.legacyRun()
+	run.extractRoundIssueDeltas(ctx, round, roundOutputs, display)
+	o.syncLegacyRun(run)
+}
+
+func (o *DebateOrchestrator) structurizeIssuesFromLedgers(ctx context.Context, display DisplayCallbacks) []MergedIssue {
+	run := o.legacyRun()
+	issues := run.structurizeIssuesFromLedgers(ctx, display)
+	o.syncLegacyRun(run)
+	return issues
+}
+
+func (o *DebateOrchestrator) initIssueLedgers() {
+	run := o.legacyRun()
+	run.initIssueLedgers()
+	o.syncLegacyRun(run)
+}
+
+func (o *DebateOrchestrator) mergeAllLedgers() []MergedIssue {
+	run := o.legacyRun()
+	issues := run.mergeAllLedgers()
+	o.syncLegacyRun(run)
+	return issues
 }
 
 // startSessions 为支持会话的AI提供者启动会话。
 // 会话模式下，提供者可以维护对话上下文，避免重复发送完整历史。
-func (o *DebateOrchestrator) startSessions(label string) {
+func (o *debateRun) startSessions(label string) {
 	for _, r := range o.reviewers {
 		if sp, ok := r.Provider.(provider.SessionProvider); ok {
 			sp.StartSession(fmt.Sprintf("Hydra | %s | reviewer:%s", label, r.ID))
@@ -123,7 +215,7 @@ func (o *DebateOrchestrator) startSessions(label string) {
 
 // runAnalysisPhase 并行执行上下文收集和代码预分析。
 // 上下文收集和预分析互不依赖，可以并行执行以减少总耗时。
-func (o *DebateOrchestrator) runAnalysisPhase(ctx context.Context, label, prompt string, display DisplayCallbacks) error {
+func (o *debateRun) runAnalysisPhase(ctx context.Context, label, prompt string, display DisplayCallbacks) error {
 	g, gctx := errgroup.WithContext(ctx)
 
 	// 上下文收集：从代码仓库中提取与变更相关的调用链、模块关系等信息
@@ -174,18 +266,25 @@ func (o *DebateOrchestrator) runAnalysisPhase(ctx context.Context, label, prompt
 
 // runDebatePhase 执行多轮辩论，返回达成共识的轮次（nil表示未达成）。
 // 每轮辩论中，所有审查者并行执行，然后检查是否达成共识。
-func (o *DebateOrchestrator) runDebatePhase(ctx context.Context, display DisplayCallbacks) (*int, error) {
+func (o *debateRun) runDebatePhase(ctx context.Context, display DisplayCallbacks) (*int, error) {
 	var convergedAtRound *int
+	if o.useLedgerStructurize() {
+		o.initIssueLedgers()
+	}
 
 	for round := 1; round <= o.options.MaxRounds; round++ {
-		if err := o.runDebateRound(ctx, round, display); err != nil {
+		roundOutputs, err := o.runDebateRound(ctx, round, display)
+		if err != nil {
 			return nil, err
 		}
+		if o.useLedgerStructurize() {
+			o.extractRoundIssueDeltas(ctx, round, roundOutputs, display)
+		}
 
-		// 共识检测：从第2轮开始（且不是最后一轮）检查审查者是否已达成共识
-		// 如果达成共识则提前终止辩论，节省Token消耗
+		// 共识检测：从第1轮开始（且不是最后一轮）检查审查者是否已达成共识
+		// Round 1 独立审查后也可能达成一致，无需强制进入第2轮
 		converged := false
-		if o.options.CheckConvergence && round >= 2 && round < o.options.MaxRounds {
+		if o.options.CheckConvergence && round >= 1 && round < o.options.MaxRounds {
 			display.OnWaiting("convergence-check")
 			var err error
 			converged, err = o.checkConvergence(ctx, display)
@@ -210,7 +309,7 @@ func (o *DebateOrchestrator) runDebatePhase(ctx context.Context, display Display
 }
 
 // runDebateRound 执行单轮辩论：构建消息、并行执行所有审查者、收集结果到对话历史。
-func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, display DisplayCallbacks) error {
+func (o *debateRun) runDebateRound(ctx context.Context, round int, display DisplayCallbacks) (map[string]string, error) {
 	// 在执行前为所有审查者构建消息（快照，确保所有审查者看到相同的信息）
 	// 这样避免了先执行的审查者的输出影响后执行审查者的输入
 	type reviewerTask struct {
@@ -227,6 +326,7 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 
 	// 初始化每个审查者的状态追踪，用于UI实时显示
 	statuses := make([]ReviewerStatus, len(o.reviewers))
+	var statusesMu sync.Mutex
 	for i, r := range o.reviewers {
 		statuses[i] = ReviewerStatus{
 			ReviewerID: r.ID,
@@ -235,7 +335,7 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 	}
 
 	display.OnWaiting(fmt.Sprintf("round-%d", round))
-	display.OnParallelStatus(round, statuses)
+	display.OnParallelStatus(round, copyStatuses(statuses))
 
 	// 并行执行所有审查者，每个审查者在独立的goroutine中运行
 	type roundResult struct {
@@ -251,12 +351,15 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 		rg.Go(func() error {
 			// 标记审查者状态为"思考中"，记录开始时间
 			startTime := time.Now().UnixMilli()
+			statusesMu.Lock()
 			statuses[i] = ReviewerStatus{
 				ReviewerID: task.reviewer.ID,
 				Status:     "thinking",
 				StartTime:  startTime,
 			}
-			display.OnParallelStatus(round, copyStatuses(statuses))
+			statusSnapshot := copyStatuses(statuses)
+			statusesMu.Unlock()
+			display.OnParallelStatus(round, statusSnapshot)
 
 			// 流式接收审查者的响应，逐块读取
 			ch, errCh := task.reviewer.Provider.ChatStream(rgctx, task.messages, task.reviewer.SystemPrompt)
@@ -270,6 +373,7 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 
 			// 标记审查者状态为"已完成"，记录结束时间和耗时
 			endTime := time.Now().UnixMilli()
+			statusesMu.Lock()
 			statuses[i] = ReviewerStatus{
 				ReviewerID: task.reviewer.ID,
 				Status:     "done",
@@ -277,7 +381,9 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 				EndTime:    endTime,
 				Duration:   float64(endTime-startTime) / 1000.0,
 			}
-			display.OnParallelStatus(round, copyStatuses(statuses))
+			statusSnapshot = copyStatuses(statuses)
+			statusesMu.Unlock()
+			display.OnParallelStatus(round, statusSnapshot)
 
 			var inputParts []string
 			for _, m := range task.messages {
@@ -295,7 +401,7 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 	}
 
 	if err := rg.Wait(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 所有审查者完成后，将结果添加到对话历史并通知UI
@@ -311,11 +417,15 @@ func (o *DebateOrchestrator) runDebateRound(ctx context.Context, round int, disp
 		display.OnMessage(r.reviewer.ID, r.fullResponse)
 	}
 
-	return nil
+	roundOutputs := make(map[string]string, len(results))
+	for _, r := range results {
+		roundOutputs[r.reviewer.ID] = r.fullResponse
+	}
+	return roundOutputs, nil
 }
 
 // runSummaryPhase 收集审查者总结，生成最终结论和结构化问题列表。
-func (o *DebateOrchestrator) runSummaryPhase(ctx context.Context, label string, display DisplayCallbacks, convergedAtRound *int) (*DebateResult, error) {
+func (o *debateRun) runSummaryPhase(ctx context.Context, label string, display DisplayCallbacks, convergedAtRound *int) (*DebateResult, error) {
 	// 辩论结束后，收集每个审查者的最终总结，然后由总结器生成统一结论
 	display.OnWaiting("summarizer")
 	summaries, err := o.collectSummaries(ctx)
@@ -329,25 +439,36 @@ func (o *DebateOrchestrator) runSummaryPhase(ctx context.Context, label string, 
 		sp.EndSession()
 	}
 
-	// getFinalConclusion（依赖 summaries）和 structurizeIssues（只读 conversationHistory）并行执行
-	var finalConclusion string
-	var parsedIssues []MergedIssue
+	var (
+		finalConclusion string
+		parsedIssues    []MergedIssue
+	)
 
-	g3, g3ctx := errgroup.WithContext(ctx)
-	g3.Go(func() error {
+	if o.useLedgerStructurize() {
 		var err error
-		finalConclusion, err = o.getFinalConclusion(g3ctx, summaries)
+		finalConclusion, err = o.getFinalConclusion(ctx, summaries)
 		if err != nil {
-			return fmt.Errorf("final conclusion: %w", err)
+			return nil, fmt.Errorf("final conclusion: %w", err)
 		}
-		return nil
-	})
-	g3.Go(func() error {
-		parsedIssues = o.structurizeIssues(g3ctx, display)
-		return nil
-	})
-	if err := g3.Wait(); err != nil {
-		return nil, err
+		parsedIssues = o.structurizeIssuesFromLedgers(ctx, display)
+	} else {
+		// getFinalConclusion（依赖 summaries）和 structurizeIssues（只读 conversationHistory）并行执行
+		g3, g3ctx := errgroup.WithContext(ctx)
+		g3.Go(func() error {
+			var err error
+			finalConclusion, err = o.getFinalConclusion(g3ctx, summaries)
+			if err != nil {
+				return fmt.Errorf("final conclusion: %w", err)
+			}
+			return nil
+		})
+		g3.Go(func() error {
+			parsedIssues = o.structurizeIssuesLegacy(g3ctx, display)
+			return nil
+		})
+		if err := g3.Wait(); err != nil {
+			return nil, err
+		}
 	}
 
 	return &DebateResult{
@@ -363,6 +484,136 @@ func (o *DebateOrchestrator) runSummaryPhase(ctx context.Context, label string, 
 	}, nil
 }
 
+func (o *DebateOrchestrator) useLedgerStructurize() bool {
+	return strings.EqualFold(strings.TrimSpace(o.options.StructurizeMode), "ledger")
+}
+
+func (o *debateRun) initIssueLedgers() {
+	o.issueLedgers = make(map[string]*IssueLedger, len(o.reviewers))
+	for _, reviewer := range o.reviewers {
+		o.issueLedgers[reviewer.ID] = NewIssueLedger(reviewer.ID)
+	}
+}
+
+func (o *debateRun) extractRoundIssueDeltas(ctx context.Context, round int, roundOutputs map[string]string, display DisplayCallbacks) {
+	if len(o.issueLedgers) == 0 || len(roundOutputs) == 0 {
+		return
+	}
+
+	display.OnWaiting("structurizer")
+
+	g, gctx := errgroup.WithContext(ctx)
+	for _, reviewer := range o.reviewers {
+		reviewerID := reviewer.ID
+		roundContent := strings.TrimSpace(roundOutputs[reviewerID])
+		ledger := o.issueLedgers[reviewerID]
+		if roundContent == "" || ledger == nil {
+			continue
+		}
+
+		g.Go(func() error {
+			delta, err := o.extractIssueDelta(gctx, reviewerID, round, roundContent, ledger.BuildSummary())
+			if err != nil {
+				util.Warnf("extractRoundIssueDeltas: reviewer %s round %d skipped: %v", reviewerID, round, err)
+				return nil
+			}
+			ledger.ApplyDelta(delta, round)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		util.Warnf("extractRoundIssueDeltas: unexpected error: %v", err)
+	}
+}
+
+func (o *debateRun) extractIssueDelta(ctx context.Context, reviewerID string, round int, roundContent, ledgerSummary string) (*StructurizeDelta, error) {
+	deltaSchema := schema.GetSchemaString("issues_delta")
+	basePrompt := prompt.MustRender("structurize_delta.tmpl", map[string]any{
+		"ReviewerID":    reviewerID,
+		"Round":         round,
+		"RoundContent":  roundContent,
+		"LedgerSummary": ledgerSummary,
+		"Schema":        deltaSchema,
+		"Language":      o.options.Language,
+	})
+	systemPrompt := prompt.MustRender("structurize_delta_system.tmpl", nil)
+
+	chatOpts := &provider.ChatOptions{DisableTools: true, MaxTokens: 8192}
+	const maxAttempts = 3
+	var lastValidationErrors string
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptPrompt := basePrompt
+		if attempt > 1 {
+			attemptPrompt = fmt.Sprintf("Previous output had validation errors:\n%s\n\n%s", lastValidationErrors, basePrompt)
+		}
+
+		msgs := []provider.Message{{Role: "user", Content: attemptPrompt}}
+		response, err := o.summarizer.Provider.Chat(ctx, msgs, systemPrompt, chatOpts)
+		if err != nil {
+			lastValidationErrors = fmt.Sprintf("Chat error: %v", err)
+			continue
+		}
+		o.trackTokens("summarizer", attemptPrompt+systemPrompt, response)
+
+		parsed := ParseStructurizeDelta(response)
+		switch {
+		case parsed.ParseError != nil:
+			lastValidationErrors = fmt.Sprintf("JSON parse error: %v", parsed.ParseError)
+		case len(parsed.SchemaErrors) > 0:
+			vr := &schema.ValidationResult{Errors: parsed.SchemaErrors}
+			lastValidationErrors = schema.FormatErrorsForRetry(vr)
+		case parsed.Output == nil:
+			lastValidationErrors = "JSON was valid but output is empty."
+		default:
+			return parsed.Output, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %s", maxAttempts, lastValidationErrors)
+}
+
+func (o *debateRun) structurizeIssuesFromLedgers(ctx context.Context, display DisplayCallbacks) []MergedIssue {
+	allIssues := o.mergeAllLedgers()
+	if len(allIssues) > 0 {
+		return DeduplicateMergedIssues(allIssues)
+	}
+
+	// 兜底：当增量提取全失败时，回退到 legacy 一次性提取。
+	if o.hasReviewerMessages() {
+		util.Warnf("structurizeIssuesFromLedgers: no issues from ledgers, falling back to legacy structurizer")
+		return o.structurizeIssuesLegacy(ctx, display)
+	}
+	return nil
+}
+
+func (o *debateRun) mergeAllLedgers() []MergedIssue {
+	if len(o.issueLedgers) == 0 {
+		return nil
+	}
+	reviewerIDs := make([]string, 0, len(o.issueLedgers))
+	for reviewerID := range o.issueLedgers {
+		reviewerIDs = append(reviewerIDs, reviewerID)
+	}
+	sort.Strings(reviewerIDs)
+
+	var merged []MergedIssue
+	for _, reviewerID := range reviewerIDs {
+		merged = append(merged, o.issueLedgers[reviewerID].ToMergedIssues()...)
+	}
+	return merged
+}
+
+func (o *debateRun) hasReviewerMessages() bool {
+	for _, msg := range o.conversationHistory {
+		if msg.ReviewerID != "user" {
+			return true
+		}
+	}
+	return false
+}
+
 // ========== 消息构建 ==========
 
 // buildMessages 根据当前轮次为指定审查者构建消息列表。
@@ -370,7 +621,7 @@ func (o *DebateOrchestrator) runSummaryPhase(ctx context.Context, label string, 
 // 第2轮及之后：
 //   - 会话模式：仅发送上一轮其他审查者的新消息（增量更新）
 //   - 非会话模式：发送完整上下文，包含所有历史消息
-func (o *DebateOrchestrator) buildMessages(currentReviewerID string) []provider.Message {
+func (o *debateRun) buildMessages(currentReviewerID string) []provider.Message {
 	reviewer := o.findReviewer(currentReviewerID)
 	hasSession := false
 	if reviewer != nil {
@@ -405,7 +656,7 @@ func (o *DebateOrchestrator) buildMessages(currentReviewerID string) []provider.
 
 // buildFirstRoundMessages 构建第一轮独立审查的消息。
 // 每个审查者独立审查代码，不受其他审查者影响。
-func (o *DebateOrchestrator) buildFirstRoundMessages(currentReviewerID string) []provider.Message {
+func (o *debateRun) buildFirstRoundMessages(currentReviewerID string) []provider.Message {
 	var contextSection string
 	if o.gatheredContext != nil && o.gatheredContext.Summary != "" {
 		contextSection = fmt.Sprintf("\n## System Context\n%s\n\n", o.gatheredContext.Summary)
@@ -423,13 +674,14 @@ func (o *DebateOrchestrator) buildFirstRoundMessages(currentReviewerID string) [
 		callChainSection = "\n" + FormatCallChainForReviewer(o.gatheredContext.RawReferences) + "\n"
 	}
 
+	// 只传 focus bullets，不传 analyzer 全文，避免锚定 reviewer 思维
 	p := prompt.MustRender("reviewer_first_round.tmpl", map[string]any{
 		"TaskPrompt":       o.taskPrompt,
 		"ContextSection":   contextSection,
 		"FocusSection":     focusSection,
 		"CallChainSection": callChainSection,
-		"Analysis":         o.analysis,
 		"ReviewerID":       currentReviewerID,
+		"Language":         o.options.Language,
 	})
 
 	return []provider.Message{{Role: "user", Content: p}}
@@ -437,7 +689,7 @@ func (o *DebateOrchestrator) buildFirstRoundMessages(currentReviewerID string) [
 
 // collectPreviousRoundsMessages 收集之前轮次的消息，用于辩论上下文。
 // 返回当前审查者的消息计数和其他审查者的消息列表。
-func (o *DebateOrchestrator) collectPreviousRoundsMessages(currentReviewerID string) (int, []DebateMessage) {
+func (o *debateRun) collectPreviousRoundsMessages(currentReviewerID string) (int, []DebateMessage) {
 	myMessageCount := 0
 	for _, m := range o.conversationHistory {
 		if m.ReviewerID == currentReviewerID {
@@ -468,7 +720,7 @@ func (o *DebateOrchestrator) collectPreviousRoundsMessages(currentReviewerID str
 
 // buildSessionDebateMessages 为会话模式构建增量消息。
 // 仅发送最新一轮的新消息（增量更新，因为会话已有之前的上下文）。
-func (o *DebateOrchestrator) buildSessionDebateMessages(currentReviewerID string, myMessageCount int, previousRoundsMessages []DebateMessage) []provider.Message {
+func (o *debateRun) buildSessionDebateMessages(currentReviewerID string, myMessageCount int, previousRoundsMessages []DebateMessage) []provider.Message {
 	prevRoundCount := myMessageCount - 1
 	messageCountByReviewer2 := make(map[string]int)
 	var newMessages []DebateMessage
@@ -497,6 +749,7 @@ func (o *DebateOrchestrator) buildSessionDebateMessages(currentReviewerID string
 	p := prompt.MustRender("reviewer_debate_session.tmpl", map[string]any{
 		"ReviewerID": currentReviewerID,
 		"NewContent": newContent,
+		"Language":   o.options.Language,
 	})
 
 	return []provider.Message{{Role: "user", Content: p}}
@@ -504,7 +757,7 @@ func (o *DebateOrchestrator) buildSessionDebateMessages(currentReviewerID string
 
 // buildFullContextDebateMessages 为非会话模式构建包含完整上下文的消息。
 // 发送完整上下文，包含所有历史轮次的消息。
-func (o *DebateOrchestrator) buildFullContextDebateMessages(currentReviewerID string, otherIDs []string, previousRoundsMessages []DebateMessage) []provider.Message {
+func (o *debateRun) buildFullContextDebateMessages(currentReviewerID string, otherIDs []string, previousRoundsMessages []DebateMessage) []provider.Message {
 	otherLabel := fmt.Sprintf("[%s]", strings.Join(otherIDs, "], ["))
 	isPlural := len(otherIDs) > 1
 	otherWord := "is"
@@ -519,6 +772,7 @@ func (o *DebateOrchestrator) buildFullContextDebateMessages(currentReviewerID st
 		"OtherLabel": otherLabel,
 		"PluralS":    pluralS(isPlural),
 		"OtherWord":  otherWord,
+		"Language":   o.options.Language,
 	})
 
 	messages := []provider.Message{{Role: "user", Content: p}}
@@ -553,16 +807,13 @@ func (o *DebateOrchestrator) buildFullContextDebateMessages(currentReviewerID st
 // checkConvergence 请求总结器判断审查者是否已达成共识。
 // 共识条件非常严格：所有审查者必须就最终结论达成一致，
 // 关键问题必须被所有人确认，不能有被忽略的意见分歧。
-// 仅在完成至少2轮辩论后才进行检测。
-func (o *DebateOrchestrator) checkConvergence(ctx context.Context, display DisplayCallbacks) (bool, error) {
+// 支持从 Round 1 开始检测（独立审查达成一致也是有效共识）。
+func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbacks) (bool, error) {
 	if len(o.conversationHistory) < len(o.reviewers) {
 		return false, nil
 	}
 
 	roundsCompleted := len(o.conversationHistory) / len(o.reviewers)
-	if roundsCompleted < 2 {
-		return false, nil
-	}
 
 	// 使用所有已完成轮次的消息，避免仅看最后一轮导致误判提前收敛
 	roundByReviewer := make(map[string]int)
@@ -579,6 +830,7 @@ func (o *DebateOrchestrator) checkConvergence(ctx context.Context, display Displ
 	convergencePrompt := prompt.MustRender("convergence_check.tmpl", map[string]any{
 		"ReviewerCount":   len(o.reviewers),
 		"RoundsCompleted": roundsCompleted,
+		"IsFirstRound":    roundsCompleted == 1,
 		"MessagesText":    messagesText,
 	})
 
@@ -644,7 +896,7 @@ func (o *DebateOrchestrator) checkConvergence(ctx context.Context, display Displ
 
 // collectSummaries 并行请求每个审查者提供最终总结。
 // 在辩论结束后，每个审查者总结自己的核心观点和结论，不透露身份。
-func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
+func (o *debateRun) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
 	// 预分配结果切片，每个 goroutine 写入自己的索引位置，无需加锁
 	summaries := make([]DebateSummary, len(o.reviewers))
 
@@ -653,7 +905,9 @@ func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSumm
 		i, reviewer := i, reviewer
 		g.Go(func() error {
 			messages := o.buildMessages(reviewer.ID)
-			summaryPrompt := prompt.MustRender("reviewer_summary.tmpl", nil)
+			summaryPrompt := prompt.MustRender("reviewer_summary.tmpl", map[string]any{
+				"Language": o.options.Language,
+			})
 
 			// 会话模式下续传只会发送最后一条 user 消息，将最新上下文与总结要求合并到同一条消息中
 			if _, ok := reviewer.Provider.(provider.SessionProvider); ok {
@@ -701,7 +955,7 @@ func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSumm
 
 // getFinalConclusion 请求总结器根据所有审查者的匿名总结生成最终结论。
 // 最终结论包含：共识点、分歧点分析、以及推荐的行动项。
-func (o *DebateOrchestrator) getFinalConclusion(ctx context.Context, summaries []DebateSummary) (string, error) {
+func (o *debateRun) getFinalConclusion(ctx context.Context, summaries []DebateSummary) (string, error) {
 	var parts []string
 	for i, s := range summaries {
 		parts = append(parts, fmt.Sprintf("Reviewer %d:\n%s", i+1, s.Summary))
@@ -713,6 +967,7 @@ func (o *DebateOrchestrator) getFinalConclusion(ctx context.Context, summaries [
 		"ReviewerCount": len(summaries),
 		"SummaryText":   summaryText,
 		"DebateText":    debateText,
+		"Language":      o.options.Language,
 	})
 
 	msgs := []provider.Message{{Role: "user", Content: conclusionPrompt}}
@@ -730,7 +985,7 @@ func (o *DebateOrchestrator) getFinalConclusion(ctx context.Context, summaries [
 // structurizeIssues 使用AI从审查文本中提取结构化的问题列表。
 // 如果JSON解析失败，最多重试3次。每次重试会使用更明确的提示词引导模型输出正确格式。
 // 提取的问题包含：严重程度、分类、文件位置、描述和建议修复等信息。
-func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display DisplayCallbacks) []MergedIssue {
+func (o *debateRun) structurizeIssuesLegacy(ctx context.Context, display DisplayCallbacks) []MergedIssue {
 	// 收集每个审查者的所有消息（按轮次），避免只取最后一条导致早期发现的问题丢失
 	allMessages := make(map[string][]string) // reviewerID -> []content (按轮次顺序)
 	for _, msg := range o.conversationHistory {
@@ -773,10 +1028,13 @@ func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display Disp
 		"ReviewText":  reviewText,
 		"ReviewerIDs": reviewerIDsStr,
 		"Schema":      issuesSchema,
+		"Language":    o.options.Language,
 	})
 
 	systemPrompt := prompt.MustRender("structurize_system.tmpl", nil)
-	chatOpts := &provider.ChatOptions{DisableTools: true}
+	// 显式设置 MaxTokens：structurizer 需要输出大量结构化 JSON（每个 issue 包含完整描述+代码），
+	// 不设置时 OpenAI 默认 max_tokens 仅约 4096，会导致 JSON 输出截断 → "unexpected end of JSON input"
+	chatOpts := &provider.ChatOptions{DisableTools: true, MaxTokens: 32768}
 	const maxAttempts = 3
 
 	var lastValidationErrors string
@@ -796,6 +1054,15 @@ func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display Disp
 				"Schema":           issuesSchema,
 			})
 		}
+
+		// 打印 structurizer 的完整请求（system + user），便于复现与单元测试。
+		// 通过 -v/--show-tool-trace 可在终端看到完整内容。
+		structurizerTrace := fmt.Sprintf(
+			"## Structurizer Request (Attempt %d/%d)\n\n### System Prompt\n```text\n%s\n```\n\n### User Prompt\n```text\n%s\n```",
+			attempt, maxAttempts, systemPrompt, attemptPrompt,
+		)
+		display.OnMessage("structurizer-request", structurizerTrace)
+		util.Debugf("structurizeIssues: attempt %d/%d full request:\n%s", attempt, maxAttempts, structurizerTrace)
 
 		msgs := []provider.Message{{Role: "user", Content: attemptPrompt}}
 		response, err := o.summarizer.Provider.Chat(ctx, msgs, systemPrompt, chatOpts)
@@ -848,11 +1115,19 @@ func (o *DebateOrchestrator) structurizeIssues(ctx context.Context, display Disp
 	return nil
 }
 
+// structurizeIssues 兼容旧测试和旧调用，内部委托给 legacy 路径。
+func (o *debateRun) structurizeIssues(ctx context.Context, display DisplayCallbacks) []MergedIssue {
+	return o.structurizeIssuesLegacy(ctx, display)
+}
+
 // issuesToMerged 将 ReviewIssue 列表转换为 MergedIssue 列表。
+// 注意：ClaimedBy 是模型在 JSON 输出中自称的归属（可能不准确），
+// 这里直接用作 MergedIssue.RaisedBy，因为 structurizer 已被要求按 reviewer ID 归属。
+// 后续 DeduplicateIssues 会基于真实的 reviewer 输出进行交叉验证和合并。
 func issuesToMerged(issues []ReviewIssue) []MergedIssue {
 	result := make([]MergedIssue, 0, len(issues))
 	for _, issue := range issues {
-		raisedBy := issue.RaisedBy
+		raisedBy := issue.ClaimedBy
 		if len(raisedBy) == 0 {
 			raisedBy = []string{"summarizer"}
 		}
@@ -879,13 +1154,13 @@ func (o *DebateOrchestrator) findReviewer(id string) *Reviewer {
 
 // markAsSeen 将当前对话历史的最后一条消息标记为该审查者已读。
 // 用于在会话模式下确定需要发送哪些增量消息。
-func (o *DebateOrchestrator) markAsSeen(reviewerID string) {
+func (o *debateRun) markAsSeen(reviewerID string) {
 	o.lastSeenIndex[reviewerID] = len(o.conversationHistory) - 1
 }
 
 // trackTokens 追踪指定审查者的Token使用量（线程安全）。
 // 使用estimateTokens进行粗略估算。
-func (o *DebateOrchestrator) trackTokens(reviewerID, input, output string) {
+func (o *debateRun) trackTokens(reviewerID, input, output string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	tc, ok := o.tokenUsage[reviewerID]
@@ -899,7 +1174,7 @@ func (o *DebateOrchestrator) trackTokens(reviewerID, input, output string) {
 
 // getTokenUsage 返回所有审查者的Token使用量汇总（线程安全）。
 // 预估费用按照每Token 0.00001美元计算。
-func (o *DebateOrchestrator) getTokenUsage() []TokenUsage {
+func (o *debateRun) getTokenUsage() []TokenUsage {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	var usage []TokenUsage
@@ -916,7 +1191,7 @@ func (o *DebateOrchestrator) getTokenUsage() []TokenUsage {
 
 // endAllSessions 结束所有AI提供者的会话。
 // 在辩论完成或出错时调用，释放会话资源。
-func (o *DebateOrchestrator) endAllSessions() {
+func (o *debateRun) endAllSessions() {
 	for _, r := range o.reviewers {
 		if sp, ok := r.Provider.(provider.SessionProvider); ok {
 			sp.EndSession()
@@ -930,7 +1205,7 @@ func (o *DebateOrchestrator) endAllSessions() {
 	}
 }
 
-func (o *DebateOrchestrator) buildDebateTranscript(maxLen int) string {
+func (o *debateRun) buildDebateTranscript(maxLen int) string {
 	if len(o.conversationHistory) == 0 {
 		return ""
 	}

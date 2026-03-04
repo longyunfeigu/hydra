@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"regexp"
 	"strings"
@@ -13,12 +12,12 @@ import (
 	"github.com/fatih/color"
 	"github.com/guwanhua/hydra/internal/checkout"
 	"github.com/guwanhua/hydra/internal/config"
-	appctx "github.com/guwanhua/hydra/internal/context"
 	"github.com/guwanhua/hydra/internal/display"
 	"github.com/guwanhua/hydra/internal/orchestrator"
 	"github.com/guwanhua/hydra/internal/platform"
 	"github.com/guwanhua/hydra/internal/platform/detect"
-	"github.com/guwanhua/hydra/internal/provider"
+	"github.com/guwanhua/hydra/internal/review"
+	"github.com/guwanhua/hydra/internal/reviewpost"
 	"github.com/guwanhua/hydra/internal/util"
 	"github.com/spf13/cobra"
 )
@@ -55,16 +54,7 @@ func init() {
 	f.Bool("no-post-summary", false, "Skip posting review summary note")
 }
 
-const hydraSummaryMarker = "<!-- hydra:summary -->"
-
-// reviewTarget 封装了审查目标的所有必要信息。
-type reviewTarget struct {
-	Type     string // "pr"、"local"、"branch"、"files"
-	Label    string // 显示标签，如 "PR #123"、"MR !456"
-	Prompt   string // AI 审查提示词
-	Repo     string // 仓库标识（owner/repo 或 group/project）
-	MRNumber string // PR/MR 编号（仅 PR/MR 模式）
-}
+const hydraSummaryMarker = reviewpost.HydraSummaryMarker
 
 func runReview(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -84,16 +74,17 @@ func runReview(cmd *cobra.Command, args []string) error {
 	}
 	d.SpinnerSucceed("Configuration loaded")
 
-	// 检测平台
 	var platformType, platformHost string
 	if cfg.Platform != nil {
 		platformType = cfg.Platform.Type
 		platformHost = cfg.Platform.Host
 	}
 	plat, platErr := detect.FromRemote(platformType, platformHost)
+	if platErr != nil {
+		util.Warnf("Platform detection failed: %v", platErr)
+	}
 
-	// 解析审查目标
-	target, err := resolveTarget(cmd, args, d, plat)
+	target, err := resolveTarget(cmd, args, plat, plat, cfg.Defaults.DiffExclude)
 	if err != nil {
 		return err
 	}
@@ -102,144 +93,54 @@ func runReview(cmd *cobra.Command, args []string) error {
 	for id := range cfg.Reviewers {
 		allIDs = append(allIDs, id)
 	}
-
 	selectedIDs, err := selectReviewerIDs(cmd, allIDs)
 	if err != nil {
 		return err
 	}
 
-	reviewers := make([]orchestrator.Reviewer, 0, len(selectedIDs))
-	for _, id := range selectedIDs {
-		rc := cfg.Reviewers[id]
-		p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, cfg)
-		if err != nil {
-			return fmt.Errorf("failed to create provider for reviewer %s: %w", id, err)
-		}
-		reviewers = append(reviewers, orchestrator.Reviewer{
-			ID:           id,
-			Provider:     p,
-			SystemPrompt: rc.Prompt,
-		})
-	}
-
-	analyzerProvider, err := provider.CreateProvider(cfg.Analyzer.Model, cfg.Analyzer.ModelName, cfg.Analyzer.ReasoningEffort, cfg)
-	if err != nil {
-		return fmt.Errorf("failed to create analyzer provider: %w", err)
-	}
-	analyzer := orchestrator.Reviewer{
-		ID:           "analyzer",
-		Provider:     analyzerProvider,
-		SystemPrompt: cfg.Analyzer.Prompt,
-	}
-
-	summarizerProvider, err := provider.CreateProvider(cfg.Summarizer.Model, cfg.Summarizer.ModelName, cfg.Summarizer.ReasoningEffort, cfg)
-	if err != nil {
-		return fmt.Errorf("failed to create summarizer provider: %w", err)
-	}
-	summarizer := orchestrator.Reviewer{
-		ID:           "summarizer",
-		Provider:     summarizerProvider,
-		SystemPrompt: cfg.Summarizer.Prompt,
-	}
-
 	skipContext, _ := cmd.Flags().GetBool("skip-context")
-	var contextGatherer orchestrator.ContextGathererInterface
-	if !skipContext && cfg.ContextGatherer != nil && cfg.ContextGatherer.Enabled {
-		contextModel := cfg.ContextGatherer.Model
-		if contextModel == "" {
-			contextModel = cfg.Analyzer.Model
-		}
-		contextProvider, err := provider.CreateProvider(contextModel, "", "", cfg)
-		if err != nil {
-			util.Warnf("Failed to create context gatherer provider: %v", err)
-		} else {
-			contextGatherer = appctx.NewContextGathererAdapter(contextProvider, cfg.ContextGatherer, plat)
-		}
-	}
-
-	var checkoutResult checkout.Result
-	mgr := checkout.NewManager(cfg.Checkout)
-	if target.Type == "pr" && mgr != nil && target.Repo != "" {
-		d.SpinnerStart("Checking out repository...")
-		platName := ""
-		if plat != nil {
-			platName = plat.Name()
-		}
-		host := ""
-		if cfg.Platform != nil {
-			host = cfg.Platform.Host
-		}
-		checkoutResult = mgr.Checkout(checkout.Params{
-			Platform: platName,
-			Repo:     target.Repo,
-			MRNumber: target.MRNumber,
-			Host:     host,
-		})
-		if checkoutResult.Available {
-			defer checkoutResult.Release()
-			d.SpinnerSucceed("Repository checked out")
-		} else {
-			d.SpinnerSucceed("Checkout skipped, using diff-only mode")
-		}
-	}
-
-	cwd := "."
-	if checkoutResult.Available {
-		cwd = checkoutResult.RepoDir
-	}
-	for i := range reviewers {
-		provider.SetCwdIfSupported(reviewers[i].Provider, cwd)
-	}
-	provider.SetCwdIfSupported(analyzerProvider, cwd)
-	provider.SetCwdIfSupported(summarizerProvider, cwd)
-	if contextGatherer != nil {
-		if cg, ok := contextGatherer.(interface{ SetCwd(string) }); ok {
-			cg.SetCwd(cwd)
-		}
-	}
-
-	if checkoutResult.Available {
-		target.Prompt += "\n\nNote: The full repository source code is available in your working directory.\nYou can browse files, read implementations, and examine the broader codebase context beyond the diff."
-	}
-
-	maxRounds := cfg.Defaults.MaxRounds
-	if r, _ := cmd.Flags().GetInt("rounds"); r > 0 {
-		maxRounds = r
-	}
-	isSolo := len(reviewers) == 1
-	if isSolo {
-		maxRounds = 1
-	}
-
 	noConverge, _ := cmd.Flags().GetBool("no-converge")
-	checkConvergence := !isSolo && !noConverge && cfg.Defaults.CheckConvergence
+	maxRounds, _ := cmd.Flags().GetInt("rounds")
 
-	d.ReviewHeader(target.Label, selectedIDs, maxRounds, checkConvergence, contextGatherer != nil)
-
-	oCfg := orchestrator.OrchestratorConfig{
-		Reviewers:       reviewers,
-		Analyzer:        analyzer,
-		Summarizer:      summarizer,
-		ContextGatherer: contextGatherer,
-		Options: orchestrator.OrchestratorOptions{
-			MaxRounds:        maxRounds,
-			CheckConvergence: checkConvergence,
-		},
+	platformName := ""
+	if plat != nil {
+		platformName = plat.Name()
+	}
+	checkoutHost := ""
+	if cfg.Platform != nil {
+		checkoutHost = cfg.Platform.Host
 	}
 
-	orch := orchestrator.New(oCfg)
-	result, err := orch.RunStreaming(ctx, target.Label, target.Prompt, d)
+	runner := review.NewRunner(cfg, checkout.NewManager(cfg.Checkout))
+	d.SpinnerStart("Preparing review...")
+	prepared, err := runner.Prepare(*target, review.RunOptions{
+		ReviewerIDs:        selectedIDs,
+		SkipContext:        skipContext,
+		MaxRoundsOverride:  maxRounds,
+		DisableConvergence: noConverge,
+		HistoryProvider:    plat,
+		CheckoutPlatform:   platformName,
+		CheckoutHost:       checkoutHost,
+	})
+	if err != nil {
+		d.SpinnerFail("Failed to prepare review")
+		return err
+	}
+	defer prepared.Close()
+	d.SpinnerSucceed("Review prepared")
+
+	d.ReviewHeader(prepared.Job().Label, prepared.ReviewerIDs(), prepared.MaxRounds(), prepared.CheckConvergence(), prepared.HasContext())
+
+	result, err := prepared.Run(ctx, d)
 	if err != nil {
 		return fmt.Errorf("review failed: %w", err)
 	}
 
 	d.FinalConclusion(result.FinalConclusion)
-
 	if len(result.ParsedIssues) > 0 {
 		d.IssuesTable(result.ParsedIssues)
 	}
 
-	// 将审查发现的问题作为评论发布到 PR/MR
 	noPost, _ := cmd.Flags().GetBool("no-post")
 	if !noPost && target.Type == "pr" && len(result.ParsedIssues) > 0 && plat != nil {
 		prNum := extractPRNumber(target.Label)
@@ -251,7 +152,6 @@ func runReview(cmd *cobra.Command, args []string) error {
 				postResult.Posted, postResult.Inline, postResult.FileLevel, postResult.Global, postResult.Failed, postResult.Skipped))
 		}
 	} else if !noPost && target.Type == "pr" {
-		// 诊断：打印跳过发布的原因
 		if plat == nil {
 			util.Warnf("Skipped posting comments: platform not detected (check platform config)")
 		}
@@ -260,7 +160,6 @@ func runReview(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 发布最终总结（PR/MR 模式），默认开启，可通过 --no-post-summary 关闭
 	noPostSummary, _ := cmd.Flags().GetBool("no-post-summary")
 	if shouldPostSummary(noPost, noPostSummary, target.Type, result.FinalConclusion, plat) {
 		prNum := extractPRNumber(target.Label)
@@ -299,185 +198,32 @@ func runReview(cmd *cobra.Command, args []string) error {
 		color.Green("\n  Output saved to: %s", outputFile)
 	}
 
-	_ = ctx
-	_ = platErr // 平台检测失败时仅影响 PR 模式和评论发布
 	return nil
 }
 
 // resolveTarget 根据命令行参数确定审查目标。
-func resolveTarget(cmd *cobra.Command, args []string, d *display.Display, plat platform.Platform) (*reviewTarget, error) {
+func resolveTarget(cmd *cobra.Command, args []string, resolver review.MRInputResolver, metadata platform.MRMetadataProvider, diffExclude []string) (*review.Job, error) {
 	isLocal, _ := cmd.Flags().GetBool("local")
 	branchBase, _ := cmd.Flags().GetString("branch")
 	files, _ := cmd.Flags().GetStringSlice("files")
 
 	if isLocal {
-		return resolveLocalTarget(d)
+		return review.BuildLocalJob(diffExclude)
 	}
 	if cmd.Flags().Changed("branch") {
 		if branchBase == "" {
 			branchBase = "main"
 		}
-		return resolveBranchTarget(branchBase)
+		return review.BuildBranchJob(branchBase, diffExclude)
 	}
 	if len(files) > 0 {
-		return &reviewTarget{
-			Type:   "files",
-			Label:  fmt.Sprintf("Files: %s", strings.Join(files, ", ")),
-			Prompt: fmt.Sprintf("Review the following files: %s.", strings.Join(files, ", ")),
-		}, nil
+		return review.BuildFilesJob(files), nil
 	}
 	if len(args) > 0 {
-		return resolveMRTarget(args[0], plat)
+		return review.BuildMRJobFromInput(args[0], resolver, metadata, diffExclude)
 	}
 
 	return nil, fmt.Errorf("please specify a PR/MR number or use --local, --branch, or --files")
-}
-
-func resolveLocalTarget(d *display.Display) (*reviewTarget, error) {
-	diff, err := exec.Command("git", "diff", "HEAD").Output()
-	if err != nil {
-		return nil, fmt.Errorf("not a git repository or git is not available")
-	}
-
-	diffStr := string(diff)
-	label := "Local Changes"
-	isLastCommit := false
-
-	if strings.TrimSpace(diffStr) == "" {
-		diff, err = exec.Command("git", "diff", "HEAD~1", "HEAD").Output()
-		if err != nil || strings.TrimSpace(string(diff)) == "" {
-			return nil, fmt.Errorf("no changes found. Make some changes or commits first")
-		}
-		diffStr = string(diff)
-		isLastCommit = true
-		commitMsg, _ := exec.Command("git", "log", "-1", "--pretty=%s").Output()
-		label = fmt.Sprintf("Last Commit: %s", strings.TrimSpace(string(commitMsg)))
-	}
-
-	var prompt string
-	if isLastCommit {
-		prompt = fmt.Sprintf("Please review the following code changes from the last commit:\n\n```diff\n%s\n```\n\nAnalyze these changes and provide your feedback.", diffStr)
-	} else {
-		prompt = fmt.Sprintf("Please review the following local code changes (uncommitted diff):\n\n```diff\n%s\n```\n\nAnalyze these changes and provide your feedback.", diffStr)
-	}
-
-	return &reviewTarget{Type: "local", Label: label, Prompt: prompt}, nil
-}
-
-func resolveBranchTarget(baseBranch string) (*reviewTarget, error) {
-	currentBranch, err := exec.Command("git", "branch", "--show-current").Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current branch: %w", err)
-	}
-	branch := strings.TrimSpace(string(currentBranch))
-
-	diff, err := exec.Command("git", "diff", baseBranch+"..."+branch).Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get branch diff: %w", err)
-	}
-
-	diffStr := string(diff)
-	if strings.TrimSpace(diffStr) == "" {
-		return nil, fmt.Errorf("no differences found between %s and %s", baseBranch, branch)
-	}
-
-	annotatedDiff := platform.AnnotateDiffWithLineNumbers(diffStr)
-	prompt := fmt.Sprintf("Please review the changes in branch \"%s\" compared to \"%s\":\n\n```diff\n%s\n```\n\nAnalyze these changes and provide your feedback.\nWhen reporting issues, always reference the line number shown at the beginning of each line.", branch, baseBranch, annotatedDiff)
-
-	return &reviewTarget{
-		Type:   "branch",
-		Label:  fmt.Sprintf("Branch: %s", branch),
-		Prompt: prompt,
-	}, nil
-}
-
-// resolveMRTarget 处理 PR/MR 审查模式的目标解析。
-// 支持 GitHub PR URL、GitLab MR URL 以及纯编号。
-func resolveMRTarget(input string, plat platform.Platform) (*reviewTarget, error) {
-	var mrNumber, mrURL, mrRepo string
-
-	if strings.HasPrefix(input, "http") {
-		// 用户提供了完整 URL
-		mrURL = input
-		if plat != nil {
-			repo, id, err := plat.ParseMRURL(input)
-			if err == nil {
-				mrNumber = id
-				mrRepo = repo
-			}
-		}
-		// 回退：尝试通用正则提取
-		if mrNumber == "" {
-			// GitHub: /pull/123
-			re := regexp.MustCompile(`/pull/(\d+)`)
-			if m := re.FindStringSubmatch(input); len(m) > 1 {
-				mrNumber = m[1]
-			}
-			// GitLab: /-/merge_requests/123
-			re2 := regexp.MustCompile(`/merge_requests/(\d+)`)
-			if m := re2.FindStringSubmatch(input); len(m) > 1 {
-				mrNumber = m[1]
-			}
-		}
-		if mrNumber == "" {
-			mrNumber = input
-		}
-	} else {
-		// 用户提供了纯编号
-		mrNumber = input
-		if plat != nil {
-			repo, err := plat.DetectRepoFromRemote()
-			if err == nil {
-				mrRepo = repo
-				mrURL = plat.BuildMRURL(repo, mrNumber)
-			}
-		}
-		if mrURL == "" {
-			mrURL = fmt.Sprintf("MR/PR #%s", mrNumber)
-		}
-	}
-
-	// fallback：URL 解析失败时尝试从当前 git remote 推断仓库
-	if mrRepo == "" && plat != nil {
-		if repo, err := plat.DetectRepoFromRemote(); err == nil {
-			mrRepo = repo
-		}
-	}
-
-	// 通过 Platform 接口获取 diff 和信息
-	var mrDiff, mrTitle, mrBody string
-	if plat != nil {
-		if diff, err := plat.GetDiff(mrNumber, mrRepo); err == nil {
-			mrDiff = diff
-		}
-		if info, err := plat.GetInfo(mrNumber, mrRepo); err == nil {
-			mrTitle = info.Title
-			mrBody = info.Description
-		}
-	}
-
-	var prompt string
-	if mrDiff != "" {
-		annotatedDiff := platform.AnnotateDiffWithLineNumbers(mrDiff)
-		prompt = fmt.Sprintf("Please review %s.\n\nTitle: %s\n\nDescription:\n%s\n\nHere is the full diff (each line is prefixed with its new-file line number for reference):\n\n```diff\n%s```\n\nAnalyze these changes and provide your feedback. You already have the complete diff above — do NOT attempt to fetch it again.\nWhen reporting issues, always reference the line number shown at the beginning of each line (e.g. \"line 263\").",
-			mrURL, mrTitle, mrBody, annotatedDiff)
-	} else {
-		prompt = fmt.Sprintf("Please review %s. Get the details and diff using any method available to you, then analyze the changes.", mrURL)
-	}
-
-	// 确定标签格式
-	label := fmt.Sprintf("PR #%s", mrNumber)
-	if plat != nil && plat.Name() == "gitlab" {
-		label = fmt.Sprintf("MR !%s", mrNumber)
-	}
-
-	return &reviewTarget{
-		Type:     "pr",
-		Label:    label,
-		Prompt:   prompt,
-		Repo:     mrRepo,
-		MRNumber: mrNumber,
-	}, nil
 }
 
 func selectReviewerIDs(cmd *cobra.Command, allIDs []string) ([]string, error) {
@@ -534,26 +280,10 @@ func saveOutput(path, format string, result *orchestrator.DebateResult) error {
 
 // convertIssuesToPlatform 将编排器产出的 MergedIssue 列表转换为平台通用的评论格式。
 func convertIssuesToPlatform(issues []orchestrator.MergedIssue) []platform.IssueForComment {
-	result := make([]platform.IssueForComment, 0, len(issues))
-	for _, issue := range issues {
-		raisedBy := ""
-		if len(issue.RaisedBy) > 0 {
-			raisedBy = strings.Join(issue.RaisedBy, ", ")
-		}
-		result = append(result, platform.IssueForComment{
-			File:         issue.File,
-			Line:         issue.Line,
-			Title:        issue.Title,
-			Description:  issue.Description,
-			Severity:     issue.Severity,
-			SuggestedFix: issue.SuggestedFix,
-			RaisedBy:     raisedBy,
-		})
-	}
-	return result
+	return reviewpost.ConvertIssuesToPlatform(issues)
 }
 
-func shouldPostSummary(noPost, noPostSummary bool, targetType, finalConclusion string, plat platform.Platform) bool {
+func shouldPostSummary(noPost, noPostSummary bool, targetType, finalConclusion string, plat platform.Named) bool {
 	return !noPost &&
 		!noPostSummary &&
 		targetType == "pr" &&
@@ -563,41 +293,13 @@ func shouldPostSummary(noPost, noPostSummary bool, targetType, finalConclusion s
 }
 
 func buildSummaryNoteBody(finalConclusion string) string {
-	return hydraSummaryMarker + "\n## Hydra Code Review Summary\n\n" + strings.TrimSpace(finalConclusion)
+	return reviewpost.BuildSummaryNoteBody(finalConclusion)
 }
 
-func upsertSummaryNote(plat platform.Platform, mrID, repo, body string) error {
-	type summaryUpserter interface {
-		UpsertSummaryNote(mrID, repo, marker, body string) error
-	}
-	type summaryPoster interface {
-		PostNote(mrID, repo, body string) error
-	}
-
-	if upserter, ok := plat.(summaryUpserter); ok {
-		return upserter.UpsertSummaryNote(mrID, repo, hydraSummaryMarker, body)
-	}
-	if poster, ok := plat.(summaryPoster); ok {
-		return poster.PostNote(mrID, repo, body)
-	}
-	return fmt.Errorf("platform %q does not support summary posting", plat.Name())
+func upsertSummaryNote(plat platform.Named, mrID, repo, body string) error {
+	return reviewpost.UpsertSummaryNote(plat, mrID, repo, body)
 }
 
-func supportsSummaryPosting(plat platform.Platform) bool {
-	if plat == nil {
-		return false
-	}
-	type summaryUpserter interface {
-		UpsertSummaryNote(mrID, repo, marker, body string) error
-	}
-	type summaryPoster interface {
-		PostNote(mrID, repo, body string) error
-	}
-	if _, ok := plat.(summaryUpserter); ok {
-		return true
-	}
-	if _, ok := plat.(summaryPoster); ok {
-		return true
-	}
-	return false
+func supportsSummaryPosting(plat platform.Named) bool {
+	return reviewpost.SupportsSummaryPosting(plat)
 }

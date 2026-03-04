@@ -33,12 +33,14 @@ func CreateProvider(model, modelName, reasoningEffort string, cfg *config.HydraC
 		p := NewClaudeCodeProvider()
 		p.skipPermissions = skipPerms
 		p.modelName = modelName
+		p.promptSizeThreshold = cfg.Defaults.PromptSizeThreshold
 		return p, nil
 	case model == "codex-cli":
 		// 创建 Codex CLI 提供者，通过调用 codex 命令行工具进行交互
 		p := NewCodexCliProvider()
 		p.skipPermissions = skipPerms
 		p.modelName = modelName
+		p.promptSizeThreshold = cfg.Defaults.PromptSizeThreshold
 		return p, nil
 	case strings.HasPrefix(model, "gpt-"),
 		strings.HasPrefix(model, "o1-"),

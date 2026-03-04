@@ -52,10 +52,14 @@ type CLIProviderConfig struct {
 // DefaultsConfig 保存默认运行参数。
 // 这些参数控制审查流程的基本行为，如最大轮数、输出格式等。
 type DefaultsConfig struct {
-	MaxRounds        int    `yaml:"max_rounds"`                 // 最大审查轮数，控制对抗式审查的迭代次数
-	OutputFormat     string `yaml:"output_format"`              // 输出格式（如 markdown、json 等）
-	CheckConvergence bool   `yaml:"check_convergence"`          // 是否检查审查意见的收敛性（提前终止）
-	SkipPermissions  *bool  `yaml:"skip_permissions,omitempty"` // 是否跳过 CLI 权限提示（非交互模式必须为 true）
+	MaxRounds           int      `yaml:"max_rounds"`                      // 最大审查轮数，控制对抗式审查的迭代次数
+	OutputFormat        string   `yaml:"output_format"`                   // 输出格式（如 markdown、json 等）
+	CheckConvergence    bool     `yaml:"check_convergence"`               // 是否检查审查意见的收敛性（提前终止）
+	SkipPermissions     *bool    `yaml:"skip_permissions,omitempty"`      // 是否跳过 CLI 权限提示（非交互模式必须为 true）
+	Language            string   `yaml:"language,omitempty"`              // 输出语言（如 "zh"、"ja"、"en"），空表示默认英文
+	DiffExclude         []string `yaml:"diff_exclude,omitempty"`          // diff 过滤模式列表（如 "*.pb.go"、"vendor/**"）
+	PromptSizeThreshold int      `yaml:"prompt_size_threshold,omitempty"` // 大 prompt 写临时文件的阈值（字节），默认 102400（100KB）
+	StructurizeMode     string   `yaml:"structurize_mode,omitempty"`      // 结构化模式：legacy（一次性）| ledger（增量账本）
 }
 
 // ReviewerConfig 定义审查者、分析器或汇总器的配置。
@@ -166,6 +170,9 @@ func LoadConfig(configPath string) (*HydraConfig, error) {
 		t := true
 		cfg.Defaults.SkipPermissions = &t
 	}
+	if strings.TrimSpace(cfg.Defaults.StructurizeMode) == "" {
+		cfg.Defaults.StructurizeMode = "ledger"
+	}
 
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err
@@ -218,6 +225,11 @@ func validateConfig(cfg *HydraConfig) error {
 	// 验证分析器配置
 	if err := validateReviewerConfig("analyzer", cfg.Analyzer); err != nil {
 		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Defaults.StructurizeMode)) {
+	case "legacy", "ledger":
+	default:
+		return fmt.Errorf("config error: defaults.structurize_mode must be one of: legacy, ledger")
 	}
 
 	return nil

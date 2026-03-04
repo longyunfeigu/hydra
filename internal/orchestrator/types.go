@@ -54,6 +54,8 @@ type ReviewerStatus struct {
 type OrchestratorOptions struct {
 	MaxRounds        int
 	CheckConvergence bool
+	Language         string // 输出语言（如 "zh"、"ja"），空表示默认英文
+	StructurizeMode  string // "legacy" | "ledger"，空值按 legacy 处理
 }
 
 // OrchestratorConfig 保存创建DebateOrchestrator所需的全部配置。
@@ -138,7 +140,7 @@ type ReviewIssue struct {
 	Description  string   `json:"description"`
 	SuggestedFix string   `json:"suggestedFix,omitempty"`
 	CodeSnippet  string   `json:"codeSnippet,omitempty"`
-	RaisedBy     []string `json:"raisedBy,omitempty"`
+	ClaimedBy    []string `json:"raisedBy,omitempty"` // 原始模型输出中“声称由哪些 reviewer 提出”
 }
 
 // MergedIssue 是经过去重合并的问题，包含多个审查者的归属信息。
@@ -155,6 +157,36 @@ type ReviewerOutput struct {
 	Issues  []ReviewIssue `json:"issues"`
 	Verdict string        `json:"verdict"`
 	Summary string        `json:"summary"`
+}
+
+// StructurizeDelta 表示单个 reviewer 在单轮中的 issue 增量变化。
+type StructurizeDelta struct {
+	Add     []DeltaAddIssue    `json:"add"`
+	Retract []string           `json:"retract"`
+	Update  []DeltaUpdateIssue `json:"update"`
+}
+
+// DeltaAddIssue 表示新发现的问题（由本地 ledger 分配 ID）。
+type DeltaAddIssue struct {
+	Severity     string `json:"severity"`
+	Category     string `json:"category,omitempty"`
+	File         string `json:"file"`
+	Line         *int   `json:"line,omitempty"`
+	Title        string `json:"title"`
+	Description  string `json:"description"`
+	SuggestedFix string `json:"suggestedFix,omitempty"`
+}
+
+// DeltaUpdateIssue 表示对已有问题（按 ID）的字段更新。
+type DeltaUpdateIssue struct {
+	ID           string  `json:"id"`
+	Severity     *string `json:"severity,omitempty"`
+	Category     *string `json:"category,omitempty"`
+	File         *string `json:"file,omitempty"`
+	Line         *int    `json:"line,omitempty"`
+	Title        *string `json:"title,omitempty"`
+	Description  *string `json:"description,omitempty"`
+	SuggestedFix *string `json:"suggestedFix,omitempty"`
 }
 
 // DisplayCallbacks 是终端显示集成的回调接口。

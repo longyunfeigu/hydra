@@ -26,7 +26,12 @@ type ValidationResult struct {
 
 // ValidateIssuesJSON 使用 JSON Schema 校验原始 JSON 字符串。
 func ValidateIssuesJSON(jsonStr string) *ValidationResult {
-	schemaBytes, err := schemaFS.ReadFile("schemas/issues.json")
+	return ValidateJSON("issues", jsonStr)
+}
+
+// ValidateJSON 使用指定 schema 校验原始 JSON 字符串。
+func ValidateJSON(schemaName, jsonStr string) *ValidationResult {
+	schemaBytes, err := schemaFS.ReadFile(fmt.Sprintf("schemas/%s.json", schemaName))
 	if err != nil {
 		return &ValidationResult{
 			Valid:  false,

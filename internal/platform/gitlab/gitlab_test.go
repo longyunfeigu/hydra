@@ -130,7 +130,7 @@ func TestBuildTextPosition_IncludesOldPath(t *testing.T) {
 		BaseSHA:  "base",
 		StartSHA: "start",
 	}
-	pos := buildTextPosition("backend/a.go", 42, commitInfo)
+	pos := buildTextPosition("backend/a.go", 42, nil, commitInfo)
 
 	if got, _ := pos["position_type"].(string); got != "text" {
 		t.Fatalf("position_type = %q, want %q", got, "text")

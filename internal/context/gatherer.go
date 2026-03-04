@@ -151,7 +151,7 @@ func (g *ContextGatherer) Gather(ctx gocontext.Context, diff, prNumber, baseBran
 		ctx,
 		[]provider.Message{{Role: "user", Content: prompt}},
 		"You are a senior software architect. Analyze the PR context and respond in JSON format only.",
-		nil,
+		&provider.ChatOptions{MaxTokens: 16384},
 	)
 	if err != nil {
 		// AI 分析失败时返回部分上下文（包含原始引用和历史 PR 数据），不中断流程
@@ -192,6 +192,9 @@ type aiAnalysisResult struct {
 // jsonBlockRegex 匹配 Markdown JSON 代码块（```json ... ```）
 var jsonBlockRegex = regexp.MustCompile("(?s)```json\\s*(.*?)\\s*```")
 
+// anyCodeBlockRegex 匹配任意 Markdown 代码块（``` ... ```），不限语言标记
+var anyCodeBlockRegex = regexp.MustCompile("(?s)```\\w*\\s*(.*?)\\s*```")
+
 // jsonObjectRegex 匹配任意 JSON 对象（{...}）
 var jsonObjectRegex = regexp.MustCompile(`(?s)\{.*\}`)
 
@@ -201,32 +204,49 @@ var jsonObjectRegex = regexp.MustCompile(`(?s)\{.*\}`)
 //  2. 从响应文本中直接匹配 JSON 对象
 //  3. 如果都失败，将原始响应（截断到1000字符）作为摘要返回
 func parseAIResponse(response string) aiAnalysisResult {
-	var jsonStr string
+	candidates := collectJSONCandidates(response)
 
-	// 优先尝试从 Markdown JSON 代码块中提取
-	if m := jsonBlockRegex.FindStringSubmatch(response); m != nil {
-		jsonStr = m[1]
-	} else if m := jsonObjectRegex.FindString(response); m != "" {
-		// 其次尝试直接匹配 JSON 对象
-		jsonStr = m
-	} else {
-		// 都无法提取 JSON，将原始响应作为摘要兜底
-		summary := response
-		if len(summary) > 1000 {
-			summary = summary[:1000]
+	for _, jsonStr := range candidates {
+		var result aiAnalysisResult
+		if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+			continue
 		}
-		return aiAnalysisResult{Summary: summary}
+		// 校验解析结果：至少要有 AffectedModules 或 Summary 才算有效
+		if len(result.AffectedModules) > 0 || result.Summary != "" {
+			return result
+		}
 	}
 
-	var result aiAnalysisResult
-	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
-		// JSON 解析失败时也将原始响应作为摘要兜底
-		summary := response
-		if len(summary) > 1000 {
-			summary = summary[:1000]
-		}
-		return aiAnalysisResult{Summary: summary}
+	// 所有候选都失败，将原始响应作为摘要兜底
+	summary := response
+	if len(summary) > 1000 {
+		summary = summary[:1000]
+	}
+	return aiAnalysisResult{Summary: summary}
+}
+
+// collectJSONCandidates 从 AI 响应中提取所有可能的 JSON 字符串候选。
+// 按优先级排列：```json 代码块 > 任意代码块 > 直接匹配的 JSON 对象。
+func collectJSONCandidates(response string) []string {
+	var candidates []string
+
+	// 1. 所有 ```json 代码块
+	for _, m := range jsonBlockRegex.FindAllStringSubmatch(response, -1) {
+		candidates = append(candidates, m[1])
 	}
 
-	return result
+	// 2. 所有 ``` 代码块（非 json 标记的）
+	for _, m := range anyCodeBlockRegex.FindAllStringSubmatch(response, -1) {
+		block := strings.TrimSpace(m[1])
+		if len(block) > 0 && block[0] == '{' {
+			candidates = append(candidates, block)
+		}
+	}
+
+	// 3. 直接匹配最外层 JSON 对象
+	if m := jsonObjectRegex.FindString(response); m != "" {
+		candidates = append(candidates, m)
+	}
+
+	return candidates
 }

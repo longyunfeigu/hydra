@@ -41,6 +41,10 @@ defaults:
   max_rounds: 5
   output_format: markdown
   check_convergence: true
+  structurize_mode: legacy  # legacy | ledger
+  # language: zh  # Output language (e.g. zh, ja, en). Empty = English
+  # diff_exclude:  # Additional patterns to exclude from diff (e.g. ["*.min.js", "dist/**"])
+  # prompt_size_threshold: 102400  # Bytes. Prompts larger than this are written to a temp file (default 100KB)
 
 analyzer:
   model: claude-code

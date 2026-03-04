@@ -225,3 +225,23 @@ func TestValidateIssuesJSON_MixedValidAndInvalid(t *testing.T) {
 		t.Error("expected invalid when any issue has bad severity")
 	}
 }
+
+func TestValidateJSON_IssuesDelta_Valid(t *testing.T) {
+	json := `{
+		"add": [{"severity":"high","file":"a.go","title":"T","description":"D"}],
+		"retract": ["I1"],
+		"update": [{"id":"I2","severity":"medium","description":"updated"}]
+	}`
+	result := ValidateJSON("issues_delta", json)
+	if !result.Valid {
+		t.Errorf("expected valid issues_delta JSON, got errors: %v", result.Errors)
+	}
+}
+
+func TestValidateJSON_IssuesDelta_Invalid(t *testing.T) {
+	json := `{"add":[{"file":"a.go","title":"T","description":"D"}],"retract":[],"update":[]}`
+	result := ValidateJSON("issues_delta", json)
+	if result.Valid {
+		t.Error("expected invalid issues_delta JSON when severity is missing")
+	}
+}

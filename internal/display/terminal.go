@@ -3,6 +3,7 @@
 package display
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -252,12 +253,25 @@ func (d *Display) OnConvergenceJudgment(verdict string, reasoning string) {
 
 // OnContextGathered 展示收集到的系统上下文信息。
 // 包括受影响模块（按影响级别着色）、关联 PR 列表和 AI 生成的上下文摘要。
+// 当 AffectedModules 为空但 Summary 含 JSON 时，尝试二次解析并格式化展示。
 func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 	d.SpinnerStop()
 
 	color.New(color.FgMagenta, color.Bold).Printf("\n%s\n", strings.Repeat("─", 50))
 	color.New(color.FgMagenta, color.Bold).Printf("  System Context\n")
 	color.New(color.FgMagenta, color.Bold).Printf("%s\n\n", strings.Repeat("─", 50))
+
+	// 兜底：如果 AffectedModules 为空但 Summary 包含 JSON，尝试二次解析
+	if len(ctx.AffectedModules) == 0 && ctx.Summary != "" && looksLikeJSON(ctx.Summary) {
+		if parsed := tryParseContextJSON(ctx.Summary); parsed != nil {
+			if len(parsed.AffectedModules) > 0 {
+				ctx.AffectedModules = parsed.AffectedModules
+			}
+			if parsed.Summary != "" {
+				ctx.Summary = parsed.Summary
+			}
+		}
+	}
 
 	if len(ctx.AffectedModules) > 0 {
 		fmt.Println(color.HiBlackString("Affected Modules:"))
@@ -293,6 +307,127 @@ func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
 		rendered := RenderTerminalMarkdown(ctx.Summary)
 		fmt.Print(rendered)
 	}
+}
+
+// looksLikeJSON 快速判断字符串是否可能是 JSON 对象。
+func looksLikeJSON(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	return strings.HasPrefix(trimmed, "{") || strings.Contains(trimmed, `"affectedModules"`)
+}
+
+// contextJSONFallback 是二次解析 Summary 中 JSON 时使用的结构。
+type contextJSONFallback struct {
+	AffectedModules []struct {
+		Name          string   `json:"name"`
+		Path          string   `json:"path"`
+		AffectedFiles []string `json:"affectedFiles"`
+		ImpactLevel   string   `json:"impactLevel"`
+	} `json:"affectedModules"`
+	Summary string `json:"summary"`
+}
+
+// tryParseContextJSON 尝试从可能包含 JSON 的文本中解析出上下文数据。
+// 支持原始 JSON、```json 代码块包裹的 JSON，以及被截断的不完整 JSON。
+func tryParseContextJSON(text string) *orchestrator.GatheredContext {
+	jsonStr := text
+
+	// 尝试从 ```json 代码块中提取
+	if idx := strings.Index(text, "```json"); idx >= 0 {
+		start := idx + 7
+		if end := strings.Index(text[start:], "```"); end >= 0 {
+			jsonStr = strings.TrimSpace(text[start : start+end])
+		}
+	} else if idx := strings.Index(text, "```"); idx >= 0 {
+		start := idx + 3
+		// 跳过可能的语言标记行
+		if nl := strings.IndexByte(text[start:], '\n'); nl >= 0 {
+			start += nl + 1
+		}
+		if end := strings.Index(text[start:], "```"); end >= 0 {
+			jsonStr = strings.TrimSpace(text[start : start+end])
+		}
+	}
+
+	// 先尝试完整解析
+	var fb contextJSONFallback
+	if err := json.Unmarshal([]byte(jsonStr), &fb); err == nil && len(fb.AffectedModules) > 0 {
+		return fallbackToContext(&fb)
+	}
+
+	// 完整解析失败（可能 JSON 被截断），尝试逐个提取 affectedModules 中的完整对象
+	modules := extractModulesFromTruncatedJSON(jsonStr)
+	if len(modules) > 0 {
+		result := &orchestrator.GatheredContext{}
+		for _, mod := range modules {
+			result.AffectedModules = append(result.AffectedModules, orchestrator.AffectedModule{
+				Name:          mod.Name,
+				Path:          mod.Path,
+				AffectedFiles: mod.AffectedFiles,
+				ImpactLevel:   mod.ImpactLevel,
+			})
+		}
+		return result
+	}
+
+	return nil
+}
+
+// fallbackToContext 将解析成功的 contextJSONFallback 转为 GatheredContext。
+func fallbackToContext(fb *contextJSONFallback) *orchestrator.GatheredContext {
+	result := &orchestrator.GatheredContext{
+		Summary: fb.Summary,
+	}
+	for _, mod := range fb.AffectedModules {
+		result.AffectedModules = append(result.AffectedModules, orchestrator.AffectedModule{
+			Name:          mod.Name,
+			Path:          mod.Path,
+			AffectedFiles: mod.AffectedFiles,
+			ImpactLevel:   mod.ImpactLevel,
+		})
+	}
+	return result
+}
+
+// truncatedModuleJSON 用于从截断 JSON 中提取单个 module 对象。
+type truncatedModuleJSON struct {
+	Name          string   `json:"name"`
+	Path          string   `json:"path"`
+	AffectedFiles []string `json:"affectedFiles"`
+	ImpactLevel   string   `json:"impactLevel"`
+}
+
+// extractModulesFromTruncatedJSON 从可能被截断的 JSON 中尽量提取完整的 module 对象。
+// 逐个匹配 {...} 块并尝试解析，跳过解析失败的（通常是最后一个被截断的）。
+func extractModulesFromTruncatedJSON(text string) []truncatedModuleJSON {
+	var modules []truncatedModuleJSON
+	// 在 affectedModules 数组内查找每个 {...} 对象
+	idx := strings.Index(text, `"affectedModules"`)
+	if idx < 0 {
+		return nil
+	}
+	rest := text[idx:]
+
+	depth := 0
+	start := -1
+	for i, ch := range rest {
+		if ch == '{' {
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		} else if ch == '}' {
+			depth--
+			if depth == 0 && start >= 0 {
+				objStr := rest[start : i+1]
+				var mod truncatedModuleJSON
+				if err := json.Unmarshal([]byte(objStr), &mod); err == nil && mod.Name != "" {
+					modules = append(modules, mod)
+				}
+				start = -1
+			}
+		}
+	}
+	return modules
 }
 
 // printAffectedFiles 按模块打印受影响文件列表，限制条数避免终端输出过长。

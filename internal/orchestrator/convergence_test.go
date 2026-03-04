@@ -118,3 +118,69 @@ func TestCheckConvergence_UsesAllRoundsContext(t *testing.T) {
 	}
 }
 
+func TestCheckConvergence_Round1CanConverge(t *testing.T) {
+	mp := &convergenceMockProvider{response: "Both reviewers independently found the same SQL injection issue and agree it's critical.\nCONVERGED"}
+	o := &DebateOrchestrator{
+		reviewers: []Reviewer{
+			{ID: "r1"},
+			{ID: "r2"},
+		},
+		summarizer: Reviewer{
+			ID:       "summarizer",
+			Provider: mp,
+		},
+		// Only 1 round of messages (round 1)
+		conversationHistory: []DebateMessage{
+			{ReviewerID: "r1", Content: "Found SQL injection risk in auth.go:42"},
+			{ReviewerID: "r2", Content: "SQL injection vulnerability in auth.go line 42"},
+		},
+	}
+	d := &convergenceDisplay{}
+
+	converged, err := o.checkConvergence(context.Background(), d)
+	if err != nil {
+		t.Fatalf("checkConvergence returned error: %v", err)
+	}
+	if !converged {
+		t.Fatal("expected round-1 convergence when reviewers independently agree")
+	}
+	if d.verdict != "CONVERGED" {
+		t.Fatalf("display verdict = %q, want CONVERGED", d.verdict)
+	}
+
+	// Verify IsFirstRound context was passed to template
+	if !containsStr(mp.capturedPrompt, "Round 1") {
+		t.Fatal("expected prompt to mention Round 1")
+	}
+	if !containsStr(mp.capturedPrompt, "independently") {
+		t.Fatal("expected prompt to contain round-1 specific guidance about independent review")
+	}
+}
+
+func TestCheckConvergence_Round1NotConverged(t *testing.T) {
+	mp := &convergenceMockProvider{response: "Reviewers found completely different issues.\nNOT_CONVERGED"}
+	o := &DebateOrchestrator{
+		reviewers: []Reviewer{
+			{ID: "r1"},
+			{ID: "r2"},
+		},
+		summarizer: Reviewer{
+			ID:       "summarizer",
+			Provider: mp,
+		},
+		conversationHistory: []DebateMessage{
+			{ReviewerID: "r1", Content: "Found performance issue in database queries"},
+			{ReviewerID: "r2", Content: "Found security issue in authentication"},
+		},
+	}
+	d := &convergenceDisplay{}
+
+	converged, err := o.checkConvergence(context.Background(), d)
+	if err != nil {
+		t.Fatalf("checkConvergence returned error: %v", err)
+	}
+	if converged {
+		t.Fatal("expected not converged when reviewers found different issues")
+	}
+}
+

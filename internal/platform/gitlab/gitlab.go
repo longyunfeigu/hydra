@@ -356,7 +356,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
 		payload, _ := json.Marshal(map[string]interface{}{
 			"body": opts.Body,
-			"position": buildTextPosition(opts.Path, *opts.Line, opts.CommitInfo),
+			"position": buildTextPosition(opts.Path, *opts.Line, opts.OldLine, opts.CommitInfo),
 		})
 		out, err := g.glabPostJSON(endpoint, payload)
 		if err == nil {
@@ -402,8 +402,8 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 	}
 }
 
-func buildTextPosition(path string, line int, commitInfo platform.CommitInfo) map[string]interface{} {
-	return map[string]interface{}{
+func buildTextPosition(path string, line int, oldLine *int, commitInfo platform.CommitInfo) map[string]interface{} {
+	pos := map[string]interface{}{
 		"position_type": "text",
 		"new_path":      path,
 		"old_path":      path,
@@ -412,6 +412,11 @@ func buildTextPosition(path string, line int, commitInfo platform.CommitInfo) ma
 		"base_sha":      commitInfo.BaseSHA,
 		"start_sha":     commitInfo.StartSHA,
 	}
+	// context 行需要同时设置 old_line，否则 GitLab 无法计算 line_code
+	if oldLine != nil && *oldLine > 0 {
+		pos["old_line"] = *oldLine
+	}
+	return pos
 }
 
 func buildFilePosition(path string, commitInfo platform.CommitInfo) map[string]interface{} {
@@ -468,6 +473,7 @@ func (g *GitLabPlatform) PostReview(mrID string, classified []platform.Classifie
 			cr := g.PostComment(mrID, platform.PostCommentOpts{
 				Path:       cc.Input.Path,
 				Line:       cc.Input.Line,
+				OldLine:    cc.OldLine,
 				Body:       cc.Input.Body,
 				CommitInfo: commitInfo,
 				Repo:       repo,
@@ -547,7 +553,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 		}
 		payload, _ := json.Marshal(map[string]interface{}{
 			"note": cc.Input.Body,
-			"position": buildTextPosition(cc.Input.Path, *cc.Input.Line, commitInfo),
+			"position": buildTextPosition(cc.Input.Path, *cc.Input.Line, cc.OldLine, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
 		out, err := g.glabPostJSON(endpoint, payload)
@@ -634,18 +640,18 @@ func (g *GitLabPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 		return platform.ReviewResult{Failed: len(issues)}
 	}
 
-	diffInfo := make(map[string]map[int]bool)
+	diffInfoEx := make(map[string]map[int]platform.DiffLineInfo)
 	for _, f := range changedFiles {
 		if f.Patch != "" {
-			diffInfo[f.Filename] = platform.ParseDiffLines(f.Patch)
+			diffInfoEx[f.Filename] = platform.ParseDiffLinesEx(f.Patch)
 		} else {
-			diffInfo[f.Filename] = make(map[int]bool)
+			diffInfoEx[f.Filename] = make(map[int]platform.DiffLineInfo)
 		}
 	}
 
 	// 调试：打印 diff 中的文件路径
-	util.Debugf("PostIssuesAsComments: diff contains %d files:", len(diffInfo))
-	for path, lines := range diffInfo {
+	util.Debugf("PostIssuesAsComments: diff contains %d files:", len(diffInfoEx))
+	for path, lines := range diffInfoEx {
 		util.Debugf("  diff file: %s (lines in diff: %d)", path, len(lines))
 	}
 	for _, c := range comments {
@@ -656,7 +662,7 @@ func (g *GitLabPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 		util.Debugf("  comment path: %q line: %s", c.Path, lineStr)
 	}
 
-	classified := platform.ClassifyCommentsByDiff(comments, diffInfo)
+	classified := platform.ClassifyCommentsByDiffEx(comments, diffInfoEx)
 
 	// 调试：打印分类结果
 	for _, cc := range classified {

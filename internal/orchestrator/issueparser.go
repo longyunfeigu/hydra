@@ -52,42 +52,43 @@ var (
 	// jsonFenceRe 匹配```json ... ```格式的JSON代码块
 	jsonFenceRe = regexp.MustCompile("(?s)```json\\s*(.*?)\\s*```")
 	// rawJSONRe 匹配包含"issues"数组的原始JSON对象（无代码块包裹的情况）
-	rawJSONRe   = regexp.MustCompile(`(?s)\{[\s\S]*"issues"\s*:\s*\[[\s\S]*\][\s\S]*\}`)
+	rawJSONRe = regexp.MustCompile(`(?s)\{[\s\S]*"issues"\s*:\s*\[[\s\S]*\][\s\S]*\}`)
+	// rawDeltaJSONRe 匹配包含 delta 关键字段的 JSON 对象（无代码块包裹的情况）
+	rawDeltaJSONRe = regexp.MustCompile(`(?s)\{[\s\S]*"(add|retract|update)"\s*:[\s\S]*\}`)
 	// focusRe 匹配"## Suggested Review Focus"章节，提取审查关注重点
-	focusRe     = regexp.MustCompile(`(?s)## Suggested Review Focus\s*\n(.*?)(?:\n##|\z)`)
+	focusRe = regexp.MustCompile(`(?s)## Suggested Review Focus\s*\n(.*?)(?:\n##|\z)`)
 	// fileLineRe 匹配文件路径中嵌入的行号范围，如 "file.py:37" 或 "file.py:37-48"
-	fileLineRe  = regexp.MustCompile(`^(.+):(\d+)(?:-(\d+))?$`)
+	fileLineRe = regexp.MustCompile(`^(.+):(\d+)(?:-(\d+))?$`)
 )
 
 // ParseResult 包含解析结果、原始 JSON 和可能的错误信息。
 type ParseResult struct {
-	Output       *ReviewerOutput            // 成功解析的结构化输出
-	RawJSON      string                     // 提取到的原始 JSON
-	SchemaErrors []schema.ValidationError   // schema 校验错误
-	ParseError   error                      // JSON 语法级错误
+	Output       *ReviewerOutput          // 成功解析的结构化输出
+	RawJSON      string                   // 提取到的原始 JSON
+	SchemaErrors []schema.ValidationError // schema 校验错误
+	ParseError   error                    // JSON 语法级错误
+}
+
+// DeltaParseResult 包含 issue delta 解析结果。
+type DeltaParseResult struct {
+	Output       *StructurizeDelta        // 成功解析的 delta
+	RawJSON      string                   // 提取到的原始 JSON
+	SchemaErrors []schema.ValidationError // schema 校验错误
+	ParseError   error                    // JSON 语法级错误
 }
 
 // ParseReviewerOutput 从审查者的响应文本中解析结构化的ReviewerOutput。
 // 解析策略：
-//   1. 优先查找```json代码块中的JSON内容
-//   2. 回退方案：查找包含"issues"数组的原始JSON对象
-//   3. 使用 JSON Schema 校验结构有效性
+//  1. 优先查找```json代码块中的JSON内容
+//  2. 回退方案：查找包含"issues"数组的原始JSON对象
+//  3. 使用 JSON Schema 校验结构有效性
+//
 // 对每个问题进行严格验证：必须包含有效的严重程度、文件路径、标题和描述。
 // 返回 ParseResult，包含解析结果和错误详情，便于重试时提供具体反馈。
 func ParseReviewerOutput(response string) *ParseResult {
 	result := &ParseResult{}
 
-	// 优先尝试匹配```json代码块格式
-	if m := jsonFenceRe.FindStringSubmatch(response); len(m) > 1 {
-		result.RawJSON = m[1]
-	}
-
-	// 回退方案：尝试匹配未包裹在代码块中的原始JSON对象
-	if result.RawJSON == "" {
-		if m := rawJSONRe.FindString(response); m != "" {
-			result.RawJSON = m
-		}
-	}
+	result.RawJSON = extractJSON(response, rawJSONRe)
 
 	if result.RawJSON == "" {
 		result.ParseError = fmt.Errorf("no JSON block found in response")
@@ -205,7 +206,7 @@ func ParseReviewerOutput(response string) *ParseResult {
 		if rb, ok := m["raisedBy"].([]interface{}); ok {
 			for _, v := range rb {
 				if s, ok := v.(string); ok {
-					issue.RaisedBy = append(issue.RaisedBy, s)
+					issue.ClaimedBy = append(issue.ClaimedBy, s)
 				}
 			}
 		}
@@ -219,6 +220,171 @@ func ParseReviewerOutput(response string) *ParseResult {
 		Summary: raw.Summary,
 	}
 	return result
+}
+
+// ParseStructurizeDelta 从模型响应中解析单轮增量 delta。
+func ParseStructurizeDelta(response string) *DeltaParseResult {
+	result := &DeltaParseResult{}
+	result.RawJSON = extractJSON(response, rawDeltaJSONRe)
+
+	if result.RawJSON == "" {
+		result.ParseError = fmt.Errorf("no JSON block found in response")
+		return result
+	}
+
+	vr := schema.ValidateJSON("issues_delta", result.RawJSON)
+	if !vr.Valid {
+		result.SchemaErrors = vr.Errors
+	}
+
+	var raw struct {
+		Add     []json.RawMessage `json:"add"`
+		Retract []string          `json:"retract"`
+		Update  []json.RawMessage `json:"update"`
+	}
+	if err := json.Unmarshal([]byte(result.RawJSON), &raw); err != nil {
+		result.ParseError = fmt.Errorf("JSON syntax error: %w", err)
+		return result
+	}
+
+	if raw.Add == nil || raw.Retract == nil || raw.Update == nil {
+		result.ParseError = fmt.Errorf("missing one of required keys: add/retract/update")
+		return result
+	}
+
+	out := &StructurizeDelta{
+		Retract: make([]string, 0, len(raw.Retract)),
+	}
+
+	for _, id := range raw.Retract {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		out.Retract = append(out.Retract, id)
+	}
+
+	for _, rawAdd := range raw.Add {
+		var m map[string]any
+		if err := json.Unmarshal(rawAdd, &m); err != nil {
+			continue
+		}
+
+		severity := parseStringField(m, "severity")
+		if !validSeverities[severity] {
+			continue
+		}
+		file := parseStringField(m, "file")
+		title := parseStringField(m, "title")
+		description := parseStringField(m, "description")
+		if file == "" || title == "" || description == "" {
+			continue
+		}
+
+		add := DeltaAddIssue{
+			Severity:    severity,
+			Category:    parseStringField(m, "category"),
+			File:        file,
+			Title:       title,
+			Description: description,
+		}
+		if suggestedFix, ok := parseOptionalStringField(m, "suggestedFix"); ok {
+			add.SuggestedFix = suggestedFix
+		}
+		if line, ok := parsePositiveIntField(m, "line"); ok {
+			add.Line = &line
+		}
+		out.Add = append(out.Add, add)
+	}
+
+	for _, rawUpdate := range raw.Update {
+		var m map[string]any
+		if err := json.Unmarshal(rawUpdate, &m); err != nil {
+			continue
+		}
+
+		update := DeltaUpdateIssue{
+			ID: parseStringField(m, "id"),
+		}
+		if update.ID == "" {
+			continue
+		}
+
+		if severity, ok := parseOptionalStringField(m, "severity"); ok {
+			if !validSeverities[severity] {
+				continue
+			}
+			update.Severity = &severity
+		}
+		if category, ok := parseOptionalStringField(m, "category"); ok {
+			update.Category = &category
+		}
+		if file, ok := parseOptionalStringField(m, "file"); ok && file != "" {
+			update.File = &file
+		}
+		if title, ok := parseOptionalStringField(m, "title"); ok && title != "" {
+			update.Title = &title
+		}
+		if description, ok := parseOptionalStringField(m, "description"); ok && description != "" {
+			update.Description = &description
+		}
+		if suggestedFix, ok := parseOptionalStringField(m, "suggestedFix"); ok {
+			update.SuggestedFix = &suggestedFix
+		}
+		if line, ok := parsePositiveIntField(m, "line"); ok {
+			update.Line = &line
+		}
+
+		out.Update = append(out.Update, update)
+	}
+
+	result.Output = out
+	return result
+}
+
+func extractJSON(response string, rawPattern *regexp.Regexp) string {
+	// 优先尝试匹配```json代码块格式
+	if m := jsonFenceRe.FindStringSubmatch(response); len(m) > 1 {
+		return m[1]
+	}
+	// 回退方案：尝试匹配未包裹在代码块中的原始 JSON 对象
+	if m := rawPattern.FindString(response); m != "" {
+		return m
+	}
+	return ""
+}
+
+func parseStringField(m map[string]any, key string) string {
+	s, _ := m[key].(string)
+	return strings.TrimSpace(s)
+}
+
+func parseOptionalStringField(m map[string]any, key string) (string, bool) {
+	v, ok := m[key]
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(s), true
+}
+
+func parsePositiveIntField(m map[string]any, key string) (int, bool) {
+	v, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+	i := int(f)
+	if i <= 0 || float64(i) != f {
+		return 0, false
+	}
+	return i, true
 }
 
 // ParseFocusAreas 从分析器输出中提取建议的审查关注重点。
@@ -253,6 +419,7 @@ func ParseFocusAreas(analysis string) []string {
 //   - 记录所有提出该问题的审查者ID
 //   - 保留所有描述（用于生成更全面的问题说明）
 //   - 如果已有修复建议为空则使用新发现的修复建议
+//
 // 最终结果按严重程度排序（critical在前）。
 func DeduplicateIssues(issuesByReviewer map[string][]ReviewIssue) []MergedIssue {
 	var merged []MergedIssue
@@ -296,9 +463,9 @@ func DeduplicateIssues(issuesByReviewer map[string][]ReviewIssue) []MergedIssue 
 
 // isSimilarIssue 检查两个问题是否足够相似可以合并。
 // 判断逻辑：
-//   1. 必须是同一个文件（完全匹配）
-//   2. 行号范围必须重叠或相邻（5行以内）
-//   3. 标题和描述的加权Jaccard相似度 > 0.35（标题权重0.7，描述权重0.3）
+//  1. 必须是同一个文件（完全匹配）
+//  2. 行号范围必须重叠或相邻（5行以内）
+//  3. 标题和描述的加权Jaccard相似度 > 0.35（标题权重0.7，描述权重0.3）
 func isSimilarIssue(a, b *ReviewIssue) bool {
 	// 必须是同一个文件
 	if a.File != b.File {
@@ -393,11 +560,11 @@ func filterStopWords(words []string) []string {
 	return result
 }
 
-// tokenize 按空白字符将字符串分割为词列表。
-// 使用unicode.IsSpace判断空白字符，支持各种Unicode空白。
+// tokenize 将文本分割为词列表，只保留字母和数字。
+// 这会去除标点符号，避免 "vulnerability." 与 "vulnerability" 被视为不同词。
 func tokenize(s string) []string {
 	return strings.FieldsFunc(s, func(r rune) bool {
-		return unicode.IsSpace(r)
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
 	})
 }
 

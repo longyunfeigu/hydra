@@ -1,15 +1,15 @@
 package display
 
 import (
-	"log"
 	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/guwanhua/hydra/internal/orchestrator"
 )
 
 func TestNoopDisplayCallbacks(t *testing.T) {
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	d := NewNoopDisplay(logger)
 
 	// 验证所有回调方法都不 panic
@@ -59,6 +59,6 @@ func TestNoopDisplayCallbacks(t *testing.T) {
 
 // TestNoopDisplayImplementsInterface 验证 NoopDisplay 实现了 DisplayCallbacks 接口。
 func TestNoopDisplayImplementsInterface(t *testing.T) {
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	var _ orchestrator.DisplayCallbacks = NewNoopDisplay(logger)
 }
