@@ -592,8 +592,8 @@ func TestFormatIssueBody_ContainsMarker(t *testing.T) {
 		Severity: "high",
 	}
 	body := FormatIssueBody(issue)
-	if !strings.Contains(body, IssueMarkerPrefix) {
-		t.Fatal("formatted body should contain issue marker")
+	if _, ok := ParseHydraMeta(body); !ok {
+		t.Fatal("formatted body should contain structured issue marker")
 	}
 	if !strings.Contains(body, "Missing error check") {
 		t.Fatal("formatted body should still contain title")

@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -31,6 +32,9 @@ type Display struct {
 	maxRounds       int              // 最大审查轮次数
 	showToolTrace   bool             // 是否显示 analyzer/reviewer 的完整过程输出
 	traceHintShown  bool             // 默认摘要模式下，是否已提示可用 --show-tool-trace 查看明细
+	mu              sync.Mutex
+	streamedMessage map[string]bool
+	currentPhase    string
 }
 
 // New 创建一个新的 Display 实例。
@@ -48,12 +52,13 @@ func New() *Display {
 	}
 
 	return &Display{
-		spin:           s,
-		isTTY:          tty,
-		termWidth:      width,
-		currentRound:   1,
-		showToolTrace:  false,
-		traceHintShown: false,
+		spin:            s,
+		isTTY:           tty,
+		termWidth:       width,
+		currentRound:    1,
+		showToolTrace:   false,
+		traceHintShown:  false,
+		streamedMessage: make(map[string]bool),
 	}
 }
 
@@ -142,26 +147,36 @@ func (d *Display) ReviewHeader(label string, reviewerIDs []string, maxRounds int
 // OnWaiting 在等待审查者、分析器或摘要器响应时显示旋转动画。
 // 根据不同的 reviewerID 显示不同的等待提示文本，并附带随机冷笑话缓解等待焦虑。
 func (d *Display) OnWaiting(reviewerID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.SpinnerStop()
-
-	if reviewerID == "convergence-check" {
-		color.New(color.FgYellow, color.Bold).Printf("\n┌─ Convergence Judge %s\n", strings.Repeat("─", 30))
-	}
 
 	var label string
 	switch {
 	case reviewerID == "context-gatherer":
+		d.printPhaseHeader("Phase 1/3", "System Context", reviewerID)
 		label = "Gathering system context"
 	case reviewerID == "analyzer":
+		d.printPhaseHeader("Phase 1/3", "Analyzer", reviewerID)
 		label = "Analyzing changes"
+	case reviewerID == "reviewer-summaries":
+		d.printPhaseHeader("Phase 3/3", "Reviewer Summaries", reviewerID)
+		label = "Collecting reviewer summaries"
+	case reviewerID == "final-conclusion":
+		d.printPhaseHeader("Phase 3/3", "Final Conclusion", reviewerID)
+		label = "Synthesizing final conclusion"
 	case reviewerID == "summarizer":
+		d.printPhaseHeader("Phase 3/3", "Final Conclusion", reviewerID)
 		label = "Generating final summary"
 	case reviewerID == "convergence-check":
+		d.printPhaseHeader("Phase 2/3", "Convergence Check", reviewerID)
 		label = "Evaluating if reviewers reached consensus"
 	case reviewerID == "structurizer":
+		d.printPhaseHeader("Phase 3/3", "Issue Structurizer", reviewerID)
 		label = "Extracting structured issues"
 	case strings.HasPrefix(reviewerID, "round-"):
 		roundNum := strings.TrimPrefix(reviewerID, "round-")
+		d.printPhaseHeader("Phase 2/3", fmt.Sprintf("Debate Round %s/%d", roundNum, d.maxRounds), reviewerID)
 		label = fmt.Sprintf("Round %s: Starting parallel review", roundNum)
 	default:
 		label = fmt.Sprintf("%s is thinking", reviewerID)
@@ -180,6 +195,9 @@ func (d *Display) OnWaiting(reviewerID string) {
 // OnMessage 显示审查者的响应内容。
 // 当审查者切换时打印新的审查者标题头，然后渲染 Markdown 格式的响应内容。
 func (d *Display) OnMessage(reviewerID string, content string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if !d.showToolTrace {
 		// analyzer 是流式 chunk 回调，默认模式下不逐块展示，避免刷屏
 		if reviewerID == "analyzer" {
@@ -195,26 +213,46 @@ func (d *Display) OnMessage(reviewerID string, content string) {
 
 	d.SpinnerStop()
 
-	if reviewerID != d.currentReviewer {
-		d.currentReviewer = reviewerID
-		if reviewerID == "analyzer" {
-			color.New(color.FgMagenta, color.Bold).Printf("\n%s\n", strings.Repeat("─", 50))
-			color.New(color.FgMagenta, color.Bold).Printf("  Analysis\n")
-			color.New(color.FgMagenta, color.Bold).Printf("%s\n\n", strings.Repeat("─", 50))
-		} else {
-			color.New(color.FgCyan, color.Bold).Printf("\n┌─ %s ", reviewerID)
-			fmt.Printf("%s\n", color.HiBlackString("[Round %d/%d]", d.currentRound, d.maxRounds))
-			color.Cyan("│")
+	if d.streamedMessage[reviewerID] {
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			fmt.Println()
 		}
+		delete(d.streamedMessage, reviewerID)
+		return
+	}
+
+	if reviewerID != d.currentReviewer {
+		d.printReviewerHeader(reviewerID)
 	}
 
 	rendered := RenderTerminalMarkdown(content)
 	fmt.Print(rendered)
 }
 
+// OnMessageChunk 实时渲染流式输出的 chunk。
+// reviewer 和 analyzer 的 ChatStream 会在这里逐块透传，改善长耗时阶段的停顿感。
+func (d *Display) OnMessageChunk(reviewerID string, chunk string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.showToolTrace || chunk == "" {
+		return
+	}
+
+	d.SpinnerStop()
+	if reviewerID != d.currentReviewer {
+		d.printReviewerHeader(reviewerID)
+	}
+
+	d.streamedMessage[reviewerID] = true
+	fmt.Print(chunk)
+}
+
 // OnParallelStatus 更新旋转动画以显示并行执行的进度。
 // 展示每个审查者的状态（已完成/思考中/等待中）和耗时。
 func (d *Display) OnParallelStatus(round int, statuses []orchestrator.ReviewerStatus) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if !d.isTTY {
 		return
 	}
@@ -223,10 +261,23 @@ func (d *Display) OnParallelStatus(round int, statuses []orchestrator.ReviewerSt
 	d.spin.Suffix = d.buildSpinnerSuffix(prefix, getRandomJoke())
 }
 
+func (d *Display) OnSummaryStatus(statuses []orchestrator.ReviewerStatus) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.isTTY {
+		return
+	}
+	statusLine := formatSummaryStatus(statuses)
+	prefix := fmt.Sprintf("  %s | ", statusLine)
+	d.spin.Suffix = d.buildSpinnerSuffix(prefix, getRandomJoke())
+}
+
 // OnRoundComplete 显示审查轮次完成状态。
 // 如果审查者达成共识（converged=true），显示绿色的 CONVERGED 标记并提示提前结束；
 // 否则显示红色的 NOT CONVERGED 标记，继续下一轮。
 func (d *Display) OnRoundComplete(round int, converged bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	fmt.Println()
 	if converged {
 		fmt.Printf("%s %s\n", color.YellowString("└─ Verdict:"), color.New(color.FgGreen, color.Bold).Sprint("CONVERGED"))
@@ -242,6 +293,8 @@ func (d *Display) OnRoundComplete(round int, converged bool) {
 // OnConvergenceJudgment 展示收敛判断者的推理过程。
 // 以灰色文本逐行显示判断理由，帮助用户理解为何审查提前结束或继续。
 func (d *Display) OnConvergenceJudgment(verdict string, reasoning string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if reasoning == "" {
 		return
 	}
@@ -255,6 +308,8 @@ func (d *Display) OnConvergenceJudgment(verdict string, reasoning string) {
 // 包括受影响模块（按影响级别着色）、关联 PR 列表和 AI 生成的上下文摘要。
 // 当 AffectedModules 为空但 Summary 含 JSON 时，尝试二次解析并格式化展示。
 func (d *Display) OnContextGathered(ctx *orchestrator.GatheredContext) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.SpinnerStop()
 
 	color.New(color.FgMagenta, color.Bold).Printf("\n%s\n", strings.Repeat("─", 50))
@@ -553,18 +608,98 @@ func (d *Display) TokenUsage(usage []orchestrator.TokenUsage, convergedAt *int) 
 // 每个审查者用不同颜色标识状态：绿色=已完成（附耗时），黄色=思考中，灰色=等待中。
 func formatParallelStatus(round int, statuses []orchestrator.ReviewerStatus) string {
 	parts := make([]string, len(statuses))
+	nowMillis := time.Now().UnixMilli()
 	for i, s := range statuses {
 		switch s.Status {
 		case "done":
 			parts[i] = color.GreenString("✓ %s", s.ReviewerID) +
-				color.HiBlackString(" (%.1fs)", s.Duration)
+				color.HiBlackString(" (%.1fs, %s/%s, ~$%.4f)",
+					s.Duration,
+					formatNumber(s.InputTokens),
+					formatNumber(s.OutputTokens),
+					s.EstimatedCost,
+				)
 		case "thinking":
-			parts[i] = color.YellowString("⋯ %s", s.ReviewerID)
+			elapsed := 0.0
+			if s.StartTime > 0 {
+				elapsed = float64(nowMillis-s.StartTime) / 1000.0
+			}
+			parts[i] = color.YellowString("⋯ %s", s.ReviewerID) +
+				color.HiBlackString(" (%.1fs)", elapsed)
 		default:
 			parts[i] = color.HiBlackString("○ %s", s.ReviewerID)
 		}
 	}
 	return fmt.Sprintf("Round %d: [%s]", round, strings.Join(parts, " | "))
+}
+
+func formatSummaryStatus(statuses []orchestrator.ReviewerStatus) string {
+	parts := make([]string, len(statuses))
+	nowMillis := time.Now().UnixMilli()
+	for i, s := range statuses {
+		switch s.Status {
+		case "done":
+			parts[i] = color.GreenString("✓ %s", s.ReviewerID) +
+				color.HiBlackString(" (%.1fs, %s/%s, ~$%.4f)",
+					s.Duration,
+					formatNumber(s.InputTokens),
+					formatNumber(s.OutputTokens),
+					s.EstimatedCost,
+				)
+		case "thinking":
+			elapsed := 0.0
+			if s.StartTime > 0 {
+				elapsed = float64(nowMillis-s.StartTime) / 1000.0
+			}
+			parts[i] = color.YellowString("⋯ %s", s.ReviewerID) +
+				color.HiBlackString(" (%.1fs)", elapsed)
+		default:
+			parts[i] = color.HiBlackString("○ %s", s.ReviewerID)
+		}
+	}
+	return fmt.Sprintf("Reviewer summaries: [%s]", strings.Join(parts, " | "))
+}
+
+func (d *Display) printReviewerHeader(reviewerID string) {
+	d.currentReviewer = reviewerID
+	if reviewerID == "analyzer" {
+		color.New(color.FgMagenta, color.Bold).Printf("\n%s\n", strings.Repeat("─", 50))
+		color.New(color.FgMagenta, color.Bold).Printf("  Analysis\n")
+		color.New(color.FgMagenta, color.Bold).Printf("%s\n\n", strings.Repeat("─", 50))
+		return
+	}
+	if reviewerID == "summarizer" {
+		color.New(color.FgGreen, color.Bold).Printf("\n%s\n", strings.Repeat("─", 50))
+		color.New(color.FgGreen, color.Bold).Printf("  Summary Synthesizer\n")
+		color.New(color.FgGreen, color.Bold).Printf("%s\n\n", strings.Repeat("─", 50))
+		return
+	}
+	if strings.HasPrefix(reviewerID, "summary:") {
+		summaryReviewer := strings.TrimPrefix(reviewerID, "summary:")
+		color.New(color.FgMagenta, color.Bold).Printf("\n┌─ Summary · %s\n", summaryReviewer)
+		color.Magenta("│")
+		return
+	}
+	color.New(color.FgCyan, color.Bold).Printf("\n┌─ %s ", reviewerID)
+	fmt.Printf("%s\n", color.HiBlackString("[Round %d/%d]", d.currentRound, d.maxRounds))
+	color.Cyan("│")
+}
+
+func (d *Display) printPhaseHeader(phaseLabel, title, phaseID string) {
+	if d.currentPhase == phaseID {
+		return
+	}
+	d.currentPhase = phaseID
+	d.currentReviewer = ""
+
+	fmt.Println()
+	color.New(color.FgHiBlack, color.Bold).Printf("  %s", phaseLabel)
+	if title != "" {
+		fmt.Printf("  %s\n", color.WhiteString(title))
+	} else {
+		fmt.Println()
+	}
+	color.HiBlack("  %s", strings.Repeat("─", 50))
 }
 
 // formatNumber 将整数格式化为带千分位逗号的字符串。

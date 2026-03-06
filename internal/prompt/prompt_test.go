@@ -72,11 +72,12 @@ func TestRender(t *testing.T) {
 
 	t.Run("renders structurize_delta with optional ledger summary", func(t *testing.T) {
 		result, err := Render("structurize_delta.tmpl", map[string]any{
-			"ReviewerID":    "r1",
-			"Round":         2,
-			"RoundContent":  "new round findings",
-			"LedgerSummary": "| ID | Severity | File:Line | Title |",
-			"Schema":        `{"type":"object"}`,
+			"ReviewerID":       "r1",
+			"Round":            2,
+			"RoundContent":     "new round findings",
+			"LedgerSummary":    "| ID | Severity | File:Line | Title |",
+			"CanonicalSummary": "| Canonical ID | Issue Refs |\n| c1 | claude:I1 |",
+			"Schema":           `{"type":"object"}`,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -92,6 +93,15 @@ func TestRender(t *testing.T) {
 		}
 		if !strings.Contains(result, "Previously tracked active issues") {
 			t.Error("missing ledger summary section")
+		}
+		if !strings.Contains(result, "Canonical issues already tracked across reviewers") {
+			t.Error("missing canonical summary section")
+		}
+		if !strings.Contains(result, `"support"`) {
+			t.Error("missing support instructions")
+		}
+		if !strings.Contains(result, "issueRef") {
+			t.Error("missing issueRef instructions")
 		}
 	})
 
@@ -115,6 +125,48 @@ func TestRender(t *testing.T) {
 		}
 		if !strings.Contains(result, "You are [claude]") {
 			t.Error("missing ReviewerID")
+		}
+		if !strings.Contains(result, "single uninterrupted audit") {
+			t.Error("missing proactive execution rule")
+		}
+		if !strings.Contains(result, "Confirmed by workspace cross-check") {
+			t.Error("missing evidence source labeling rule")
+		}
+	})
+
+	t.Run("renders reviewer_debate_session with no handoff rules", func(t *testing.T) {
+		result, err := Render("reviewer_debate_session.tmpl", map[string]any{
+			"ReviewerID": "codex",
+			"NewContent": "- reviewer-a: check auth\n",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(result, "Use it to increase coverage and verify contested points") {
+			t.Error("missing debate continuation rule")
+		}
+		if !strings.Contains(result, "Never end with an offer to continue investigating later") {
+			t.Error("missing no-handoff ending rule")
+		}
+	})
+
+	t.Run("renders reviewer_debate_full with no handoff rules", func(t *testing.T) {
+		result, err := Render("reviewer_debate_full.tmpl", map[string]any{
+			"TaskPrompt": "Review this PR",
+			"Analysis":   "analysis",
+			"ReviewerID": "claude",
+			"OtherLabel": "[codex]",
+			"PluralS":    "",
+			"OtherWord":  "is",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(result, "Treat this round as a continuation of the same uninterrupted audit") {
+			t.Error("missing full-context audit continuation rule")
+		}
+		if !strings.Contains(result, "Never end with an offer to continue investigating later") {
+			t.Error("missing full-context no-handoff ending rule")
 		}
 	})
 
@@ -152,6 +204,19 @@ func TestRender(t *testing.T) {
 		}
 		if !strings.Contains(result, "debate transcript here") {
 			t.Error("missing DebateText")
+		}
+		if !strings.Contains(result, "Do not offer optional follow-up investigation") {
+			t.Error("missing no-follow-up rule")
+		}
+	})
+
+	t.Run("renders reviewer_summary with no follow-up rule", func(t *testing.T) {
+		result, err := Render("reviewer_summary.tmpl", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(result, "Do not ask the user whether you should continue reviewing") {
+			t.Error("missing reviewer summary no-handoff rule")
 		}
 	})
 

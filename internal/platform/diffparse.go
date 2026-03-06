@@ -159,7 +159,7 @@ func FindNearestLine(diffLines map[int]bool, targetLine, maxDistance int) (int, 
 		if dist < 0 {
 			dist = -dist
 		}
-		if dist <= maxDistance && dist < bestDist {
+		if dist <= maxDistance && (dist < bestDist || (dist == bestDist && (bestLine == 0 || line < bestLine))) {
 			bestDist = dist
 			bestLine = line
 		}
@@ -266,7 +266,7 @@ func IsDuplicateComment(comment ReviewCommentInput, existing []ExistingComment) 
 	// 提取当前评论的 marker（如果有）
 	commentMarker := extractIssueMarker(comment.Body)
 
-	prefix := TruncStr(comment.Body, 100)
+	prefix := TruncStr(StripHydraMeta(comment.Body), 100)
 	for _, e := range existing {
 		// 方式一：marker 匹配（不要求 path/line 完全一致，因为 near-line 可能改变行号）
 		if commentMarker != "" {
@@ -285,23 +285,9 @@ func IsDuplicateComment(comment ReviewCommentInput, existing []ExistingComment) 
 		if comment.Line != nil && e.Line != nil && *comment.Line != *e.Line {
 			continue
 		}
-		if TruncStr(e.Body, 100) == prefix {
+		if TruncStr(StripHydraMeta(e.Body), 100) == prefix {
 			return true
 		}
 	}
 	return false
-}
-
-// extractIssueMarker 从评论 body 中提取 hydra issue marker。
-// 返回完整 marker 字符串（如 "<!-- hydra:issue:abcd1234 -->"），未找到返回空。
-func extractIssueMarker(body string) string {
-	idx := strings.Index(body, IssueMarkerPrefix)
-	if idx < 0 {
-		return ""
-	}
-	end := strings.Index(body[idx:], "-->")
-	if end < 0 {
-		return ""
-	}
-	return body[idx : idx+end+3]
 }

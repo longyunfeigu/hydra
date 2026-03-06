@@ -23,7 +23,7 @@ type reviewPlatform interface {
 const hydraSummaryMarker = reviewpost.HydraSummaryMarker
 
 // RunServerReview 执行 server 模式下的审查流程。
-func RunServerReview(ctx context.Context, event *MergeRequestEvent, plat reviewPlatform, runner *review.Runner, checkoutHost string, logger *slog.Logger) error {
+func RunServerReview(ctx context.Context, event *MergeRequestEvent, plat reviewPlatform, runner *review.Runner, checkoutHost string, diffExclude []string, logger *slog.Logger) error {
 	repo := event.Project.PathWithNamespace
 	mrID := fmt.Sprintf("%d", event.ObjectAttributes.IID)
 
@@ -33,8 +33,12 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent, plat reviewP
 		ID:   mrID,
 		Repo: repo,
 		URL:  event.ObjectAttributes.URL,
-	}, plat)
+	}, plat, diffExclude)
 	if err != nil {
+		if review.IsNoReviewableChanges(err) {
+			logger.Info("review skipped", "repo", repo, "mr", mrID, "reason", err.Error())
+			return nil
+		}
 		return err
 	}
 
@@ -53,7 +57,15 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent, plat reviewP
 		return fmt.Errorf("review failed: %w", err)
 	}
 
-	logger.Info("review completed", "repo", repo, "mr", mrID, "issues", len(result.ParsedIssues))
+	totalInput, totalOutput, totalCost := summarizeTokenUsage(result.TokenUsage)
+	logger.Info("review completed",
+		"repo", repo,
+		"mr", mrID,
+		"issues", len(result.ParsedIssues),
+		"input_tokens", totalInput,
+		"output_tokens", totalOutput,
+		"estimated_cost", totalCost,
+	)
 
 	if len(result.ParsedIssues) > 0 {
 		platIssues := convertIssuesToPlatform(result.ParsedIssues)
@@ -96,4 +108,13 @@ func upsertServerSummaryNote(plat platform.Named, mrID, repo, body string) error
 
 func supportsServerSummaryPosting(plat platform.Named) bool {
 	return reviewpost.SupportsSummaryPosting(plat)
+}
+
+func summarizeTokenUsage(usage []orchestrator.TokenUsage) (input int, output int, cost float64) {
+	for _, u := range usage {
+		input += u.InputTokens
+		output += u.OutputTokens
+		cost += u.EstimatedCost
+	}
+	return input, output, cost
 }

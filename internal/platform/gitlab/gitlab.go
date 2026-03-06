@@ -166,7 +166,7 @@ func (g *GitLabPlatform) GetInfo(mrID, repo string) (*platform.MRInfo, error) {
 	if repo != "" {
 		return g.getInfoViaAPI(mrID, repo)
 	}
-	out, err := g.glabCmd( "mr", "view", mrID, "--output", "json").Output()
+	out, err := g.glabCmd("mr", "view", mrID, "--output", "json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MR info: %w", err)
 	}
@@ -186,7 +186,7 @@ func (g *GitLabPlatform) GetInfo(mrID, repo string) (*platform.MRInfo, error) {
 // getInfoViaAPI 通过 glab api 获取 MR 信息（不需要 git 上下文）。
 func (g *GitLabPlatform) getInfoViaAPI(mrID, repo string) (*platform.MRInfo, error) {
 	encoded := encodeProject(repo)
-	out, err := g.glabCmd( "api",
+	out, err := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%s", encoded, mrID),
 	).Output()
 	if err != nil {
@@ -212,7 +212,7 @@ func (g *GitLabPlatform) GetHeadCommitInfo(mrID, repo string) (*platform.CommitI
 	if repo != "" {
 		return g.getHeadCommitInfoViaAPI(mrID, repo)
 	}
-	out, err := g.glabCmd( "mr", "view", mrID, "--output", "json").Output()
+	out, err := g.glabCmd("mr", "view", mrID, "--output", "json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MR commit info: %w", err)
 	}
@@ -222,7 +222,7 @@ func (g *GitLabPlatform) GetHeadCommitInfo(mrID, repo string) (*platform.CommitI
 // getHeadCommitInfoViaAPI 通过 glab api 获取 MR 提交信息（不需要 git 上下文）。
 func (g *GitLabPlatform) getHeadCommitInfoViaAPI(mrID, repo string) (*platform.CommitInfo, error) {
 	encoded := encodeProject(repo)
-	out, err := g.glabCmd( "api",
+	out, err := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%s", encoded, mrID),
 	).Output()
 	if err != nil {
@@ -265,7 +265,7 @@ func (g *GitLabPlatform) GetChangedFiles(mrID, repo string) ([]platform.DiffFile
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	out, err := g.glabCmd( "api",
+	out, err := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/diffs", encodedProject, mrID),
 	).Output()
 	if err != nil {
@@ -306,37 +306,77 @@ func (g *GitLabPlatform) GetExistingComments(mrID, repo string) []platform.Exist
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	out, err := g.glabCmd( "api",
+	out, err := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID),
 	).Output()
-	if err != nil {
-		return nil
-	}
-
-	var discussions []struct {
-		Notes []struct {
-			Body     string `json:"body"`
-			Position *struct {
-				NewPath string `json:"new_path"`
-				NewLine *int   `json:"new_line"`
-			} `json:"position"`
-		} `json:"notes"`
-	}
-	if err := json.Unmarshal(out, &discussions); err != nil {
-		return nil
-	}
-
 	var comments []platform.ExistingComment
-	for _, d := range discussions {
-		for _, note := range d.Notes {
-			c := platform.ExistingComment{Body: note.Body}
-			if note.Position != nil {
-				c.Path = note.Position.NewPath
-				c.Line = note.Position.NewLine
+	if err == nil {
+		var discussions []struct {
+			ID    string `json:"id"`
+			Notes []struct {
+				ID       int    `json:"id"`
+				Body     string `json:"body"`
+				Position *struct {
+					PositionType string `json:"position_type"`
+					NewPath      string `json:"new_path"`
+					NewLine      *int   `json:"new_line"`
+					OldLine      *int   `json:"old_line"`
+				} `json:"position"`
+			} `json:"notes"`
+		}
+		if json.Unmarshal(out, &discussions) == nil {
+			for _, d := range discussions {
+				for _, note := range d.Notes {
+					source := "global"
+					path := ""
+					var line *int
+					var oldLine *int
+					if note.Position != nil {
+						path = note.Position.NewPath
+						line = note.Position.NewLine
+						oldLine = note.Position.OldLine
+						source = "file"
+						if note.Position.PositionType == "text" || note.Position.NewLine != nil {
+							source = "inline"
+						}
+					}
+					comments = append(comments, newGitLabExistingComment(
+						fmt.Sprintf("%d", note.ID),
+						d.ID,
+						path,
+						line,
+						oldLine,
+						note.Body,
+						source,
+					))
+				}
 			}
-			comments = append(comments, c)
 		}
 	}
+
+	notesOut, err := g.glabCmd("api",
+		fmt.Sprintf("projects/%s/merge_requests/%s/notes", encodedProject, mrID),
+	).Output()
+	if err == nil {
+		var notes []struct {
+			ID   int    `json:"id"`
+			Body string `json:"body"`
+		}
+		if json.Unmarshal(notesOut, &notes) == nil {
+			for _, note := range notes {
+				comments = append(comments, newGitLabExistingComment(
+					fmt.Sprintf("%d", note.ID),
+					"",
+					"",
+					nil,
+					nil,
+					note.Body,
+					"global",
+				))
+			}
+		}
+	}
+
 	return comments
 }
 
@@ -355,7 +395,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 	if opts.Line != nil && opts.CommitInfo.HeadSHA != "" {
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
 		payload, _ := json.Marshal(map[string]interface{}{
-			"body": opts.Body,
+			"body":     opts.Body,
 			"position": buildTextPosition(opts.Path, *opts.Line, opts.OldLine, opts.CommitInfo),
 		})
 		out, err := g.glabPostJSON(endpoint, payload)
@@ -374,7 +414,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		}
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
 		payload, _ := json.Marshal(map[string]interface{}{
-			"body": lineRef + opts.Body,
+			"body":     lineRef + opts.Body,
 			"position": buildFilePosition(opts.Path, opts.CommitInfo),
 		})
 		out, err := g.glabPostJSON(endpoint, payload)
@@ -393,7 +433,7 @@ func (g *GitLabPlatform) PostComment(mrID string, opts platform.PostCommentOpts)
 		}
 		body := location + opts.Body
 
-		cmd := g.glabCmd( "mr", "note", mrID, "--unique", "--message", body)
+		cmd := g.glabCmd("mr", "note", mrID, "--unique", "--message", body)
 		if err := cmd.Run(); err != nil {
 			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
 		}
@@ -527,7 +567,7 @@ func (g *GitLabPlatform) PostReview(mrID string, classified []platform.Classifie
 		}
 		body := location + cc.Input.Body
 
-		cmd := g.glabCmd( "mr", "note", mrID, "--unique", "--message", body)
+		cmd := g.glabCmd("mr", "note", mrID, "--unique", "--message", body)
 		if err := cmd.Run(); err == nil {
 			result.Posted++
 			result.Global++
@@ -552,7 +592,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 			return false
 		}
 		payload, _ := json.Marshal(map[string]interface{}{
-			"note": cc.Input.Body,
+			"note":     cc.Input.Body,
 			"position": buildTextPosition(cc.Input.Path, *cc.Input.Line, cc.OldLine, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
@@ -574,7 +614,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 			lineRef = fmt.Sprintf("**Line %d:**\n\n", *cc.Input.Line)
 		}
 		payload, _ := json.Marshal(map[string]interface{}{
-			"note": lineRef + cc.Input.Body,
+			"note":     lineRef + cc.Input.Body,
 			"position": buildFilePosition(cc.Input.Path, commitInfo),
 		})
 		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes", encodedProject, mrID)
@@ -596,7 +636,7 @@ func (g *GitLabPlatform) tryDraftNotes(encodedProject, mrID string, commitInfo p
 		return false
 	}
 
-	cmd := g.glabCmd( "api",
+	cmd := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%s/draft_notes/bulk_publish", encodedProject, mrID),
 		"--method", "POST",
 	)
@@ -623,11 +663,12 @@ func (g *GitLabPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 	if err != nil {
 		return platform.ReviewResult{Failed: len(issues)}
 	}
+	runID := platform.NewLifecycleRunID(commitInfo.HeadSHA)
 	util.Debugf("PostIssuesAsComments: commitInfo head=%s base=%s start=%s", commitInfo.HeadSHA, commitInfo.BaseSHA, commitInfo.StartSHA)
 
 	comments := make([]platform.ReviewCommentInput, 0, len(issues))
 	for _, issue := range issues {
-		body := platform.FormatIssueBody(issue)
+		body := platform.FormatIssueBodyWithMeta(issue, runID, commitInfo.HeadSHA)
 		comments = append(comments, platform.ReviewCommentInput{
 			Path: issue.File,
 			Line: issue.Line,
@@ -672,7 +713,10 @@ func (g *GitLabPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 		}
 		util.Debugf("  classified: path=%q line=%s mode=%s", cc.Input.Path, lineStr, cc.Mode)
 	}
-	return g.PostReview(mrID, classified, *commitInfo, repo)
+	desired := platform.BuildDesiredComments(classified, runID, commitInfo.HeadSHA)
+	existing := g.GetExistingComments(mrID, repo)
+	plan := platform.PlanLifecycle(existing, desired)
+	return g.applyLifecyclePlan(mrID, repo, *commitInfo, existing, plan, runID)
 }
 
 // PostNote 在 MR 上发布一条全局 note（评论）。
@@ -701,7 +745,7 @@ func (g *GitLabPlatform) UpsertSummaryNote(mrID, repo, marker, body string) erro
 	encoded := encodeProject(resolvedRepo)
 
 	listEndpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes", encoded, mrID)
-	out, err := g.glabCmd( "api", listEndpoint).Output()
+	out, err := g.glabCmd("api", listEndpoint).Output()
 	if err != nil {
 		return fmt.Errorf("failed to list MR notes: %w", err)
 	}
@@ -728,6 +772,157 @@ func (g *GitLabPlatform) UpsertSummaryNote(mrID, repo, marker, body string) erro
 	return g.PostNote(mrID, repo, body)
 }
 
+func newGitLabExistingComment(id, threadID, path string, line, oldLine *int, body, source string) platform.ExistingComment {
+	meta, _ := platform.ParseHydraMeta(body)
+	return platform.ExistingComment{
+		ID:       id,
+		ThreadID: threadID,
+		Path:     path,
+		Line:     line,
+		OldLine:  oldLine,
+		Body:     body,
+		Source:   source,
+		IsHydra:  platform.IsHydraCommentBody(body),
+		Meta:     meta,
+	}
+}
+
+func (g *GitLabPlatform) applyLifecyclePlan(mrID, repo string, commitInfo platform.CommitInfo, existing []platform.ExistingComment, plan platform.LifecyclePlan, runID string) platform.ReviewResult {
+	var result platform.ReviewResult
+	result.Unchanged = len(plan.Noop)
+	result.Skipped += len(plan.Noop)
+
+	for _, item := range plan.Resolve {
+		if err := g.updateExistingComment(mrID, repo, item.Existing, platform.RenderResolvedBody(item.Existing, runID, commitInfo.HeadSHA)); err != nil {
+			result.Failed++
+		} else {
+			result.Resolved++
+		}
+	}
+
+	for _, item := range plan.Supersede {
+		if err := g.updateExistingComment(mrID, repo, item.Existing, platform.RenderSupersededBody(item.Existing, item.Desired, runID, commitInfo.HeadSHA)); err != nil {
+			result.Failed++
+		} else {
+			result.Superseded++
+		}
+	}
+
+	for _, item := range plan.Update {
+		if err := g.updateExistingComment(mrID, repo, item.Existing, item.Desired.Body); err != nil {
+			result.Failed++
+		} else {
+			result.Updated++
+		}
+	}
+
+	for _, item := range plan.Create {
+		duplicateCandidates := platform.DuplicateCandidates(existing, item.IssueKey)
+		if platform.IsDuplicateComment(platform.ReviewCommentInput{Path: item.Path, Line: item.Line, Body: item.Body}, duplicateCandidates) {
+			result.Skipped++
+			continue
+		}
+		cr := g.createDesiredComment(mrID, repo, commitInfo, item)
+		if !cr.Success {
+			result.Failed++
+			continue
+		}
+		result.Posted++
+		switch cr.Mode {
+		case "inline":
+			result.Inline++
+		case "file":
+			result.FileLevel++
+		default:
+			result.Global++
+		}
+
+		meta, _ := platform.ParseHydraMeta(item.Body)
+		existing = append(existing, platform.ExistingComment{
+			Path:    item.Path,
+			Line:    item.Line,
+			OldLine: item.OldLine,
+			Body:    item.Body,
+			Source:  item.Source,
+			IsHydra: true,
+			Meta:    meta,
+		})
+	}
+
+	return result
+}
+
+func (g *GitLabPlatform) createDesiredComment(mrID, repo string, commitInfo platform.CommitInfo, desired platform.DesiredComment) platform.CommentResult {
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return platform.CommentResult{Success: false, Error: err.Error()}
+	}
+	encodedProject := encodeProject(resolvedRepo)
+
+	switch desired.Source {
+	case "inline":
+		if desired.Line == nil {
+			return platform.CommentResult{Success: false, Error: "inline comment missing line"}
+		}
+		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"body":     desired.Body,
+			"position": buildTextPosition(desired.Path, *desired.Line, desired.OldLine, commitInfo),
+		})
+		if _, err := g.glabPostJSON(endpoint, payload); err != nil {
+			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
+		}
+		return platform.CommentResult{Success: true, Inline: true, Mode: "inline"}
+	case "file":
+		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions", encodedProject, mrID)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"body":     desired.Body,
+			"position": buildFilePosition(desired.Path, commitInfo),
+		})
+		if _, err := g.glabPostJSON(endpoint, payload); err != nil {
+			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
+		}
+		return platform.CommentResult{Success: true, Inline: false, Mode: "file"}
+	default:
+		payload, _ := json.Marshal(map[string]string{"body": desired.Body})
+		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes", encodedProject, mrID)
+		if _, err := g.glabPostJSON(endpoint, payload); err != nil {
+			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
+		}
+		return platform.CommentResult{Success: true, Inline: false, Mode: "global"}
+	}
+}
+
+func (g *GitLabPlatform) updateExistingComment(mrID, repo string, existing platform.ExistingComment, body string) error {
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return err
+	}
+	encoded := encodeProject(resolvedRepo)
+	payload, _ := json.Marshal(map[string]string{"body": body})
+
+	switch existing.Source {
+	case "inline", "file":
+		if existing.ThreadID == "" || existing.ID == "" {
+			return fmt.Errorf("missing discussion or note id")
+		}
+		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/discussions/%s/notes/%s", encoded, mrID, existing.ThreadID, existing.ID)
+		if _, err := g.glabPutJSON(endpoint, payload); err != nil {
+			return fmt.Errorf("failed to update discussion note: %w", err)
+		}
+	default:
+		if existing.ID == "" {
+			return fmt.Errorf("missing note id")
+		}
+		endpoint := fmt.Sprintf("projects/%s/merge_requests/%s/notes/%s", encoded, mrID, existing.ID)
+		if _, err := g.glabPutJSON(endpoint, payload); err != nil {
+			return fmt.Errorf("failed to update merge request note: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // GetMRDetails 获取单个 MR 的详细信息，用于历史关联。
 func (g *GitLabPlatform) GetMRDetails(mrNumber int, cwd string) (*platform.MRDetail, error) {
 	resolvedRepo, err := g.resolveRepo("")
@@ -736,7 +931,7 @@ func (g *GitLabPlatform) GetMRDetails(mrNumber int, cwd string) (*platform.MRDet
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	cmd := g.glabCmd( "api",
+	cmd := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%d", encodedProject, mrNumber),
 	)
 	cmd.Dir = cwd
@@ -758,7 +953,7 @@ func (g *GitLabPlatform) GetMRDetails(mrNumber int, cwd string) (*platform.MRDet
 	}
 
 	// 获取 MR 变更的文件列表
-	changesOut, err := g.glabCmd( "api",
+	changesOut, err := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/merge_requests/%d/diffs", encodedProject, mrNumber),
 	).Output()
 
@@ -791,7 +986,7 @@ func (g *GitLabPlatform) GetMRsForCommit(commitSHA string, cwd string) ([]int, e
 	}
 	encodedProject := encodeProject(resolvedRepo)
 
-	cmd := g.glabCmd( "api",
+	cmd := g.glabCmd("api",
 		fmt.Sprintf("projects/%s/repository/commits/%s/merge_requests", encodedProject, commitSHA),
 	)
 	cmd.Dir = cwd

@@ -230,7 +230,10 @@ func TestValidateJSON_IssuesDelta_Valid(t *testing.T) {
 	json := `{
 		"add": [{"severity":"high","file":"a.go","title":"T","description":"D"}],
 		"retract": ["I1"],
-		"update": [{"id":"I2","severity":"medium","description":"updated"}]
+		"update": [{"id":"I2","severity":"medium","description":"updated"}],
+		"support": [{"issueRef":"claude:I3"}],
+		"withdraw": [{"issueRef":"gpt4o:I4"}],
+		"contest": [{"issueRef":"codex:I5"}]
 	}`
 	result := ValidateJSON("issues_delta", json)
 	if !result.Valid {
@@ -239,9 +242,17 @@ func TestValidateJSON_IssuesDelta_Valid(t *testing.T) {
 }
 
 func TestValidateJSON_IssuesDelta_Invalid(t *testing.T) {
-	json := `{"add":[{"file":"a.go","title":"T","description":"D"}],"retract":[],"update":[]}`
+	json := `{"add":[{"file":"a.go","title":"T","description":"D"}],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}`
 	result := ValidateJSON("issues_delta", json)
 	if result.Valid {
 		t.Error("expected invalid issues_delta JSON when severity is missing")
+	}
+}
+
+func TestValidateJSON_IssuesDelta_MissingCanonicalKeys(t *testing.T) {
+	json := `{"add":[],"retract":[],"update":[]}`
+	result := ValidateJSON("issues_delta", json)
+	if result.Valid {
+		t.Error("expected invalid issues_delta JSON when support/withdraw/contest keys are missing")
 	}
 }

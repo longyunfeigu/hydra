@@ -49,6 +49,7 @@ type DebateOrchestrator struct {
 	taskPrompt          string
 	lastSeenIndex       map[string]int
 	issueLedgers        map[string]*IssueLedger
+	canonicalSignals    []CanonicalSignal
 }
 
 // debateRun 保存单次 review 执行期的可变状态。
@@ -61,6 +62,7 @@ type debateRun struct {
 	taskPrompt          string                 // 原始任务提示词（包含diff等）
 	lastSeenIndex       map[string]int         // 每个审查者最后看到的消息索引
 	issueLedgers        map[string]*IssueLedger
+	canonicalSignals    []CanonicalSignal
 
 	mu sync.Mutex // 保护tokenUsage的并发访问锁
 }
@@ -106,6 +108,7 @@ func (o *DebateOrchestrator) legacyRun() *debateRun {
 		taskPrompt:          o.taskPrompt,
 		lastSeenIndex:       lastSeen,
 		issueLedgers:        o.issueLedgers,
+		canonicalSignals:    o.canonicalSignals,
 	}
 }
 
@@ -117,6 +120,7 @@ func (o *DebateOrchestrator) syncLegacyRun(run *debateRun) {
 	o.taskPrompt = run.taskPrompt
 	o.lastSeenIndex = run.lastSeenIndex
 	o.issueLedgers = run.issueLedgers
+	o.canonicalSignals = run.canonicalSignals
 }
 
 // RunStreaming 执行完整的辩论循环，支持并行审查者执行和流式输出。
@@ -157,9 +161,9 @@ func (o *DebateOrchestrator) checkConvergence(ctx context.Context, display Displ
 	return converged, err
 }
 
-func (o *DebateOrchestrator) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
+func (o *DebateOrchestrator) collectSummaries(ctx context.Context, display DisplayCallbacks) ([]DebateSummary, error) {
 	run := o.legacyRun()
-	summaries, err := run.collectSummaries(ctx)
+	summaries, err := run.collectSummaries(ctx, display)
 	o.syncLegacyRun(run)
 	return summaries, err
 }
@@ -242,12 +246,13 @@ func (o *debateRun) runAnalysisPhase(ctx context.Context, label, prompt string, 
 		var sb strings.Builder
 		for chunk := range ch {
 			sb.WriteString(chunk)
-			display.OnMessage("analyzer", chunk)
+			display.OnMessageChunk("analyzer", chunk)
 		}
 		if err := <-errCh; err != nil {
 			return fmt.Errorf("analyzer failed: %w", err)
 		}
 		o.analysis = sb.String()
+		display.OnMessage("analyzer", o.analysis)
 		o.trackTokens("analyzer", prompt+o.analyzer.SystemPrompt, o.analysis)
 		return nil
 	})
@@ -313,14 +318,24 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 	// 在执行前为所有审查者构建消息（快照，确保所有审查者看到相同的信息）
 	// 这样避免了先执行的审查者的输出影响后执行审查者的输入
 	type reviewerTask struct {
-		reviewer Reviewer
-		messages []provider.Message
+		reviewer    Reviewer
+		messages    []provider.Message
+		inputText   string
+		inputTokens int
 	}
 	tasks := make([]reviewerTask, len(o.reviewers))
 	for i, r := range o.reviewers {
+		messages := o.buildMessages(r.ID)
+		var inputParts []string
+		for _, m := range messages {
+			inputParts = append(inputParts, m.Content)
+		}
+		inputText := strings.Join(inputParts, "\n") + r.SystemPrompt
 		tasks[i] = reviewerTask{
-			reviewer: r,
-			messages: o.buildMessages(r.ID),
+			reviewer:    r,
+			messages:    messages,
+			inputText:   inputText,
+			inputTokens: estimateTokens(inputText),
 		}
 	}
 
@@ -353,9 +368,10 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 			startTime := time.Now().UnixMilli()
 			statusesMu.Lock()
 			statuses[i] = ReviewerStatus{
-				ReviewerID: task.reviewer.ID,
-				Status:     "thinking",
-				StartTime:  startTime,
+				ReviewerID:  task.reviewer.ID,
+				Status:      "thinking",
+				StartTime:   startTime,
+				InputTokens: task.inputTokens,
 			}
 			statusSnapshot := copyStatuses(statuses)
 			statusesMu.Unlock()
@@ -366,35 +382,36 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 			var sb strings.Builder
 			for chunk := range ch {
 				sb.WriteString(chunk)
+				display.OnMessageChunk(task.reviewer.ID, chunk)
 			}
 			if err := <-errCh; err != nil {
 				return fmt.Errorf("reviewer %s failed: %w", task.reviewer.ID, err)
 			}
 
+			fullResponse := sb.String()
+			outputTokens := estimateTokens(fullResponse)
+
 			// 标记审查者状态为"已完成"，记录结束时间和耗时
 			endTime := time.Now().UnixMilli()
 			statusesMu.Lock()
 			statuses[i] = ReviewerStatus{
-				ReviewerID: task.reviewer.ID,
-				Status:     "done",
-				StartTime:  startTime,
-				EndTime:    endTime,
-				Duration:   float64(endTime-startTime) / 1000.0,
+				ReviewerID:    task.reviewer.ID,
+				Status:        "done",
+				StartTime:     startTime,
+				EndTime:       endTime,
+				Duration:      float64(endTime-startTime) / 1000.0,
+				InputTokens:   task.inputTokens,
+				OutputTokens:  outputTokens,
+				EstimatedCost: float64(task.inputTokens+outputTokens) * 0.00001,
 			}
 			statusSnapshot = copyStatuses(statuses)
 			statusesMu.Unlock()
 			display.OnParallelStatus(round, statusSnapshot)
 
-			var inputParts []string
-			for _, m := range task.messages {
-				inputParts = append(inputParts, m.Content)
-			}
-			inputText := strings.Join(inputParts, "\n") + task.reviewer.SystemPrompt
-
 			results[i] = roundResult{
 				reviewer:     task.reviewer,
-				fullResponse: sb.String(),
-				inputText:    inputText,
+				fullResponse: fullResponse,
+				inputText:    task.inputText,
 			}
 			return nil
 		})
@@ -410,6 +427,7 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 		o.trackTokens(r.reviewer.ID, r.inputText, r.fullResponse)
 		o.conversationHistory = append(o.conversationHistory, DebateMessage{
 			ReviewerID: r.reviewer.ID,
+			Round:      round,
 			Content:    r.fullResponse,
 			Timestamp:  time.Now(),
 		})
@@ -427,8 +445,8 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 // runSummaryPhase 收集审查者总结，生成最终结论和结构化问题列表。
 func (o *debateRun) runSummaryPhase(ctx context.Context, label string, display DisplayCallbacks, convergedAtRound *int) (*DebateResult, error) {
 	// 辩论结束后，收集每个审查者的最终总结，然后由总结器生成统一结论
-	display.OnWaiting("summarizer")
-	summaries, err := o.collectSummaries(ctx)
+	display.OnWaiting("reviewer-summaries")
+	summaries, err := o.collectSummaries(ctx, display)
 	if err != nil {
 		return nil, fmt.Errorf("collecting summaries: %w", err)
 	}
@@ -444,31 +462,19 @@ func (o *debateRun) runSummaryPhase(ctx context.Context, label string, display D
 		parsedIssues    []MergedIssue
 	)
 
+	display.OnWaiting("final-conclusion")
 	if o.useLedgerStructurize() {
-		var err error
-		finalConclusion, err = o.getFinalConclusion(ctx, summaries)
+		finalConclusion, err = o.getFinalConclusion(ctx, summaries, display)
 		if err != nil {
 			return nil, fmt.Errorf("final conclusion: %w", err)
 		}
 		parsedIssues = o.structurizeIssuesFromLedgers(ctx, display)
 	} else {
-		// getFinalConclusion（依赖 summaries）和 structurizeIssues（只读 conversationHistory）并行执行
-		g3, g3ctx := errgroup.WithContext(ctx)
-		g3.Go(func() error {
-			var err error
-			finalConclusion, err = o.getFinalConclusion(g3ctx, summaries)
-			if err != nil {
-				return fmt.Errorf("final conclusion: %w", err)
-			}
-			return nil
-		})
-		g3.Go(func() error {
-			parsedIssues = o.structurizeIssuesLegacy(g3ctx, display)
-			return nil
-		})
-		if err := g3.Wait(); err != nil {
-			return nil, err
+		finalConclusion, err = o.getFinalConclusion(ctx, summaries, display)
+		if err != nil {
+			return nil, fmt.Errorf("final conclusion: %w", err)
 		}
+		parsedIssues = o.structurizeIssuesLegacy(ctx, display)
 	}
 
 	return &DebateResult{
@@ -501,6 +507,7 @@ func (o *debateRun) extractRoundIssueDeltas(ctx context.Context, round int, roun
 	}
 
 	display.OnWaiting("structurizer")
+	currentCanonicalSummary := BuildCanonicalIssueSummary(o.currentCanonicalIssues())
 
 	g, gctx := errgroup.WithContext(ctx)
 	for _, reviewer := range o.reviewers {
@@ -512,12 +519,13 @@ func (o *debateRun) extractRoundIssueDeltas(ctx context.Context, round int, roun
 		}
 
 		g.Go(func() error {
-			delta, err := o.extractIssueDelta(gctx, reviewerID, round, roundContent, ledger.BuildSummary())
+			delta, err := o.extractIssueDelta(gctx, reviewerID, round, roundContent, ledger.BuildSummary(), currentCanonicalSummary)
 			if err != nil {
 				util.Warnf("extractRoundIssueDeltas: reviewer %s round %d skipped: %v", reviewerID, round, err)
 				return nil
 			}
 			ledger.ApplyDelta(delta, round)
+			o.applyCanonicalActions(reviewerID, round, delta)
 			return nil
 		})
 	}
@@ -527,15 +535,16 @@ func (o *debateRun) extractRoundIssueDeltas(ctx context.Context, round int, roun
 	}
 }
 
-func (o *debateRun) extractIssueDelta(ctx context.Context, reviewerID string, round int, roundContent, ledgerSummary string) (*StructurizeDelta, error) {
+func (o *debateRun) extractIssueDelta(ctx context.Context, reviewerID string, round int, roundContent, ledgerSummary, canonicalSummary string) (*StructurizeDelta, error) {
 	deltaSchema := schema.GetSchemaString("issues_delta")
 	basePrompt := prompt.MustRender("structurize_delta.tmpl", map[string]any{
-		"ReviewerID":    reviewerID,
-		"Round":         round,
-		"RoundContent":  roundContent,
-		"LedgerSummary": ledgerSummary,
-		"Schema":        deltaSchema,
-		"Language":      o.options.Language,
+		"ReviewerID":       reviewerID,
+		"Round":            round,
+		"RoundContent":     roundContent,
+		"LedgerSummary":    ledgerSummary,
+		"CanonicalSummary": canonicalSummary,
+		"Schema":           deltaSchema,
+		"Language":         o.options.Language,
 	})
 	systemPrompt := prompt.MustRender("structurize_delta_system.tmpl", nil)
 
@@ -575,9 +584,9 @@ func (o *debateRun) extractIssueDelta(ctx context.Context, reviewerID string, ro
 }
 
 func (o *debateRun) structurizeIssuesFromLedgers(ctx context.Context, display DisplayCallbacks) []MergedIssue {
-	allIssues := o.mergeAllLedgers()
+	allIssues := o.collectCanonicalInputsFromLedgers()
 	if len(allIssues) > 0 {
-		return DeduplicateMergedIssues(allIssues)
+		return ApplyCanonicalSignals(CanonicalizeMergedIssues(allIssues), o.canonicalSignals)
 	}
 
 	// 兜底：当增量提取全失败时，回退到 legacy 一次性提取。
@@ -603,6 +612,93 @@ func (o *debateRun) mergeAllLedgers() []MergedIssue {
 		merged = append(merged, o.issueLedgers[reviewerID].ToMergedIssues()...)
 	}
 	return merged
+}
+
+func (o *debateRun) collectCanonicalInputsFromLedgers() []MergedIssue {
+	if len(o.issueLedgers) == 0 {
+		return nil
+	}
+	reviewerIDs := make([]string, 0, len(o.issueLedgers))
+	for reviewerID := range o.issueLedgers {
+		reviewerIDs = append(reviewerIDs, reviewerID)
+	}
+	sort.Strings(reviewerIDs)
+
+	var merged []MergedIssue
+	for _, reviewerID := range reviewerIDs {
+		merged = append(merged, o.issueLedgers[reviewerID].ToCanonicalInputs()...)
+	}
+	return merged
+}
+
+func (o *debateRun) currentCanonicalIssues() []MergedIssue {
+	return ApplyCanonicalSignals(CanonicalizeMergedIssues(o.collectCanonicalInputsFromLedgers()), o.canonicalSignals)
+}
+
+func (o *debateRun) applyCanonicalActions(reviewerID string, round int, delta *StructurizeDelta) {
+	if delta == nil {
+		return
+	}
+	seen := make(map[string]struct{}, len(delta.Support)+len(delta.Withdraw)+len(delta.Contest))
+	actions := make([]CanonicalSignal, 0, len(delta.Support)+len(delta.Withdraw)+len(delta.Contest))
+	for _, item := range delta.Support {
+		ref := strings.TrimSpace(item.IssueRef)
+		if ref == "" {
+			continue
+		}
+		key := "support|" + ref
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		actions = append(actions, CanonicalSignal{
+			ReviewerID: reviewerID,
+			IssueRef:   ref,
+			Round:      round,
+			Action:     "support",
+		})
+	}
+	for _, item := range delta.Withdraw {
+		ref := strings.TrimSpace(item.IssueRef)
+		if ref == "" {
+			continue
+		}
+		key := "withdraw|" + ref
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		actions = append(actions, CanonicalSignal{
+			ReviewerID: reviewerID,
+			IssueRef:   ref,
+			Round:      round,
+			Action:     "withdraw",
+		})
+	}
+	for _, item := range delta.Contest {
+		ref := strings.TrimSpace(item.IssueRef)
+		if ref == "" {
+			continue
+		}
+		key := "contest|" + ref
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		actions = append(actions, CanonicalSignal{
+			ReviewerID: reviewerID,
+			IssueRef:   ref,
+			Round:      round,
+			Action:     "contest",
+		})
+	}
+	if len(actions) == 0 {
+		return
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.canonicalSignals = append(o.canonicalSignals, actions...)
 }
 
 func (o *debateRun) hasReviewerMessages() bool {
@@ -896,11 +992,26 @@ func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbac
 
 // collectSummaries 并行请求每个审查者提供最终总结。
 // 在辩论结束后，每个审查者总结自己的核心观点和结论，不透露身份。
-func (o *debateRun) collectSummaries(ctx context.Context) ([]DebateSummary, error) {
+func (o *debateRun) collectSummaries(ctx context.Context, display DisplayCallbacks) ([]DebateSummary, error) {
 	// 预分配结果切片，每个 goroutine 写入自己的索引位置，无需加锁
 	summaries := make([]DebateSummary, len(o.reviewers))
+	statuses := make([]ReviewerStatus, len(o.reviewers))
+	var statusesMu sync.Mutex
+	for i, reviewer := range o.reviewers {
+		statuses[i] = ReviewerStatus{
+			ReviewerID: reviewer.ID,
+			Status:     "pending",
+		}
+	}
 
 	g, gctx := errgroup.WithContext(ctx)
+	displayStatuses := func() {
+		statusesMu.Lock()
+		snapshot := copyStatuses(statuses)
+		statusesMu.Unlock()
+		display.OnSummaryStatus(snapshot)
+	}
+	displayStatuses()
 	for i, reviewer := range o.reviewers {
 		i, reviewer := i, reviewer
 		g.Go(func() error {
@@ -928,16 +1039,54 @@ func (o *debateRun) collectSummaries(ctx context.Context) ([]DebateSummary, erro
 				messages = append(messages, provider.Message{Role: "user", Content: summaryPrompt})
 			}
 
-			summary, err := reviewer.Provider.Chat(gctx, messages, reviewer.SystemPrompt, nil)
-			if err != nil {
-				return fmt.Errorf("summary from %s: %w", reviewer.ID, err)
-			}
-
 			var inputParts []string
 			for _, m := range messages {
 				inputParts = append(inputParts, m.Content)
 			}
-			o.trackTokens(reviewer.ID, strings.Join(inputParts, "\n")+reviewer.SystemPrompt, summary)
+			inputText := strings.Join(inputParts, "\n") + reviewer.SystemPrompt
+			inputTokens := estimateTokens(inputText)
+
+			startTime := time.Now().UnixMilli()
+			statusesMu.Lock()
+			statuses[i] = ReviewerStatus{
+				ReviewerID:  reviewer.ID,
+				Status:      "thinking",
+				StartTime:   startTime,
+				InputTokens: inputTokens,
+			}
+			statusesMu.Unlock()
+			displayStatuses()
+
+			ch, errCh := reviewer.Provider.ChatStream(gctx, messages, reviewer.SystemPrompt)
+			var sb strings.Builder
+			for chunk := range ch {
+				sb.WriteString(chunk)
+				display.OnMessageChunk("summary:"+reviewer.ID, chunk)
+			}
+			if err := <-errCh; err != nil {
+				return fmt.Errorf("summary from %s: %w", reviewer.ID, err)
+			}
+
+			summary := sb.String()
+			display.OnMessage("summary:"+reviewer.ID, summary)
+
+			outputTokens := estimateTokens(summary)
+			endTime := time.Now().UnixMilli()
+			statusesMu.Lock()
+			statuses[i] = ReviewerStatus{
+				ReviewerID:    reviewer.ID,
+				Status:        "done",
+				StartTime:     startTime,
+				EndTime:       endTime,
+				Duration:      float64(endTime-startTime) / 1000.0,
+				InputTokens:   inputTokens,
+				OutputTokens:  outputTokens,
+				EstimatedCost: float64(inputTokens+outputTokens) * 0.00001,
+			}
+			statusesMu.Unlock()
+			displayStatuses()
+
+			o.trackTokens(reviewer.ID, inputText, summary)
 
 			summaries[i] = DebateSummary{
 				ReviewerID: reviewer.ID,
@@ -955,7 +1104,7 @@ func (o *debateRun) collectSummaries(ctx context.Context) ([]DebateSummary, erro
 
 // getFinalConclusion 请求总结器根据所有审查者的匿名总结生成最终结论。
 // 最终结论包含：共识点、分歧点分析、以及推荐的行动项。
-func (o *debateRun) getFinalConclusion(ctx context.Context, summaries []DebateSummary) (string, error) {
+func (o *debateRun) getFinalConclusion(ctx context.Context, summaries []DebateSummary, display DisplayCallbacks) (string, error) {
 	var parts []string
 	for i, s := range summaries {
 		parts = append(parts, fmt.Sprintf("Reviewer %d:\n%s", i+1, s.Summary))
@@ -971,10 +1120,18 @@ func (o *debateRun) getFinalConclusion(ctx context.Context, summaries []DebateSu
 	})
 
 	msgs := []provider.Message{{Role: "user", Content: conclusionPrompt}}
-	response, err := o.summarizer.Provider.Chat(ctx, msgs, o.summarizer.SystemPrompt, nil)
-	if err != nil {
+	ch, errCh := o.summarizer.Provider.ChatStream(ctx, msgs, o.summarizer.SystemPrompt)
+	var sb strings.Builder
+	for chunk := range ch {
+		sb.WriteString(chunk)
+		display.OnMessageChunk("summarizer", chunk)
+	}
+	if err := <-errCh; err != nil {
 		return "", err
 	}
+
+	response := sb.String()
+	display.OnMessage("summarizer", response)
 
 	o.trackTokens("summarizer", conclusionPrompt+o.summarizer.SystemPrompt, response)
 	return response, nil
@@ -1127,14 +1284,26 @@ func (o *debateRun) structurizeIssues(ctx context.Context, display DisplayCallba
 func issuesToMerged(issues []ReviewIssue) []MergedIssue {
 	result := make([]MergedIssue, 0, len(issues))
 	for _, issue := range issues {
-		raisedBy := issue.ClaimedBy
-		if len(raisedBy) == 0 {
-			raisedBy = []string{"summarizer"}
+		supportedBy := uniqueSorted(issue.ClaimedBy)
+		if len(supportedBy) == 0 {
+			supportedBy = []string{"summarizer"}
 		}
 		result = append(result, MergedIssue{
 			ReviewIssue:  issue,
-			RaisedBy:     raisedBy,
+			RaisedBy:     supportedBy,
+			IntroducedBy: append([]string(nil), supportedBy...),
+			SupportedBy:  append([]string(nil), supportedBy...),
 			Descriptions: []string{issue.Description},
+			Mentions: func() []IssueMention {
+				mentions := make([]IssueMention, 0, len(supportedBy))
+				for _, reviewerID := range supportedBy {
+					mentions = append(mentions, IssueMention{
+						ReviewerID: reviewerID,
+						Status:     "active",
+					})
+				}
+				return mentions
+			}(),
 		})
 	}
 	return result

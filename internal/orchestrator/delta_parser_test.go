@@ -6,7 +6,10 @@ func TestParseStructurizeDelta(t *testing.T) {
 	resp := "```json\n" + `{
   "add": [{"severity":"high","file":"a.go","line":10,"title":"A","description":"desc"}],
   "retract": ["I1"],
-  "update": [{"id":"I2","severity":"medium","description":"updated"}]
+  "update": [{"id":"I2","severity":"medium","description":"updated"}],
+  "support": [{"issueRef":"claude:I3"}],
+  "withdraw": [{"issueRef":"gpt4o:I4"}],
+  "contest": [{"issueRef":"codex:I5"}]
 }` + "\n```"
 
 	parsed := ParseStructurizeDelta(resp)
@@ -31,10 +34,19 @@ func TestParseStructurizeDelta(t *testing.T) {
 	if parsed.Output.Update[0].Severity == nil || *parsed.Output.Update[0].Severity != "medium" {
 		t.Fatalf("unexpected update severity: %+v", parsed.Output.Update[0].Severity)
 	}
+	if len(parsed.Output.Support) != 1 || parsed.Output.Support[0].IssueRef != "claude:I3" {
+		t.Fatalf("unexpected support: %+v", parsed.Output.Support)
+	}
+	if len(parsed.Output.Withdraw) != 1 || parsed.Output.Withdraw[0].IssueRef != "gpt4o:I4" {
+		t.Fatalf("unexpected withdraw: %+v", parsed.Output.Withdraw)
+	}
+	if len(parsed.Output.Contest) != 1 || parsed.Output.Contest[0].IssueRef != "codex:I5" {
+		t.Fatalf("unexpected contest: %+v", parsed.Output.Contest)
+	}
 }
 
 func TestParseStructurizeDelta_Invalid(t *testing.T) {
-	resp := "```json\n" + `{"add":[{"file":"a.go","title":"A","description":"desc"}],"retract":[],"update":[]}` + "\n```"
+	resp := "```json\n" + `{"add":[{"file":"a.go","title":"A","description":"desc"}],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```"
 	parsed := ParseStructurizeDelta(resp)
 	if parsed.Output == nil {
 		t.Fatal("expected output even when schema invalid (best-effort parse)")
@@ -51,5 +63,13 @@ func TestParseStructurizeDelta_NoJSON(t *testing.T) {
 	parsed := ParseStructurizeDelta("no json here")
 	if parsed.ParseError == nil {
 		t.Fatal("expected parse error")
+	}
+}
+
+func TestParseStructurizeDelta_MissingCanonicalKeys(t *testing.T) {
+	resp := "```json\n" + `{"add":[],"retract":[],"update":[]}` + "\n```"
+	parsed := ParseStructurizeDelta(resp)
+	if parsed.ParseError == nil {
+		t.Fatal("expected parse error for missing support/withdraw/contest")
 	}
 }

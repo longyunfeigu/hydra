@@ -86,6 +86,10 @@ func runReview(cmd *cobra.Command, args []string) error {
 
 	target, err := resolveTarget(cmd, args, plat, plat, cfg.Defaults.DiffExclude)
 	if err != nil {
+		if review.IsNoReviewableChanges(err) {
+			util.Infof("%v", err)
+			return nil
+		}
 		return err
 	}
 
@@ -192,7 +196,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 	outputFile, _ := cmd.Flags().GetString("output")
 	if outputFile != "" {
 		format, _ := cmd.Flags().GetString("format")
-		if err := saveOutput(outputFile, format, result); err != nil {
+		if err := saveOutput(outputFile, format, result, showToolTrace || verbose); err != nil {
 			return fmt.Errorf("failed to save output: %w", err)
 		}
 		color.Green("\n  Output saved to: %s", outputFile)
@@ -262,14 +266,16 @@ func extractPRNumber(label string) string {
 	return ""
 }
 
-func saveOutput(path, format string, result *orchestrator.DebateResult) error {
+func saveOutput(path, format string, result *orchestrator.DebateResult, includeTranscript bool) error {
 	var data []byte
 	var err error
 
 	if format == "json" {
 		data, err = json.MarshalIndent(result, "", "  ")
 	} else {
-		data = []byte(display.FormatMarkdown(result))
+		data = []byte(display.FormatMarkdownWithOptions(result, display.MarkdownOptions{
+			IncludeDebateTranscript: includeTranscript,
+		}))
 	}
 	if err != nil {
 		return err

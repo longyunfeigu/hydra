@@ -27,6 +27,8 @@ type LedgerIssue struct {
 	Description  string
 	SuggestedFix string
 	Round        int
+	LastRound    int
+	Mentions     []IssueMention
 }
 
 func NewIssueLedger(reviewerID string) *IssueLedger {
@@ -66,6 +68,13 @@ func (l *IssueLedger) ApplyDelta(delta *StructurizeDelta, round int) {
 			Description:  add.Description,
 			SuggestedFix: add.SuggestedFix,
 			Round:        round,
+			LastRound:    round,
+			Mentions: []IssueMention{{
+				ReviewerID:   l.ReviewerID,
+				LocalIssueID: id,
+				Round:        round,
+				Status:       "active",
+			}},
 		}
 	}
 
@@ -75,6 +84,13 @@ func (l *IssueLedger) ApplyDelta(delta *StructurizeDelta, round int) {
 			continue
 		}
 		issue.Status = "retracted"
+		issue.LastRound = round
+		issue.Mentions = append(issue.Mentions, IssueMention{
+			ReviewerID:   l.ReviewerID,
+			LocalIssueID: id,
+			Round:        round,
+			Status:       "retracted",
+		})
 	}
 
 	for _, update := range delta.Update {
@@ -103,6 +119,13 @@ func (l *IssueLedger) ApplyDelta(delta *StructurizeDelta, round int) {
 		if update.SuggestedFix != nil {
 			issue.SuggestedFix = *update.SuggestedFix
 		}
+		issue.LastRound = round
+		issue.Mentions = append(issue.Mentions, IssueMention{
+			ReviewerID:   l.ReviewerID,
+			LocalIssueID: issue.ID,
+			Round:        round,
+			Status:       issue.Status,
+		})
 	}
 }
 
@@ -173,9 +196,68 @@ func (l *IssueLedger) ToMergedIssues() []MergedIssue {
 				SuggestedFix: issue.SuggestedFix,
 			},
 			RaisedBy:     []string{l.ReviewerID},
+			IntroducedBy: []string{l.ReviewerID},
+			SupportedBy:  []string{l.ReviewerID},
 			Descriptions: []string{issue.Description},
+			Mentions:     append([]IssueMention(nil), issue.Mentions...),
 		})
 	}
+	return result
+}
+
+// ToCanonicalInputs converts all ledger issues, including retracted ones, into canonicalization inputs.
+func (l *IssueLedger) ToCanonicalInputs() []MergedIssue {
+	if l == nil || len(l.Issues) == 0 {
+		return nil
+	}
+
+	issues := make([]*LedgerIssue, 0, len(l.Issues))
+	for _, issue := range l.Issues {
+		issues = append(issues, issue)
+	}
+	sort.Slice(issues, func(i, j int) bool {
+		if issues[i].Round != issues[j].Round {
+			return issues[i].Round < issues[j].Round
+		}
+		return issues[i].ID < issues[j].ID
+	})
+
+	result := make([]MergedIssue, 0, len(issues))
+	for _, issue := range issues {
+		category := issue.Category
+		if strings.TrimSpace(category) == "" {
+			category = "general"
+		}
+
+		supportedBy := []string(nil)
+		withdrawnBy := []string(nil)
+		raisedBy := []string(nil)
+		if issue.Status == "retracted" {
+			withdrawnBy = []string{l.ReviewerID}
+		} else {
+			supportedBy = []string{l.ReviewerID}
+			raisedBy = []string{l.ReviewerID}
+		}
+
+		result = append(result, MergedIssue{
+			ReviewIssue: ReviewIssue{
+				Severity:     issue.Severity,
+				Category:     category,
+				File:         issue.File,
+				Line:         issue.Line,
+				Title:        issue.Title,
+				Description:  issue.Description,
+				SuggestedFix: issue.SuggestedFix,
+			},
+			RaisedBy:     raisedBy,
+			IntroducedBy: []string{l.ReviewerID},
+			SupportedBy:  supportedBy,
+			WithdrawnBy:  withdrawnBy,
+			Descriptions: []string{issue.Description},
+			Mentions:     append([]IssueMention(nil), issue.Mentions...),
+		})
+	}
+
 	return result
 }
 

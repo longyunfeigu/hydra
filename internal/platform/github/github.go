@@ -172,6 +172,15 @@ type diffFile struct {
 	Patch    string `json:"patch"`
 }
 
+type pullComment struct {
+	ID                  int    `json:"id"`
+	Body                string `json:"body"`
+	Path                string `json:"path"`
+	Line                *int   `json:"line"`
+	SubjectType         string `json:"subject_type"`
+	PullRequestReviewID *int   `json:"pull_request_review_id"`
+}
+
 // issueComment 表示 GitHub issue comments API 的精简字段。
 // PR 的全局评论复用 issue comments API。
 type issueComment struct {
@@ -217,22 +226,37 @@ func (g *GitHubPlatform) GetExistingComments(mrID, repo string) []platform.Exist
 	if err != nil {
 		return nil
 	}
-	out, err := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/pulls/%s/comments", resolvedRepo, mrID),
-		"--paginate", "--jq", ".[]",
-	).Output()
-	if err != nil {
-		return nil
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var comments []platform.ExistingComment
-	for _, line := range lines {
-		if line == "" {
-			continue
+
+	if pullComments, err := g.listPullComments(mrID, resolvedRepo); err == nil {
+		for _, c := range pullComments {
+			source := "inline"
+			if c.SubjectType == "file" || c.Line == nil {
+				source = "file"
+			}
+			comments = append(comments, newExistingComment(
+				fmt.Sprintf("%d", c.ID),
+				"",
+				c.Path,
+				c.Line,
+				nil,
+				c.Body,
+				source,
+			))
 		}
-		var c platform.ExistingComment
-		if json.Unmarshal([]byte(line), &c) == nil {
-			comments = append(comments, c)
+	}
+
+	if issueComments, err := g.listIssueComments(mrID, resolvedRepo); err == nil {
+		for _, c := range issueComments {
+			comments = append(comments, newExistingComment(
+				fmt.Sprintf("%d", c.ID),
+				"",
+				"",
+				nil,
+				nil,
+				c.Body,
+				"global",
+			))
 		}
 	}
 	return comments
@@ -447,10 +471,11 @@ func (g *GitHubPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 	if err != nil {
 		return platform.ReviewResult{Failed: len(issues)}
 	}
+	runID := platform.NewLifecycleRunID(commitInfo.HeadSHA)
 
 	comments := make([]platform.ReviewCommentInput, 0, len(issues))
 	for _, issue := range issues {
-		body := platform.FormatIssueBody(issue)
+		body := platform.FormatIssueBodyWithMeta(issue, runID, commitInfo.HeadSHA)
 		comments = append(comments, platform.ReviewCommentInput{
 			Path: issue.File,
 			Line: issue.Line,
@@ -474,7 +499,10 @@ func (g *GitHubPlatform) PostIssuesAsComments(mrID string, issues []platform.Iss
 	}
 
 	classified := platform.ClassifyCommentsByDiff(comments, diffInfo)
-	return g.PostReview(mrID, classified, *commitInfo, repo)
+	desired := platform.BuildDesiredComments(classified, runID, commitInfo.HeadSHA)
+	existing := g.GetExistingComments(mrID, repo)
+	plan := platform.PlanLifecycle(existing, desired)
+	return g.applyLifecyclePlan(mrID, repo, *commitInfo, existing, plan, runID)
 }
 
 // PostNote 在 PR 上发布一条全局 note（评论）。
@@ -566,6 +594,181 @@ func findLatestIssueCommentIDByMarker(comments []issueComment, marker string) in
 		}
 	}
 	return latestID
+}
+
+func (g *GitHubPlatform) listPullComments(mrID, resolvedRepo string) ([]pullComment, error) {
+	out, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%s/comments", resolvedRepo, mrID),
+		"--paginate",
+		"--jq", ".[] | @base64",
+	).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	comments := make([]pullComment, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(line)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode pull comment row: %w", err)
+		}
+		var c pullComment
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return nil, fmt.Errorf("failed to parse pull comment row: %w", err)
+		}
+		comments = append(comments, c)
+	}
+	return comments, nil
+}
+
+func newExistingComment(id, threadID, path string, line, oldLine *int, body, source string) platform.ExistingComment {
+	meta, _ := platform.ParseHydraMeta(body)
+	return platform.ExistingComment{
+		ID:       id,
+		ThreadID: threadID,
+		Path:     path,
+		Line:     line,
+		OldLine:  oldLine,
+		Body:     body,
+		Source:   source,
+		IsHydra:  platform.IsHydraCommentBody(body),
+		Meta:     meta,
+	}
+}
+
+func (g *GitHubPlatform) applyLifecyclePlan(mrID, repo string, commitInfo platform.CommitInfo, existing []platform.ExistingComment, plan platform.LifecyclePlan, runID string) platform.ReviewResult {
+	var result platform.ReviewResult
+	result.Unchanged = len(plan.Noop)
+	result.Skipped += len(plan.Noop)
+
+	for _, item := range plan.Resolve {
+		if err := g.updateExistingComment(repo, item.Existing, platform.RenderResolvedBody(item.Existing, runID, commitInfo.HeadSHA)); err != nil {
+			result.Failed++
+		} else {
+			result.Resolved++
+		}
+	}
+
+	for _, item := range plan.Supersede {
+		if err := g.updateExistingComment(repo, item.Existing, platform.RenderSupersededBody(item.Existing, item.Desired, runID, commitInfo.HeadSHA)); err != nil {
+			result.Failed++
+		} else {
+			result.Superseded++
+		}
+	}
+
+	for _, item := range plan.Update {
+		if err := g.updateExistingComment(repo, item.Existing, item.Desired.Body); err != nil {
+			result.Failed++
+		} else {
+			result.Updated++
+		}
+	}
+
+	for _, item := range plan.Create {
+		duplicateCandidates := platform.DuplicateCandidates(existing, item.IssueKey)
+		if platform.IsDuplicateComment(platform.ReviewCommentInput{Path: item.Path, Line: item.Line, Body: item.Body}, duplicateCandidates) {
+			result.Skipped++
+			continue
+		}
+		cr := g.createDesiredComment(mrID, repo, commitInfo, item)
+		if !cr.Success {
+			result.Failed++
+			continue
+		}
+		result.Posted++
+		switch cr.Mode {
+		case "inline":
+			result.Inline++
+		case "file":
+			result.FileLevel++
+		default:
+			result.Global++
+		}
+
+		meta, _ := platform.ParseHydraMeta(item.Body)
+		existing = append(existing, platform.ExistingComment{
+			Path:    item.Path,
+			Line:    item.Line,
+			OldLine: item.OldLine,
+			Body:    item.Body,
+			Source:  item.Source,
+			IsHydra: true,
+			Meta:    meta,
+		})
+	}
+
+	return result
+}
+
+func (g *GitHubPlatform) createDesiredComment(mrID, repo string, commitInfo platform.CommitInfo, desired platform.DesiredComment) platform.CommentResult {
+	if err := validatePRNumber(mrID); err != nil {
+		return platform.CommentResult{Success: false, Error: err.Error()}
+	}
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return platform.CommentResult{Success: false, Error: err.Error()}
+	}
+
+	switch desired.Source {
+	case "inline":
+		if desired.Line == nil {
+			return platform.CommentResult{Success: false, Error: "inline comment missing line"}
+		}
+		payload, _ := json.Marshal(map[string]interface{}{
+			"body":      desired.Body,
+			"commit_id": commitInfo.HeadSHA,
+			"path":      desired.Path,
+			"line":      *desired.Line,
+			"side":      "RIGHT",
+		})
+		if _, err := ghPostJSON(fmt.Sprintf("repos/%s/pulls/%s/comments", resolvedRepo, mrID), payload); err != nil {
+			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
+		}
+		return platform.CommentResult{Success: true, Inline: true, Mode: "inline"}
+	case "file":
+		payload, _ := json.Marshal(map[string]interface{}{
+			"body":         desired.Body,
+			"commit_id":    commitInfo.HeadSHA,
+			"path":         desired.Path,
+			"subject_type": "file",
+		})
+		if _, err := ghPostJSON(fmt.Sprintf("repos/%s/pulls/%s/comments", resolvedRepo, mrID), payload); err != nil {
+			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
+		}
+		return platform.CommentResult{Success: true, Inline: false, Mode: "file"}
+	default:
+		payload, _ := json.Marshal(map[string]string{"body": desired.Body})
+		if _, err := ghPostJSON(fmt.Sprintf("repos/%s/issues/%s/comments", resolvedRepo, mrID), payload); err != nil {
+			return platform.CommentResult{Success: false, Error: platform.TruncStr(err.Error(), 200)}
+		}
+		return platform.CommentResult{Success: true, Inline: false, Mode: "global"}
+	}
+}
+
+func (g *GitHubPlatform) updateExistingComment(repo string, existing platform.ExistingComment, body string) error {
+	resolvedRepo, err := g.resolveRepo(repo)
+	if err != nil {
+		return err
+	}
+	if existing.ID == "" {
+		return fmt.Errorf("missing comment id")
+	}
+
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	endpoint := fmt.Sprintf("repos/%s/pulls/comments/%s", resolvedRepo, existing.ID)
+	if existing.Source == "global" {
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%s", resolvedRepo, existing.ID)
+	}
+	if _, err := ghPatchJSON(endpoint, payload); err != nil {
+		return fmt.Errorf("failed to update comment: %w", err)
+	}
+	return nil
 }
 
 // GetMRDetails 获取单个 PR 的详细信息，用于历史 PR 关联。

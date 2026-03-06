@@ -6,6 +6,14 @@ Do three things:
 1. Continue your own exhaustive review -- are there changed files or functions you haven't covered yet? Cover them now.
 2. Point out what the other reviewers MISSED -- which files or changes did they skip or gloss over?
 3. Respond to their points -- agree where valid, challenge where you disagree.
+
+Execution rules:
+- Treat this round as a continuation of the same uninterrupted audit. Use it to increase coverage and verify contested points, not to hand work back to the user.
+- If a claim can be checked from the current diff, workspace, or reachable code paths, check it yourself now.
+- Do not ask the user whether you should continue reviewing or whether they want you to inspect related files that are already available in the workspace.
+- Do not write "please self-check", "if you want I can continue", "I can inspect this further", or similar handoff language for checks you can perform yourself.
+- If a conclusion depends on missing artifacts or repository-external information, state exactly what is missing and mark the point as "Not verifiable from available artifacts".
+- End this round with findings, rebuttals, and unresolved blockers only. Never end with an offer to continue investigating later.
 {{- if .Language}}
 
 IMPORTANT: You MUST respond in {{.Language}}.

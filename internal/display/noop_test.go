@@ -21,6 +21,10 @@ func TestNoopDisplayCallbacks(t *testing.T) {
 		d.OnMessage("test-reviewer", "short message")
 	})
 
+	t.Run("OnMessageChunk", func(t *testing.T) {
+		d.OnMessageChunk("test-reviewer", "chunk")
+	})
+
 	t.Run("OnMessage long content", func(t *testing.T) {
 		longMsg := ""
 		for i := 0; i < 300; i++ {
@@ -31,6 +35,13 @@ func TestNoopDisplayCallbacks(t *testing.T) {
 
 	t.Run("OnParallelStatus", func(t *testing.T) {
 		d.OnParallelStatus(1, []orchestrator.ReviewerStatus{
+			{ReviewerID: "r1", Status: "thinking"},
+			{ReviewerID: "r2", Status: "done"},
+		})
+	})
+
+	t.Run("OnSummaryStatus", func(t *testing.T) {
+		d.OnSummaryStatus([]orchestrator.ReviewerStatus{
 			{ReviewerID: "r1", Status: "thinking"},
 			{ReviewerID: "r2", Status: "done"},
 		})

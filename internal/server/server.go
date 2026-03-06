@@ -243,7 +243,11 @@ func (s *Server) triggerReview(event *MergeRequestEvent) {
 	// 5. 执行 review
 	s.logger.Info("review slot acquired", "key", key)
 	plat := gitlab.New(s.cfg.GitLabHost)
-	if err := RunServerReview(ctx, event, plat, s.runner, s.cfg.GitLabHost, s.logger); err != nil {
+	var diffExclude []string
+	if s.cfg.HydraConfig != nil {
+		diffExclude = s.cfg.HydraConfig.Defaults.DiffExclude
+	}
+	if err := RunServerReview(ctx, event, plat, s.runner, s.cfg.GitLabHost, diffExclude, s.logger); err != nil {
 		if ctx.Err() != nil {
 			s.logger.Warn("review cancelled", "key", key)
 		} else {

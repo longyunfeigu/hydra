@@ -137,53 +137,66 @@ nitpick  → 灰色
 
 ## Markdown 报告输出示例
 
-`FormatMarkdown(result)` 生成的报告结构：
+`FormatMarkdown(result)` 默认生成“交付视图”报告，优先展示结论与问题，不包含完整辩论转录：
 
 ```markdown
 # Code Review: PR #42
 
-## Analysis
-
-[analyzer output]
-
-## Debate
-
-### security-reviewer
-
-[round 1 review content]
-
-### perf-reviewer
-
-[round 1 review content]
-
-### security-reviewer
-
-[round 2 cross-review response]
-
-## Summaries
-
-### security-reviewer
-
-[reviewer summary]
-
-### perf-reviewer
-
-[reviewer summary]
-
 ## Final Conclusion
 
 [synthesized conclusion]
+
+## System Context
+
+### Affected Modules
+
+#### Authentication Module
+
+- Path: `internal/auth`
+- Impact: `core`
+- File Count: `2`
+- Affected Files:
+  - `internal/auth/handler.go`
+  - `internal/auth/service.go`
+
+### Affected Files
+
+- `internal/auth/handler.go`
+- `internal/auth/service.go`
+
+### Related Changes
+
+- #38: refactor: extract auth middleware
+
+### Context Summary
+
+[context gatherer summary]
 
 ## Issues (4)
 
 1. **[CRITICAL]** SQL injection vulnerability
    - Location: `auth.go:42`
    - Found by: security-reviewer, perf-reviewer
+   - Why: The query is built with string concatenation.
    - Fix: Use parameterized queries
 
 2. **[HIGH]** Missing error handling
    - Location: `handler.go:15`
    - Found by: security-reviewer
+
+## Analysis
+
+[analyzer output]
+
+## Reviewer Summaries
+
+### security-reviewer
+
+[reviewer summary]
+
+### perf-reviewer
+
+[reviewer summary]
 
 ## Token Usage
 
@@ -195,6 +208,9 @@ nitpick  → 灰色
 
 Converged at round 1.
 ```
+
+若需要附带完整辩论过程，可用 `FormatMarkdownWithOptions(result, MarkdownOptions{IncludeDebateTranscript: true})`。
+导出的附录会按 `Round 1 / Round 2` 分组，并过滤 `[tool] ...` 这类过程噪音。
 
 对于本地变更（非 PR），标题格式不同：
 

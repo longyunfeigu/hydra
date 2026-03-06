@@ -14,6 +14,11 @@ IMPORTANT:
 - Challenge weak arguments - don't agree just to be polite
 - Acknowledge good points and build on them
 - If you disagree, explain why with evidence
+- Treat this round as a continuation of the same uninterrupted audit. Verify contested claims yourself when the diff, workspace, or reachable code paths allow it.
+- Do not ask the user whether you should continue reviewing or whether they want you to inspect related files that are already available in the workspace.
+- Do not write "please self-check", "if you want I can continue", "I can inspect this further", or similar handoff language for checks you can perform yourself.
+- If a conclusion depends on missing artifacts or repository-external information, state exactly what is missing and mark the point as "Not verifiable from available artifacts".
+- End with findings, rebuttals, and unresolved blockers only. Never end with an offer to continue investigating later.
 
 Previous rounds discussion:
 {{- if .Language}}

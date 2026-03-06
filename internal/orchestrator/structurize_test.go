@@ -35,22 +35,24 @@ func (p *mockProvider) ChatStream(_ context.Context, _ []provider.Message, _ str
 	close(errs)
 	return ch, errs
 }
-func (p *mockProvider) StartSession(_ string) error  { return nil }
-func (p *mockProvider) EndSession() error             { return nil }
-func (p *mockProvider) HasSession() bool              { return false }
-func (p *mockProvider) ShouldSendFullHistory() bool   { return true }
-func (p *mockProvider) LastSeenIndex() int            { return 0 }
-func (p *mockProvider) SetLastSeenIndex(_ int)        {}
+func (p *mockProvider) StartSession(_ string) error { return nil }
+func (p *mockProvider) EndSession() error           { return nil }
+func (p *mockProvider) HasSession() bool            { return false }
+func (p *mockProvider) ShouldSendFullHistory() bool { return true }
+func (p *mockProvider) LastSeenIndex() int          { return 0 }
+func (p *mockProvider) SetLastSeenIndex(_ int)      {}
 
 // noopDisplay 实现 DisplayCallbacks 的空操作版本
 type noopDisplay struct{}
 
-func (d *noopDisplay) OnWaiting(_ string)                                           {}
-func (d *noopDisplay) OnMessage(_ string, _ string)                                 {}
-func (d *noopDisplay) OnParallelStatus(_ int, _ []ReviewerStatus)                   {}
-func (d *noopDisplay) OnRoundComplete(_ int, _ bool)                                {}
-func (d *noopDisplay) OnConvergenceJudgment(_ string, _ string)                     {}
-func (d *noopDisplay) OnContextGathered(_ *GatheredContext)                          {}
+func (d *noopDisplay) OnWaiting(_ string)                         {}
+func (d *noopDisplay) OnMessageChunk(_ string, _ string)          {}
+func (d *noopDisplay) OnMessage(_ string, _ string)               {}
+func (d *noopDisplay) OnParallelStatus(_ int, _ []ReviewerStatus) {}
+func (d *noopDisplay) OnSummaryStatus(_ []ReviewerStatus)         {}
+func (d *noopDisplay) OnRoundComplete(_ int, _ bool)              {}
+func (d *noopDisplay) OnConvergenceJudgment(_ string, _ string)   {}
+func (d *noopDisplay) OnContextGathered(_ *GatheredContext)       {}
 
 func makeOrchestrator(summarizerResponses []string, history []DebateMessage) *DebateOrchestrator {
 	mp := &mockProvider{responses: summarizerResponses}
@@ -431,12 +433,12 @@ func (p *promptCaptureProvider) Chat(ctx context.Context, msgs []provider.Messag
 func (p *promptCaptureProvider) ChatStream(ctx context.Context, msgs []provider.Message, sys string) (<-chan string, <-chan error) {
 	return p.inner.ChatStream(ctx, msgs, sys)
 }
-func (p *promptCaptureProvider) StartSession(_ string) error  { return nil }
-func (p *promptCaptureProvider) EndSession() error             { return nil }
-func (p *promptCaptureProvider) HasSession() bool              { return false }
-func (p *promptCaptureProvider) ShouldSendFullHistory() bool   { return true }
-func (p *promptCaptureProvider) LastSeenIndex() int            { return 0 }
-func (p *promptCaptureProvider) SetLastSeenIndex(_ int)        {}
+func (p *promptCaptureProvider) StartSession(_ string) error { return nil }
+func (p *promptCaptureProvider) EndSession() error           { return nil }
+func (p *promptCaptureProvider) HasSession() bool            { return false }
+func (p *promptCaptureProvider) ShouldSendFullHistory() bool { return true }
+func (p *promptCaptureProvider) LastSeenIndex() int          { return 0 }
+func (p *promptCaptureProvider) SetLastSeenIndex(_ int)      {}
 
 func containsStr(s, substr string) bool {
 	return len(s) >= len(substr) && findSubstring(s, substr)

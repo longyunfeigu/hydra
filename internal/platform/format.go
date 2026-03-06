@@ -6,19 +6,32 @@ import (
 	"strings"
 )
 
-// IssueMarkerPrefix 是 Hydra inline 评论的幂等标记前缀。
-const IssueMarkerPrefix = "<!-- hydra:issue:"
-
-// FormatIssueBody 将单个问题格式化为 Markdown 格式的评论正文。
-// 在开头插入隐藏的幂等标记 <!-- hydra:issue:<hash> -->，
-// hash 由 (file, line, severity, title) 生成，确保同一 issue 重复审查时可识别。
+// FormatIssueBody 将单个问题格式化为 Markdown 格式的评论正文，并附带 Hydra meta marker。
 func FormatIssueBody(issue IssueForComment) string {
-	marker := BuildIssueMarker(issue.File, issue.Line, issue.Severity, issue.Title)
+	return FormatIssueBodyWithMeta(issue, "", "")
+}
 
+// FormatIssueBodyWithMeta 使用给定 run/head 信息生成带结构化 marker 的 issue 正文。
+func FormatIssueBodyWithMeta(issue IssueForComment, runID, headSHA string) string {
+	displayBody := FormatIssueDisplayBody(issue)
+	meta := BuildHydraCommentMeta(
+		BuildIssueKey(issue),
+		displayBody,
+		issue.File,
+		issue.Line,
+		nil,
+		"inline",
+		runID,
+		headSHA,
+		"active",
+	)
+	return EncodeHydraMeta(meta) + "\n" + displayBody
+}
+
+// FormatIssueDisplayBody 仅渲染给人看的 issue 正文，不包含隐藏 marker。
+func FormatIssueDisplayBody(issue IssueForComment) string {
 	severityBadge := SeverityToBadge(issue.Severity)
 	var sb strings.Builder
-	sb.WriteString(marker)
-	sb.WriteByte('\n')
 	sb.WriteString(fmt.Sprintf("%s **%s**\n\n", severityBadge, issue.Title))
 	sb.WriteString(issue.Description)
 	if issue.SuggestedFix != "" {
@@ -30,9 +43,7 @@ func FormatIssueBody(issue IssueForComment) string {
 	return sb.String()
 }
 
-// BuildIssueMarker 生成用于幂等去重的隐藏 HTML 标记。
-// 格式: <!-- hydra:issue:<sha256_prefix_8> -->
-// 输入: file + line + severity + title，对大小写和空格做归一化处理。
+// BuildIssueMarker 生成旧版幂等 marker，保留给兼容逻辑与测试使用。
 func BuildIssueMarker(file string, line *int, severity, title string) string {
 	lineStr := "0"
 	if line != nil {

@@ -19,6 +19,7 @@ type Reviewer struct {
 // 记录了发言的审查者ID、消息内容和时间戳。
 type DebateMessage struct {
 	ReviewerID string    `json:"reviewerId"`
+	Round      int       `json:"round,omitempty"`
 	Content    string    `json:"content"`
 	Timestamp  time.Time `json:"timestamp"`
 }
@@ -42,11 +43,14 @@ type TokenUsage struct {
 // ReviewerStatus 追踪审查者在并行执行过程中的进度状态。
 // 用于终端UI展示每个审查者的实时工作状态。
 type ReviewerStatus struct {
-	ReviewerID string
-	Status     string  // "pending"（等待中）、"thinking"（思考中）、"done"（已完成）
-	StartTime  int64   // Unix毫秒时间戳 - 开始时间
-	EndTime    int64   // Unix毫秒时间戳 - 结束时间
-	Duration   float64 // 耗时（秒）
+	ReviewerID    string
+	Status        string  // "pending"（等待中）、"thinking"（思考中）、"done"（已完成）
+	StartTime     int64   // Unix毫秒时间戳 - 开始时间
+	EndTime       int64   // Unix毫秒时间戳 - 结束时间
+	Duration      float64 // 耗时（秒）
+	InputTokens   int
+	OutputTokens  int
+	EstimatedCost float64
 }
 
 // OrchestratorOptions 控制辩论行为的配置选项。
@@ -143,12 +147,34 @@ type ReviewIssue struct {
 	ClaimedBy    []string `json:"raisedBy,omitempty"` // 原始模型输出中“声称由哪些 reviewer 提出”
 }
 
+// IssueMention 表示某个 reviewer 对 issue 的一次本地提及或状态变更。
+type IssueMention struct {
+	ReviewerID   string `json:"reviewerId"`
+	LocalIssueID string `json:"localIssueId,omitempty"`
+	Round        int    `json:"round,omitempty"`
+	Status       string `json:"status,omitempty"` // active | retracted | support | withdraw | contest
+}
+
+// CanonicalSignal 表示 reviewer 对已有 issueRef 的显式态度变化。
+type CanonicalSignal struct {
+	ReviewerID string `json:"reviewerId"`
+	IssueRef   string `json:"issueRef"`
+	Round      int    `json:"round"`
+	Action     string `json:"action"` // support | withdraw | contest
+}
+
 // MergedIssue 是经过去重合并的问题，包含多个审查者的归属信息。
 // 当多个审查者提出相似问题时，会合并为一个MergedIssue，保留最高严重程度。
 type MergedIssue struct {
 	ReviewIssue
-	RaisedBy     []string `json:"raisedBy"`
-	Descriptions []string `json:"descriptions"`
+	CanonicalID  string         `json:"canonicalId,omitempty"`
+	RaisedBy     []string       `json:"raisedBy"`
+	IntroducedBy []string       `json:"introducedBy,omitempty"`
+	SupportedBy  []string       `json:"supportedBy,omitempty"`
+	WithdrawnBy  []string       `json:"withdrawnBy,omitempty"`
+	ContestedBy  []string       `json:"contestedBy,omitempty"`
+	Descriptions []string       `json:"descriptions"`
+	Mentions     []IssueMention `json:"mentions,omitempty"`
 }
 
 // ReviewerOutput 是从审查者响应文本中解析出的结构化输出。
@@ -161,9 +187,12 @@ type ReviewerOutput struct {
 
 // StructurizeDelta 表示单个 reviewer 在单轮中的 issue 增量变化。
 type StructurizeDelta struct {
-	Add     []DeltaAddIssue    `json:"add"`
-	Retract []string           `json:"retract"`
-	Update  []DeltaUpdateIssue `json:"update"`
+	Add      []DeltaAddIssue       `json:"add"`
+	Retract  []string              `json:"retract"`
+	Update   []DeltaUpdateIssue    `json:"update"`
+	Support  []DeltaIssueRefAction `json:"support"`
+	Withdraw []DeltaIssueRefAction `json:"withdraw"`
+	Contest  []DeltaIssueRefAction `json:"contest"`
 }
 
 // DeltaAddIssue 表示新发现的问题（由本地 ledger 分配 ID）。
@@ -189,13 +218,20 @@ type DeltaUpdateIssue struct {
 	SuggestedFix *string `json:"suggestedFix,omitempty"`
 }
 
+// DeltaIssueRefAction 表示对已存在 issueRef 的显式态度动作。
+type DeltaIssueRefAction struct {
+	IssueRef string `json:"issueRef"`
+}
+
 // DisplayCallbacks 是终端显示集成的回调接口。
 // 编排器在执行过程中调用这些回调方法来实时更新终端UI。
 // 包括：等待状态、消息输出、并行执行状态、轮次完成、共识判断和上下文收集完成等事件。
 type DisplayCallbacks interface {
 	OnWaiting(reviewerID string)
+	OnMessageChunk(reviewerID string, chunk string)
 	OnMessage(reviewerID string, content string)
 	OnParallelStatus(round int, statuses []ReviewerStatus)
+	OnSummaryStatus(statuses []ReviewerStatus)
 	OnRoundComplete(round int, converged bool)
 	OnConvergenceJudgment(verdict string, reasoning string)
 	OnContextGathered(ctx *GatheredContext)

@@ -100,12 +100,16 @@ type ClassifiedComment struct {
 
 // ReviewResult 汇总批量发布评审评论的结果统计。
 type ReviewResult struct {
-	Posted    int
-	Inline    int
-	FileLevel int
-	Global    int
-	Failed    int
-	Skipped   int
+	Posted     int
+	Inline     int
+	FileLevel  int
+	Global     int
+	Failed     int
+	Skipped    int
+	Updated    int
+	Resolved   int
+	Superseded int
+	Unchanged  int
 }
 
 // PostCommentOpts 包含 PostComment 所需的所有选项参数。
@@ -120,9 +124,15 @@ type PostCommentOpts struct {
 
 // ExistingComment 表示 MR/PR 上已存在的评论，用于去重检查。
 type ExistingComment struct {
-	Path string `json:"path"`
-	Line *int   `json:"line"`
-	Body string `json:"body"`
+	ID       string            `json:"id"`
+	ThreadID string            `json:"thread_id"`
+	Path     string            `json:"path"`
+	Line     *int              `json:"line"`
+	OldLine  *int              `json:"old_line"`
+	Body     string            `json:"body"`
+	Source   string            `json:"source"`
+	IsHydra  bool              `json:"is_hydra"`
+	Meta     *HydraCommentMeta `json:"meta"`
 }
 
 // IssueForComment 是将代码审查问题转换为评审评论的结构体。
@@ -134,6 +144,51 @@ type IssueForComment struct {
 	Severity     string
 	SuggestedFix string
 	RaisedBy     string
+}
+
+// HydraCommentMeta 是嵌入在 Hydra 评论正文中的隐藏元数据。
+type HydraCommentMeta struct {
+	IssueKey   string `json:"key"`
+	Status     string `json:"status"`
+	RunID      string `json:"run"`
+	HeadSHA    string `json:"head"`
+	BodyHash   string `json:"body"`
+	AnchorHash string `json:"anchor"`
+}
+
+// DesiredComment 表示本轮 review 结束后平台上应存在的评论状态。
+type DesiredComment struct {
+	IssueKey   string
+	Path       string
+	Line       *int
+	OldLine    *int
+	Body       string
+	Source     string
+	BodyHash   string
+	AnchorHash string
+}
+
+// LifecyclePlan 描述现有评论与期望评论之间的状态迁移。
+type LifecyclePlan struct {
+	Create    []DesiredComment
+	Update    []CommentUpdate
+	Resolve   []CommentResolve
+	Supersede []CommentSupersede
+	Noop      []DesiredComment
+}
+
+type CommentUpdate struct {
+	Existing ExistingComment
+	Desired  DesiredComment
+}
+
+type CommentResolve struct {
+	Existing ExistingComment
+}
+
+type CommentSupersede struct {
+	Existing ExistingComment
+	Desired  DesiredComment
 }
 
 // MRDetail 包含历史 MR/PR 的详细信息，用于 context gathering。

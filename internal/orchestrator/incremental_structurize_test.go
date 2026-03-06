@@ -79,10 +79,10 @@ func deltaKeyFromPrompt(prompt string) string {
 
 func TestIncrementalStructurize_TwoRounds(t *testing.T) {
 	provider := &deltaRoutingProvider{responses: map[string]string{
-		"r1:1": "```json\n" + `{"add":[{"severity":"high","file":"a.go","title":"Issue A","description":"desc"}],"retract":[],"update":[]}` + "\n```",
-		"r2:1": "```json\n" + `{"add":[{"severity":"medium","file":"b.go","title":"Issue B","description":"desc"}],"retract":[],"update":[]}` + "\n```",
-		"r1:2": "```json\n" + `{"add":[],"retract":["I1"],"update":[]}` + "\n```",
-		"r2:2": "```json\n" + `{"add":[],"retract":[],"update":[{"id":"I1","severity":"high","description":"upgraded"}]}` + "\n```",
+		"r1:1": "```json\n" + `{"add":[{"severity":"high","file":"a.go","title":"Issue A","description":"desc"}],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
+		"r2:1": "```json\n" + `{"add":[{"severity":"medium","file":"b.go","title":"Issue B","description":"desc"}],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
+		"r1:2": "```json\n" + `{"add":[],"retract":["I1"],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
+		"r2:2": "```json\n" + `{"add":[],"retract":[],"update":[{"id":"I1","severity":"high","description":"upgraded"}],"support":[],"withdraw":[],"contest":[]}` + "\n```",
 	}}
 
 	o := &DebateOrchestrator{
@@ -120,7 +120,7 @@ func TestIncrementalStructurize_TwoRounds(t *testing.T) {
 func TestIncrementalStructurize_ParseFailure(t *testing.T) {
 	provider := &deltaRoutingProvider{responses: map[string]string{
 		"r1:1": "not json",
-		"r2:1": "```json\n" + `{"add":[{"severity":"medium","file":"b.go","title":"Issue B","description":"desc"}],"retract":[],"update":[]}` + "\n```",
+		"r2:1": "```json\n" + `{"add":[{"severity":"medium","file":"b.go","title":"Issue B","description":"desc"}],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
 	}}
 
 	o := &DebateOrchestrator{
@@ -144,6 +144,46 @@ func TestIncrementalStructurize_ParseFailure(t *testing.T) {
 	}
 	if len(issues[0].RaisedBy) != 1 || issues[0].RaisedBy[0] != "r2" {
 		t.Fatalf("unexpected raisedBy: %v", issues[0].RaisedBy)
+	}
+}
+
+func TestIncrementalStructurize_CanonicalSupportAction(t *testing.T) {
+	provider := &deltaRoutingProvider{responses: map[string]string{
+		"r1:1": "```json\n" + `{"add":[{"severity":"high","file":"auth.go","title":"Missing authorization check","description":"Admin endpoint executes sensitive action without a role guard"}],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
+		"r2:1": "```json\n" + `{"add":[],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
+		"r1:2": "```json\n" + `{"add":[],"retract":[],"update":[],"support":[],"withdraw":[],"contest":[]}` + "\n```",
+		"r2:2": "```json\n" + `{"add":[],"retract":[],"update":[],"support":[{"issueRef":"r1:I1"}],"withdraw":[],"contest":[]}` + "\n```",
+	}}
+
+	o := &DebateOrchestrator{
+		reviewers: []Reviewer{{ID: "r1"}, {ID: "r2"}},
+		summarizer: Reviewer{
+			ID:       "summarizer",
+			Provider: provider,
+		},
+		options:    OrchestratorOptions{StructurizeMode: "ledger"},
+		tokenUsage: make(map[string]*tokenCount),
+	}
+	o.initIssueLedgers()
+
+	o.extractRoundIssueDeltas(context.Background(), 1, map[string]string{
+		"r1": "round1",
+		"r2": "round1",
+	}, &noopDisplay{})
+	o.extractRoundIssueDeltas(context.Background(), 2, map[string]string{
+		"r1": "round2",
+		"r2": "round2",
+	}, &noopDisplay{})
+
+	issues := o.structurizeIssuesFromLedgers(context.Background(), &noopDisplay{})
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 canonical issue, got %d", len(issues))
+	}
+	if len(issues[0].SupportedBy) != 2 {
+		t.Fatalf("expected support from both reviewers, got %v", issues[0].SupportedBy)
+	}
+	if len(issues[0].RaisedBy) != 2 {
+		t.Fatalf("expected RaisedBy to mirror supporters, got %v", issues[0].RaisedBy)
 	}
 }
 

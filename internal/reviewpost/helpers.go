@@ -16,8 +16,12 @@ func ConvertIssuesToPlatform(issues []orchestrator.MergedIssue) []platform.Issue
 	result := make([]platform.IssueForComment, 0, len(issues))
 	for _, issue := range issues {
 		raisedBy := ""
-		if len(issue.RaisedBy) > 0 {
-			raisedBy = strings.Join(issue.RaisedBy, ", ")
+		supporters := issue.SupportedBy
+		if len(supporters) == 0 {
+			supporters = issue.RaisedBy
+		}
+		if len(supporters) > 0 {
+			raisedBy = strings.Join(supporters, ", ")
 		}
 		result = append(result, platform.IssueForComment{
 			File:         issue.File,

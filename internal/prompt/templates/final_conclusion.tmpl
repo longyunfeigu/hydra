@@ -2,6 +2,13 @@ There are exactly {{.ReviewerCount}} reviewers in this debate. Based on their an
 - Points of consensus
 - Points of disagreement with analysis
 - Recommended action items
+- Any blockers that remain "Not verifiable from available artifacts"
+
+Output rules:
+- Produce conclusions and action items only.
+- Do not ask the user whether you should continue reviewing.
+- Do not offer optional follow-up investigation such as "if you want I can inspect more files".
+- If something is unverifiable, label it clearly and stop there.
 
 Anonymous summaries:
 {{.SummaryText}}

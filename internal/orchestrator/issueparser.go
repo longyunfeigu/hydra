@@ -54,7 +54,7 @@ var (
 	// rawJSONRe 匹配包含"issues"数组的原始JSON对象（无代码块包裹的情况）
 	rawJSONRe = regexp.MustCompile(`(?s)\{[\s\S]*"issues"\s*:\s*\[[\s\S]*\][\s\S]*\}`)
 	// rawDeltaJSONRe 匹配包含 delta 关键字段的 JSON 对象（无代码块包裹的情况）
-	rawDeltaJSONRe = regexp.MustCompile(`(?s)\{[\s\S]*"(add|retract|update)"\s*:[\s\S]*\}`)
+	rawDeltaJSONRe = regexp.MustCompile(`(?s)\{[\s\S]*"(add|retract|update|support|withdraw|contest)"\s*:[\s\S]*\}`)
 	// focusRe 匹配"## Suggested Review Focus"章节，提取审查关注重点
 	focusRe = regexp.MustCompile(`(?s)## Suggested Review Focus\s*\n(.*?)(?:\n##|\z)`)
 	// fileLineRe 匹配文件路径中嵌入的行号范围，如 "file.py:37" 或 "file.py:37-48"
@@ -238,22 +238,28 @@ func ParseStructurizeDelta(response string) *DeltaParseResult {
 	}
 
 	var raw struct {
-		Add     []json.RawMessage `json:"add"`
-		Retract []string          `json:"retract"`
-		Update  []json.RawMessage `json:"update"`
+		Add      []json.RawMessage `json:"add"`
+		Retract  []string          `json:"retract"`
+		Update   []json.RawMessage `json:"update"`
+		Support  []json.RawMessage `json:"support"`
+		Withdraw []json.RawMessage `json:"withdraw"`
+		Contest  []json.RawMessage `json:"contest"`
 	}
 	if err := json.Unmarshal([]byte(result.RawJSON), &raw); err != nil {
 		result.ParseError = fmt.Errorf("JSON syntax error: %w", err)
 		return result
 	}
 
-	if raw.Add == nil || raw.Retract == nil || raw.Update == nil {
-		result.ParseError = fmt.Errorf("missing one of required keys: add/retract/update")
+	if raw.Add == nil || raw.Retract == nil || raw.Update == nil || raw.Support == nil || raw.Withdraw == nil || raw.Contest == nil {
+		result.ParseError = fmt.Errorf("missing one of required keys: add/retract/update/support/withdraw/contest")
 		return result
 	}
 
 	out := &StructurizeDelta{
-		Retract: make([]string, 0, len(raw.Retract)),
+		Retract:  make([]string, 0, len(raw.Retract)),
+		Support:  make([]DeltaIssueRefAction, 0, len(raw.Support)),
+		Withdraw: make([]DeltaIssueRefAction, 0, len(raw.Withdraw)),
+		Contest:  make([]DeltaIssueRefAction, 0, len(raw.Contest)),
 	}
 
 	for _, id := range raw.Retract {
@@ -338,8 +344,39 @@ func ParseStructurizeDelta(response string) *DeltaParseResult {
 		out.Update = append(out.Update, update)
 	}
 
+	for _, action := range parseDeltaIssueRefActions(raw.Support) {
+		out.Support = append(out.Support, action)
+	}
+	for _, action := range parseDeltaIssueRefActions(raw.Withdraw) {
+		out.Withdraw = append(out.Withdraw, action)
+	}
+	for _, action := range parseDeltaIssueRefActions(raw.Contest) {
+		out.Contest = append(out.Contest, action)
+	}
+
 	result.Output = out
 	return result
+}
+
+func parseDeltaIssueRefActions(items []json.RawMessage) []DeltaIssueRefAction {
+	actions := make([]DeltaIssueRefAction, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, rawItem := range items {
+		var m map[string]any
+		if err := json.Unmarshal(rawItem, &m); err != nil {
+			continue
+		}
+		ref := parseStringField(m, "issueRef")
+		if ref == "" {
+			continue
+		}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		actions = append(actions, DeltaIssueRefAction{IssueRef: ref})
+	}
+	return actions
 }
 
 func extractJSON(response string, rawPattern *regexp.Regexp) string {
@@ -430,7 +467,12 @@ func DeduplicateIssues(issuesByReviewer map[string][]ReviewIssue) []MergedIssue 
 			for i := range merged {
 				if isSimilarIssue(&merged[i].ReviewIssue, &issue) {
 					merged[i].RaisedBy = append(merged[i].RaisedBy, reviewerID)
+					merged[i].SupportedBy = append(merged[i].SupportedBy, reviewerID)
 					merged[i].Descriptions = append(merged[i].Descriptions, issue.Description)
+					merged[i].Mentions = append(merged[i].Mentions, IssueMention{
+						ReviewerID: reviewerID,
+						Status:     "active",
+					})
 					// 保留最高严重程度（数值越小越严重）
 					if severityOrder[issue.Severity] < severityOrder[merged[i].Severity] {
 						merged[i].Severity = issue.Severity
@@ -447,7 +489,13 @@ func DeduplicateIssues(issuesByReviewer map[string][]ReviewIssue) []MergedIssue 
 				merged = append(merged, MergedIssue{
 					ReviewIssue:  issue,
 					RaisedBy:     []string{reviewerID},
+					IntroducedBy: []string{reviewerID},
+					SupportedBy:  []string{reviewerID},
 					Descriptions: []string{issue.Description},
+					Mentions: []IssueMention{{
+						ReviewerID: reviewerID,
+						Status:     "active",
+					}},
 				})
 			}
 		}
@@ -457,6 +505,10 @@ func DeduplicateIssues(issuesByReviewer map[string][]ReviewIssue) []MergedIssue 
 	sort.Slice(merged, func(i, j int) bool {
 		return severityOrder[merged[i].Severity] < severityOrder[merged[j].Severity]
 	})
+
+	for i := range merged {
+		merged[i] = finalizeCanonicalIssue(merged[i])
+	}
 
 	return merged
 }
@@ -597,8 +649,13 @@ func DeduplicateMergedIssues(issues []MergedIssue) []MergedIssue {
 						merged[i].RaisedBy = append(merged[i].RaisedBy, r)
 					}
 				}
+				merged[i].SupportedBy = append(merged[i].SupportedBy, issue.SupportedBy...)
+				merged[i].IntroducedBy = append(merged[i].IntroducedBy, issue.IntroducedBy...)
+				merged[i].WithdrawnBy = append(merged[i].WithdrawnBy, issue.WithdrawnBy...)
+				merged[i].ContestedBy = append(merged[i].ContestedBy, issue.ContestedBy...)
 				// 合并描述
 				merged[i].Descriptions = append(merged[i].Descriptions, issue.Descriptions...)
+				merged[i].Mentions = append(merged[i].Mentions, issue.Mentions...)
 				// 保留最高严重程度
 				if severityOrder[issue.Severity] < severityOrder[merged[i].Severity] {
 					merged[i].Severity = issue.Severity
@@ -620,6 +677,10 @@ func DeduplicateMergedIssues(issues []MergedIssue) []MergedIssue {
 	sort.Slice(merged, func(i, j int) bool {
 		return severityOrder[merged[i].Severity] < severityOrder[merged[j].Severity]
 	})
+
+	for i := range merged {
+		merged[i] = finalizeCanonicalIssue(merged[i])
+	}
 
 	return merged
 }

@@ -22,9 +22,9 @@ import (
 //   - 流式模式使用 --output-format stream-json，输出为 JSONL（每行一个事件）
 //   - 会话复用通过 --resume <session_id> 实现，session_id 从首次响应中提取
 type ClaudeCodeProvider struct {
-	cwd             string           // CLI 的工作目录
-	timeout         time.Duration    // 无活动超时时间（默认 15 分钟）
-	session         CliSessionHelper // 会话状态管理
+	cwd                 string           // CLI 的工作目录
+	timeout             time.Duration    // 无活动超时时间（默认 15 分钟）
+	session             CliSessionHelper // 会话状态管理
 	skipPermissions     bool             // 是否跳过 CLI 的权限确认（非交互模式必须为 true）
 	modelName           string           // 底层模型名称，传给 --model 参数（如 "claude-sonnet-4-5-20250514"）
 	promptSizeThreshold int              // 大 prompt 写临时文件的阈值（字节），0 表示使用默认值
@@ -45,11 +45,11 @@ func (p *ClaudeCodeProvider) Name() string { return "claude-code" }
 
 // --- SessionProvider 接口实现，委托给 CliSessionHelper ---
 func (p *ClaudeCodeProvider) StartSession(name string)    { p.session.Start(name) }
-func (p *ClaudeCodeProvider) EndSession()                  { p.session.End() }
-func (p *ClaudeCodeProvider) SessionID() string            { return p.session.SessionID() }
-func (p *ClaudeCodeProvider) IsFirstMessage() bool         { return p.session.IsFirstMessage() }
-func (p *ClaudeCodeProvider) MarkMessageSent()             { p.session.MarkMessageSent() }
-func (p *ClaudeCodeProvider) ShouldSendFullHistory() bool  { return p.session.ShouldSendFullHistory() }
+func (p *ClaudeCodeProvider) EndSession()                 { p.session.End() }
+func (p *ClaudeCodeProvider) SessionID() string           { return p.session.SessionID() }
+func (p *ClaudeCodeProvider) IsFirstMessage() bool        { return p.session.IsFirstMessage() }
+func (p *ClaudeCodeProvider) MarkMessageSent()            { p.session.MarkMessageSent() }
+func (p *ClaudeCodeProvider) ShouldSendFullHistory() bool { return p.session.ShouldSendFullHistory() }
 
 // Chat 同步调用 Claude CLI 并返回完整响应。带指数退避重试。
 func (p *ClaudeCodeProvider) Chat(ctx context.Context, messages []Message, systemPrompt string, _ *ChatOptions) (string, error) {
@@ -108,11 +108,12 @@ func (p *ClaudeCodeProvider) ChatStream(ctx context.Context, messages []Message,
 // buildArgs 构建 claude CLI 的命令行参数。
 //
 // 参数说明：
-//   -p -                      : 从 stdin 读取 prompt（pipe 模式）
-//   --dangerously-skip-permissions : 跳过交互式权限确认（可通过配置关闭）
-//   --output-format json/stream-json : 结构化输出格式
-//   --resume <id>             : 复用已有会话（非首次消息时）
-//   --system-prompt <prompt>  : 系统提示（仅首次消息时传入）
+//
+//	-p -                      : 从 stdin 读取 prompt（pipe 模式）
+//	--dangerously-skip-permissions : 跳过交互式权限确认（可通过配置关闭）
+//	--output-format json/stream-json : 结构化输出格式
+//	--resume <id>             : 复用已有会话（非首次消息时）
+//	--system-prompt <prompt>  : 系统提示（仅首次消息时传入）
 func (p *ClaudeCodeProvider) buildArgs(systemPrompt string, streaming bool, snap SessionSnapshot) []string {
 	args := []string{"-p", "-",
 		"--strict-mcp-config", // 不加载用户配置的 MCP servers，节省内存
@@ -169,7 +170,7 @@ type claudeEvent struct {
 	SessionID string         `json:"session_id,omitempty"` // 会话 ID，从响应中提取
 	Result    string         `json:"result,omitempty"`     // result 事件的最终文本
 	IsError   bool           `json:"is_error,omitempty"`
-	Message   *claudeMessage `json:"message,omitempty"`    // assistant 事件的消息体
+	Message   *claudeMessage `json:"message,omitempty"` // assistant 事件的消息体
 }
 
 type claudeMessage struct {
@@ -177,8 +178,20 @@ type claudeMessage struct {
 }
 
 type claudeContent struct {
-	Type string `json:"type"` // "text"
-	Text string `json:"text"`
+	Type      string          `json:"type"` // "text" | "tool_use" | "tool_result"
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+}
+
+type claudeStreamState struct {
+	lastAssistantText string
+	textEmitted       bool
+	seenToolUseIDs    map[string]struct{}
 }
 
 // runClaude 以非流式模式执行 claude CLI（--output-format json）。
@@ -308,6 +321,9 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 	}()
 
 	// 逐行读取 stdout 并解析 JSONL 事件
+	state := &claudeStreamState{
+		seenToolUseIDs: make(map[string]struct{}),
+	}
 	var lineBuf string
 	buf := make([]byte, 4096)
 	for {
@@ -329,7 +345,7 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 					continue
 				}
 
-				p.handleStreamEvent(line, chunks)
+				p.handleStreamEvent(line, state, chunks)
 			}
 		}
 		if readErr != nil {
@@ -339,7 +355,7 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 
 	// 处理缓冲区中剩余的不完整行
 	if trimmed := strings.TrimSpace(lineBuf); trimmed != "" {
-		p.handleStreamEvent(trimmed, chunks)
+		p.handleStreamEvent(trimmed, state, chunks)
 	}
 
 	if err := cmd.Wait(); err != nil {
@@ -353,7 +369,7 @@ func (p *ClaudeCodeProvider) runClaudeStream(ctx context.Context, prompt, system
 }
 
 // handleStreamEvent 解析单行 JSONL 事件并分发处理。
-func (p *ClaudeCodeProvider) handleStreamEvent(line string, chunks chan<- string) {
+func (p *ClaudeCodeProvider) handleStreamEvent(line string, state *claudeStreamState, chunks chan<- string) {
 	var event claudeEvent
 	if err := json.Unmarshal([]byte(line), &event); err != nil {
 		util.Warnf("claude stream: failed to parse JSONL line: %v", err)
@@ -367,19 +383,142 @@ func (p *ClaudeCodeProvider) handleStreamEvent(line string, chunks chan<- string
 
 	switch event.Type {
 	case "assistant":
-		// 完整的 assistant 消息 — 提取文本并发送
 		if event.Message != nil {
-			if text := extractTextFromContent(event.Message.Content); text != "" {
-				chunks <- text
-			}
+			p.emitAssistantMessage(event.Message.Content, state, chunks)
 		}
 	case "result":
-		// 最终结果 — session_id 已在上面捕获
-		// 不重复发送文本（已通过 assistant 事件发送）
 		if event.IsError {
 			util.Warnf("claude stream returned error result: %s", event.Result)
 		}
+		if !state.textEmitted {
+			if text := strings.TrimSpace(event.Result); text != "" {
+				chunks <- text
+				state.textEmitted = true
+				state.lastAssistantText = text
+			}
+		}
 	}
+}
+
+func (p *ClaudeCodeProvider) emitAssistantMessage(content []claudeContent, state *claudeStreamState, chunks chan<- string) {
+	if delta := diffAssistantText(state.lastAssistantText, extractTextFromContent(content)); delta != "" {
+		chunks <- delta
+		state.textEmitted = true
+		state.lastAssistantText = extractTextFromContent(content)
+	}
+
+	for _, block := range content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		if block.ID != "" {
+			if _, seen := state.seenToolUseIDs[block.ID]; seen {
+				continue
+			}
+			state.seenToolUseIDs[block.ID] = struct{}{}
+		}
+		if chunk := formatToolUseChunk(block); chunk != "" {
+			chunks <- chunk
+		}
+	}
+}
+
+func diffAssistantText(previous, current string) string {
+	current = strings.TrimSpace(current)
+	previous = strings.TrimSpace(previous)
+	if current == "" || current == previous {
+		return ""
+	}
+	if previous != "" && strings.HasPrefix(current, previous) {
+		return current[len(previous):]
+	}
+	return current
+}
+
+func formatToolUseChunk(block claudeContent) string {
+	name := strings.TrimSpace(block.Name)
+	if name == "" {
+		name = "tool"
+	}
+	detail := summarizeClaudeToolInput(block.Input)
+	if detail == "" {
+		return fmt.Sprintf("\n[tool] %s\n", name)
+	}
+	return fmt.Sprintf("\n[tool] %s: %s\n", name, detail)
+}
+
+func summarizeClaudeToolInput(input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+
+	var decoded any
+	if err := json.Unmarshal(input, &decoded); err != nil {
+		return truncateForToolTrace(strings.TrimSpace(string(input)), 160)
+	}
+
+	switch v := decoded.(type) {
+	case map[string]any:
+		keys := []string{
+			"command", "cmd", "description", "prompt", "query", "url",
+			"file_path", "path", "paths", "pattern", "glob", "tool",
+		}
+		for _, key := range keys {
+			if raw, ok := v[key]; ok {
+				if formatted := formatToolValue(raw); formatted != "" {
+					return formatted
+				}
+			}
+		}
+		if len(v) == 0 {
+			return ""
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return truncateForToolTrace(string(b), 160)
+	case []any:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return truncateForToolTrace(string(b), 160)
+	case string:
+		return truncateForToolTrace(v, 160)
+	default:
+		return truncateForToolTrace(fmt.Sprint(v), 160)
+	}
+}
+
+func formatToolValue(v any) string {
+	switch value := v.(type) {
+	case string:
+		return truncateForToolTrace(value, 160)
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			text := strings.TrimSpace(fmt.Sprint(item))
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return truncateForToolTrace(strings.Join(parts, ", "), 160)
+	default:
+		return truncateForToolTrace(fmt.Sprint(value), 160)
+	}
+}
+
+func truncateForToolTrace(s string, limit int) string {
+	s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	if s == "" || limit <= 0 {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit-3]) + "..."
 }
 
 // extractTextFromContent 从 Claude 消息的 content 数组中拼接所有文本块。

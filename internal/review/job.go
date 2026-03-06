@@ -1,6 +1,7 @@
 package review
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -30,6 +31,14 @@ type MRRef struct {
 type MRInputResolver interface {
 	platform.Named
 	platform.RepoDetector
+}
+
+// ErrNoReviewableChanges 表示 diff 在应用排除规则后没有剩余可审查内容。
+var ErrNoReviewableChanges = errors.New("no reviewable changes found")
+
+// IsNoReviewableChanges 判断错误是否表示“没有可审查变更”。
+func IsNoReviewableChanges(err error) bool {
+	return errors.Is(err, ErrNoReviewableChanges)
 }
 
 // BuildFilesJob 构造文件列表审查任务。
@@ -63,7 +72,10 @@ func BuildLocalJob(diffExclude []string) (*Job, error) {
 		label = fmt.Sprintf("Last Commit: %s", strings.TrimSpace(string(commitMsg)))
 	}
 
-	diffStr = platform.FilterDiff(diffStr, diffExclude)
+	diffStr, err = filterReviewDiff(diffStr, diffExclude, "no reviewable local changes found after applying diff exclusions")
+	if err != nil {
+		return nil, err
+	}
 
 	var reviewPrompt string
 	if isLastCommit {
@@ -88,9 +100,10 @@ func BuildBranchJob(baseBranch string, diffExclude []string) (*Job, error) {
 		return nil, fmt.Errorf("failed to get branch diff: %w", err)
 	}
 
-	diffStr := platform.FilterDiff(string(diff), diffExclude)
-	if strings.TrimSpace(diffStr) == "" {
-		return nil, fmt.Errorf("no differences found between %s and %s", baseBranch, branch)
+	diffStr, err := filterReviewDiff(string(diff), diffExclude,
+		fmt.Sprintf("no reviewable differences found between %s and %s after applying diff exclusions", baseBranch, branch))
+	if err != nil {
+		return nil, err
 	}
 
 	annotatedDiff := platform.AnnotateDiffWithLineNumbers(diffStr)
@@ -145,26 +158,26 @@ func BuildMRJobFromInput(input string, resolver MRInputResolver, metadata platfo
 // BuildMRJobFromRef 根据已知 MR 信息构造审查任务。
 func BuildMRJobFromRef(ref MRRef, platformName string, metadata platform.MRMetadataProvider, diffExclude []string) (*Job, error) {
 	var mrDiff, mrTitle, mrBody string
-	if metadata != nil {
-		if diff, err := metadata.GetDiff(ref.ID, ref.Repo); err == nil {
-			mrDiff = diff
-		}
-		if info, err := metadata.GetInfo(ref.ID, ref.Repo); err == nil {
-			mrTitle = info.Title
-			mrBody = info.Description
-		}
+	if metadata == nil {
+		return nil, fmt.Errorf("cannot review %s: metadata provider is unavailable", ref.URL)
+	}
+	diff, err := metadata.GetDiff(ref.ID, ref.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get PR/MR diff for %s: %w", ref.URL, err)
+	}
+	mrDiff, err = filterReviewDiff(diff, diffExclude,
+		fmt.Sprintf("%s has no reviewable changes after applying diff exclusions", ref.URL))
+	if err != nil {
+		return nil, err
+	}
+	if info, err := metadata.GetInfo(ref.ID, ref.Repo); err == nil {
+		mrTitle = info.Title
+		mrBody = info.Description
 	}
 
-	mrDiff = platform.FilterDiff(mrDiff, diffExclude)
-
-	var reviewPrompt string
-	if mrDiff != "" {
-		annotatedDiff := platform.AnnotateDiffWithLineNumbers(mrDiff)
-		reviewPrompt = fmt.Sprintf("Please review %s.\n\nTitle: %s\n\nDescription:\n%s\n\nHere is the full diff (each line is prefixed with its new-file line number for reference):\n\n```diff\n%s```\n\nAnalyze these changes and provide your feedback. You already have the complete diff above — do NOT attempt to fetch it again.\nWhen reporting issues, always reference the line number shown at the beginning of each line (e.g. \"line 263\").",
-			ref.URL, mrTitle, mrBody, annotatedDiff)
-	} else {
-		reviewPrompt = fmt.Sprintf("Please review %s. Get the details and diff using any method available to you, then analyze the changes.", ref.URL)
-	}
+	annotatedDiff := platform.AnnotateDiffWithLineNumbers(mrDiff)
+	reviewPrompt := fmt.Sprintf("Please review %s.\n\nTitle: %s\n\nDescription:\n%s\n\nHere is the full diff (each line is prefixed with its new-file line number for reference):\n\n```diff\n%s```\n\nAnalyze these changes and provide your feedback. You already have the complete diff above — do NOT attempt to fetch it again.\nWhen reporting issues, always reference the line number shown at the beginning of each line (e.g. \"line 263\").",
+		ref.URL, mrTitle, mrBody, annotatedDiff)
 
 	label := fmt.Sprintf("PR #%s", ref.ID)
 	if strings.EqualFold(strings.TrimSpace(platformName), "gitlab") {
@@ -181,10 +194,18 @@ func BuildMRJobFromRef(ref MRRef, platformName string, metadata platform.MRMetad
 }
 
 // BuildServerMRJob 使用服务端模板构造 webhook 模式的 MR 审查任务。
-func BuildServerMRJob(ref MRRef, metadata platform.MRMetadataProvider) (*Job, error) {
+func BuildServerMRJob(ref MRRef, metadata platform.MRMetadataProvider, diffExclude []string) (*Job, error) {
+	if metadata == nil {
+		return nil, fmt.Errorf("cannot review %s: metadata provider is unavailable", ref.URL)
+	}
 	mrDiff, err := metadata.GetDiff(ref.ID, ref.Repo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MR diff: %w", err)
+	}
+	mrDiff, err = filterReviewDiff(mrDiff, diffExclude,
+		fmt.Sprintf("%s has no reviewable changes after applying diff exclusions", ref.URL))
+	if err != nil {
+		return nil, err
 	}
 
 	mrInfo, err := metadata.GetInfo(ref.ID, ref.Repo)
@@ -219,4 +240,12 @@ func extractMRIDFromText(input string) string {
 		}
 	}
 	return ""
+}
+
+func filterReviewDiff(diff string, diffExclude []string, noReviewableMsg string) (string, error) {
+	filtered := platform.FilterDiff(diff, diffExclude)
+	if strings.TrimSpace(filtered) == "" {
+		return "", fmt.Errorf("%w: %s", ErrNoReviewableChanges, noReviewableMsg)
+	}
+	return filtered, nil
 }

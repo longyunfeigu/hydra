@@ -34,11 +34,13 @@ type convergenceDisplay struct {
 	reasoning string
 }
 
-func (d *convergenceDisplay) OnWaiting(_ string)                          {}
-func (d *convergenceDisplay) OnMessage(_ string, _ string)                {}
-func (d *convergenceDisplay) OnParallelStatus(_ int, _ []ReviewerStatus)  {}
-func (d *convergenceDisplay) OnRoundComplete(_ int, _ bool)               {}
-func (d *convergenceDisplay) OnContextGathered(_ *GatheredContext)        {}
+func (d *convergenceDisplay) OnWaiting(_ string)                         {}
+func (d *convergenceDisplay) OnMessageChunk(_ string, _ string)          {}
+func (d *convergenceDisplay) OnMessage(_ string, _ string)               {}
+func (d *convergenceDisplay) OnParallelStatus(_ int, _ []ReviewerStatus) {}
+func (d *convergenceDisplay) OnSummaryStatus(_ []ReviewerStatus)         {}
+func (d *convergenceDisplay) OnRoundComplete(_ int, _ bool)              {}
+func (d *convergenceDisplay) OnContextGathered(_ *GatheredContext)       {}
 func (d *convergenceDisplay) OnConvergenceJudgment(verdict, reasoning string) {
 	d.verdict = verdict
 	d.reasoning = reasoning
@@ -183,4 +185,3 @@ func TestCheckConvergence_Round1NotConverged(t *testing.T) {
 		t.Fatal("expected not converged when reviewers found different issues")
 	}
 }
-
