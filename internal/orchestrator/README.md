@@ -122,6 +122,33 @@ StructurizeDelta (单个审查者单轮的增量变化)
 
 ## debateRun 模式 — 单次执行状态分离
 
+这是一个经典的**配置与状态分离**设计模式，核心思想是将不可变的配置和每次执行的可变状态拆开，使编排器可以安全地并发复用。
+
+### 设计动机
+
+类比：把 `DebateOrchestrator` 想象成一台**咖啡机**（配置固定：水温、豆子种类、研磨度），`debateRun` 就是每次按下按钮后的**一次冲泡过程**（水量在变、压力在变、时间在推进）。咖啡机可以反复用，但每杯咖啡的冲泡状态是独立的——你不会把上一杯的残留水量带到下一杯。
+
+如果不做分离，状态直接放在 `DebateOrchestrator` 上：
+- 并发调用两次 `RunStreaming` → 两次执行共享同一份对话历史 → 数据竞争、结果混乱
+- 第二次调用时上一次的残留状态还在 → 需要手动清理，容易遗漏
+
+分离之后：
+- 每次调用天然隔离，互不影响
+- `DebateOrchestrator` 是线程安全的（不可变），可以安全地并发复用
+- 不需要 reset 逻辑，`newRun()` 天然就是干净的
+
+这是 Go 里常见的模式，类似 `http.Server`（配置）vs 每个请求的 handler context（状态）。
+
+### 两者的职责划分
+
+| | `DebateOrchestrator` | `debateRun` |
+|---|---|---|
+| 性质 | **不可变配置**（造好就不变） | **可变状态**（每次执行都不同） |
+| 内容 | reviewers、analyzer、summarizer、options | 对话历史、token 统计、ledger 等 |
+| 生命周期 | 创建一次，**复用多次** | 每次 `RunStreaming` **新建一个** |
+
+### 代码结构
+
 `DebateOrchestrator` 本身只保存**可复用的配置**（reviewers、analyzer、summarizer、options 等）。每次调用 `RunStreaming` 时，通过 `newRun(prompt)` 创建一个独立的 `debateRun`，将**可变状态**（对话历史、token 统计、ledger 等）隔离到 run 实例中：
 
 ```go
@@ -183,6 +210,285 @@ RunStreaming(ctx, label, prompt, display)
 │           └── 最多重试 3 次（ChatOptions{MaxTokens: 32768}）
 │
 └── endAllSessions()                        // 清理所有会话
+```
+
+## extractRoundIssueDeltas 流程详解（含示例）
+
+### 场景设定
+
+假设有两个审查者 `claude` 和 `gpt4o`，刚结束 **Round 2** 的辩论。Round 1 时各自已经发现了一些问题：
+
+```
+claude 的 Ledger（Round 1 积累）:
+  I1: [active] high/security  auth.go:15  "SQL注入风险"
+  I2: [active] medium/perf    db.go:80    "N+1查询"
+
+gpt4o 的 Ledger（Round 1 积累）:
+  I1: [active] high/security  auth.go:17  "SQL注入漏洞"     ← 和 claude:I1 本质相同
+  I2: [active] low/style      main.go:5   "变量命名不规范"
+```
+
+Round 2 辩论中，两人的发言（`roundOutputs`）大致是：
+- **claude**: "我同意 gpt4o 的 SQL 注入问题，撤回我之前提的 N+1 查询（经确认不是问题），另外发现一个新的 XSS 问题"
+- **gpt4o**: "认同 claude 说的 N+1 不是问题，我也撤回变量命名那个太 nitpick 了"
+
+### Step 1: 构建全局问题视图（currentCanonicalSummary）
+
+```go
+currentCanonicalSummary := BuildCanonicalIssueSummary(o.currentCanonicalIssues())
+```
+
+在提取新一轮 delta 之前，先给 AI 一张"全局问题总览表"。这一步做了三件事：
+
+1. **`collectCanonicalInputsFromLedgers()`** — 把所有审查者的 ledger 问题收集到一起：`[claude:I1, claude:I2, gpt4o:I1, gpt4o:I2]`
+2. **`CanonicalizeMergedIssues()`** — 跨审查者去重合并：claude:I1 和 gpt4o:I1 因为同文件、标题相似，合并为一个 canonical issue
+3. **`ApplyCanonicalSignals()`** — 应用之前轮次积累的 support/withdraw/contest 信号
+
+最终生成的 markdown 表格大致如下：
+
+```markdown
+| Canonical ID | Severity | File:Line  | Title        | Supporters    | Issue Refs           |
+|-------------|----------|------------|--------------|---------------|----------------------|
+| a1b2c3d4    | high     | auth.go:15 | SQL注入风险   | claude, gpt4o | claude:I1, gpt4o:I1  |
+| e5f6g7h8    | medium   | db.go:80   | N+1查询       | claude        | claude:I2            |
+| i9j0k1l2    | low      | main.go:5  | 变量命名不规范 | gpt4o         | gpt4o:I2             |
+```
+
+**为什么需要这张表？** 如果没有全局视图，AI 在提取 claude 的 delta 时只知道 claude 自己的 ledger，不知道 `gpt4o:I1` 的存在，就无法正确生成 `support: [{issue_ref: "gpt4o:I1"}]`。这张表让 AI 能正确理解审查者对其他人问题的态度变化。
+
+### Step 2: 并行提取每个审查者的 delta
+
+```go
+g, gctx := errgroup.WithContext(ctx)
+for _, reviewer := range o.reviewers {
+    g.Go(func() error {
+        delta := o.extractIssueDelta(reviewerID, round, roundContent, ledger.BuildSummary(), canonicalSummary)
+        ledger.ApplyDelta(delta, round)
+        o.applyCanonicalActions(reviewerID, round, delta)
+    })
+}
+```
+
+两个审查者**并行**处理。以 claude 为例，`extractIssueDelta()` 把以下信息拼成 prompt 发给 summarizer：
+
+| 输入 | 内容 |
+|------|------|
+| `roundContent` | claude 在 Round 2 说的原文 |
+| `ledgerSummary` | claude 当前的问题清单（I1 SQL注入、I2 N+1查询） |
+| `canonicalSummary` | 上面的全局问题表格 |
+| `schema` | 要求输出的 JSON 格式 |
+
+AI 返回结构化的 delta JSON（最多重试 3 次）：
+
+```json
+// claude 的 Round 2 delta
+{
+  "add": [{"severity": "high", "category": "security", "file": "template.go", "line": 42,
+           "title": "XSS漏洞", "description": "未转义用户输入"}],
+  "retract": ["I2"],
+  "update": [],
+  "support": [{"issue_ref": "gpt4o:I1"}],
+  "withdraw": [],
+  "contest": []
+}
+```
+
+```json
+// gpt4o 的 Round 2 delta
+{
+  "add": [],
+  "retract": ["I2"],
+  "update": [],
+  "support": [],
+  "withdraw": [],
+  "contest": []
+}
+```
+
+### Step 3: ledger.ApplyDelta() — 更新本地账本
+
+**claude 的 Ledger 变化：**
+
+```
+I1: [active]    high/security  auth.go:15     "SQL注入风险"   ← 不变
+I2: [retracted] medium/perf    db.go:80       "N+1查询"       ← retract
+I3: [active]    high/security  template.go:42 "XSS漏洞"       ← 新增（add）
+```
+
+**gpt4o 的 Ledger 变化：**
+
+```
+I1: [active]    high/security  auth.go:17  "SQL注入漏洞"      ← 不变
+I2: [retracted] low/style      main.go:5   "变量命名不规范"    ← retract
+```
+
+### Step 4: applyCanonicalActions() — 收集跨审查者信号
+
+从 claude 的 delta 中提取 `support: [gpt4o:I1]`，生成：
+
+```go
+CanonicalSignal{ReviewerID: "claude", IssueRef: "gpt4o:I1", Round: 2, Action: "support"}
+```
+
+加锁写入 `o.canonicalSignals`。
+
+### 最终状态（Round 2 结束后）
+
+```
+claude Ledger:  I1(active:SQL注入)  I2(retracted:N+1)  I3(active:XSS)
+gpt4o Ledger:   I1(active:SQL注入)  I2(retracted:命名)
+
+canonicalSignals: [claude supports gpt4o:I1]
+```
+
+辩论结束后，`structurizeIssuesFromLedgers()` 会把两个 ledger 合并：
+- claude:I1 和 gpt4o:I1 因为同文件、标题相似 → 合并为一个 canonical issue，`SupportedBy: [claude, gpt4o]`
+- claude:I3 (XSS) → 独立的 canonical issue，`SupportedBy: [claude]`
+- 两个 retracted 的问题被标记 `WithdrawnBy`，最终因为 `SupportedBy` 为空而被过滤掉
+
+### 全景图
+
+```
+extractRoundIssueDeltas(round=2, roundOutputs)
+│
+│ ┌─────────────────────────────────────────────────────┐
+│ │ Step 0: 构建全局问题视图                              │
+│ │                                                     │
+│ │ currentCanonicalIssues()                            │
+│ │ ├── collectCanonicalInputsFromLedgers()             │
+│ │ │   把所有审查者 ledger 的问题倒成一个扁平列表         │
+│ │ │   [claude:I1, claude:I2, gpt4o:I1, gpt4o:I2]     │
+│ │ │                                                   │
+│ │ ├── CanonicalizeMergedIssues()                      │
+│ │ │   跨审查者去重合并（文件+行号+文本相似度）            │
+│ │ │   claude:I1 + gpt4o:I1 → 合并为 1 个               │
+│ │ │                                                   │
+│ │ └── ApplyCanonicalSignals()                         │
+│ │     应用历史轮次的 support/withdraw/contest           │
+│ │     过滤掉无人支持的问题                              │
+│ │                                                     │
+│ │ BuildCanonicalIssueSummary() → Markdown 表格         │
+│ │ ┌──────────────────────────────────────────────┐     │
+│ │ │ ID       │ Severity │ File     │ Supporters  │     │
+│ │ │ a1b2c3d4 │ high     │ auth.go  │ claude,gpt4o│     │
+│ │ │ e5f6g7h8 │ medium   │ db.go    │ claude      │     │
+│ │ │ i9j0k1l2 │ low      │ main.go  │ gpt4o       │     │
+│ │ └──────────────────────────────────────────────┘     │
+│ └─────────────────────────────────────────────────────┘
+│
+│ ┌─────────────────────────────────────────────────────┐
+│ │ Step 1: 并行提取每个审查者的 delta                     │
+│ │                                                     │
+│ │  errgroup.Go ──┬── claude 分支 ──┬── gpt4o 分支      │
+│ │                │                 │                   │
+│ │  ┌─────────────▼──────┐  ┌──────▼──────────────┐    │
+│ │  │ extractIssueDelta  │  │ extractIssueDelta    │    │
+│ │  │                    │  │                      │    │
+│ │  │ 输入:              │  │ 输入:                │    │
+│ │  │  · claude 的发言    │  │  · gpt4o 的发言      │    │
+│ │  │  · claude 的 ledger │  │  · gpt4o 的 ledger   │    │
+│ │  │  · 全局问题表格     │  │  · 全局问题表格       │    │
+│ │  │  · JSON schema     │  │  · JSON schema       │    │
+│ │  │                    │  │                      │    │
+│ │  │ 拼成 prompt        │  │ 拼成 prompt          │    │
+│ │  │ 发给 summarizer AI │  │ 发给 summarizer AI   │    │
+│ │  │ (最多重试 3 次)     │  │ (最多重试 3 次)       │    │
+│ │  │                    │  │                      │    │
+│ │  │ 输出:              │  │ 输出:                │    │
+│ │  │ {                  │  │ {                    │    │
+│ │  │  add: [XSS漏洞],   │  │  add: [],            │    │
+│ │  │  retract: ["I2"],  │  │  retract: ["I2"],    │    │
+│ │  │  support: [gpt4o:  │  │  support: [],        │    │
+│ │  │    I1],            │  │  withdraw: [],       │    │
+│ │  │  ...               │  │  ...                 │    │
+│ │  │ }                  │  │ }                    │    │
+│ │  └────────┬───────────┘  └──────┬───────────────┘    │
+│ │           │                     │                    │
+│ └───────────┼─────────────────────┼────────────────────┘
+│             │                     │
+│ ┌───────────▼─────────────────────▼────────────────────┐
+│ │ Step 2: 更新本地 Ledger (ledger.ApplyDelta)           │
+│ │                                                     │
+│ │ claude Ledger:                gpt4o Ledger:          │
+│ │  I1 [active]  SQL注入         I1 [active]  SQL注入    │
+│ │  I2 [retracted] N+1查询       I2 [retracted] 命名     │
+│ │  I3 [active]  XSS ← 新增                             │
+│ └─────────────────────────────────────────────────────┘
+│
+│ ┌─────────────────────────────────────────────────────┐
+│ │ Step 3: 收集跨审查者信号 (applyCanonicalActions)      │
+│ │                                                     │
+│ │ 从 delta 的 support/withdraw/contest 字段提取信号      │
+│ │                                                     │
+│ │ claude 的 delta 有 support:[gpt4o:I1]                │
+│ │ → CanonicalSignal{claude, "gpt4o:I1", round=2,      │
+│ │                   action="support"}                  │
+│ │                                                     │
+│ │ 加锁写入 o.canonicalSignals（因为并行所以要锁）         │
+│ └─────────────────────────────────────────────────────┘
+│
+│ g.Wait()  ← 等待所有审查者完成
+│
+└── return（本轮处理结束，进入下一轮或总结阶段）
+```
+
+### 数据流总结
+
+整个函数是一个**感知-提取-更新**的循环：
+
+```
+全局视图（给 AI 看的地图）
+       ↓
+AI 从发言中提取增量变化（add/retract/update/support/withdraw/contest）
+       ↓
+更新两个地方：
+  ├── 本地 Ledger（每个审查者自己的问题账本）
+  └── 全局 Signals（跨审查者的态度信号池）
+       ↓
+下一轮开始时，重新构建全局视图（包含了本轮的更新）→ 循环
+```
+
+复杂的根源在于它同时维护了两个层次的状态：
+- **局部状态**（Ledger）：每个审查者独立维护自己发现的问题，可以新增、撤回、更新
+- **全局状态**（Canonical + Signals）：跨审查者的问题合并视图和态度信号
+
+每轮结束时，先从局部状态推导出全局视图给 AI 看，AI 再产出新的局部变更，如此循环直到辩论结束。
+
+### applyCanonicalActions vs ApplyCanonicalSignals
+
+这两个函数名字相似但职责完全不同，一个是**收集信号**，一个是**兑现信号**：
+
+| | `applyCanonicalActions` | `ApplyCanonicalSignals` |
+|---|---|---|
+| **阶段** | 每轮结束时（辩论进行中） | 辩论结束时 / 构建全局视图时 |
+| **做什么** | 从 delta 里**收集**信号，扔进信号池 | 把信号池里的信号**应用**到 canonical issues 上 |
+| **类比** | 往信箱里**投信** | 把信箱里的信**拆开处理** |
+| **输入** | 一个审查者的一轮 delta | 所有 canonical issues + 全部历史信号 |
+| **输出** | 追加到 `o.canonicalSignals` | 更新后的 issue 列表（SupportedBy/WithdrawnBy/ContestedBy 已变更） |
+| **可见性** | unexported（内部方法） | Exported（公开函数） |
+
+时间线视角：
+
+```
+Round 1 结束
+  applyCanonicalActions(claude, delta) → 收集: []            ← 第一轮没有跨审查者信号
+  applyCanonicalActions(gpt4o, delta)  → 收集: []
+
+Round 2 结束
+  applyCanonicalActions(claude, delta) → 收集: [claude supports gpt4o:I1]
+  applyCanonicalActions(gpt4o, delta)  → 收集: []
+
+  信号池: [claude supports gpt4o:I1]
+
+                    ↓ 辩论结束，最终合并 ↓
+
+structurizeIssuesFromLedgers()
+  CanonicalizeMergedIssues(...)         → 先做文本相似度去重合并
+  ApplyCanonicalSignals(issues, 信号池)  → 再把信号池里的信号应用上去
+    → "claude supports gpt4o:I1"
+    → 找到包含 gpt4o:I1 的 canonical issue
+    → 把 claude 加入 SupportedBy
+    → 过滤掉 SupportedBy 为空的
 ```
 
 ## 双模问题提取：Legacy vs Ledger
