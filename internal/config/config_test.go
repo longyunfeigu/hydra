@@ -191,7 +191,7 @@ func TestValidateConfig(t *testing.T) {
 				Summarizer: ReviewerConfig{Model: "claude-code", Prompt: "p"},
 			},
 			wantErr: true,
-			errMsg:  "summarizer.model must be an OpenAI model",
+			errMsg:  "summarizer.model must be an API model",
 		},
 		{
 			name: "valid config",

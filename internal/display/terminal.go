@@ -24,17 +24,18 @@ import (
 // 包含旋转动画器（spinner）用于显示等待状态，
 // 以及当前审查者和轮次信息用于格式化输出。
 type Display struct {
-	spin            *spinner.Spinner // 终端旋转动画器，用于显示等待/处理中状态
-	isTTY           bool             // stdout 是否为 TTY（非 TTY 时禁用 spinner 避免刷屏）
-	termWidth       int              // 终端列宽，用于截断 spinner 文本防止换行
-	currentReviewer string           // 当前正在展示输出的审查者 ID
-	currentRound    int              // 当前审查轮次
-	maxRounds       int              // 最大审查轮次数
-	showToolTrace   bool             // 是否显示 analyzer/reviewer 的完整过程输出
-	traceHintShown  bool             // 默认摘要模式下，是否已提示可用 --show-tool-trace 查看明细
-	mu              sync.Mutex
-	streamedMessage map[string]bool
-	currentPhase    string
+	spin               *spinner.Spinner // 终端旋转动画器，用于显示等待/处理中状态
+	isTTY              bool             // stdout 是否为 TTY（非 TTY 时禁用 spinner 避免刷屏）
+	termWidth          int              // 终端列宽，用于截断 spinner 文本防止换行
+	currentReviewer    string           // 当前正在展示输出的审查者 ID
+	currentRound       int              // 当前审查轮次
+	maxRounds          int              // 最大审查轮次数
+	showToolTrace      bool             // 是否显示 analyzer/reviewer 的完整过程输出
+	traceHintShown     bool             // 默认摘要模式下，是否已提示可用 --show-tool-trace 查看明细
+	mu                 sync.Mutex
+	streamedMessage    map[string]bool
+	announcedReviewers map[string]bool
+	currentPhase       string
 }
 
 // New 创建一个新的 Display 实例。
@@ -52,13 +53,14 @@ func New() *Display {
 	}
 
 	return &Display{
-		spin:            s,
-		isTTY:           tty,
-		termWidth:       width,
-		currentRound:    1,
-		showToolTrace:   false,
-		traceHintShown:  false,
-		streamedMessage: make(map[string]bool),
+		spin:               s,
+		isTTY:              tty,
+		termWidth:          width,
+		currentRound:       1,
+		showToolTrace:      false,
+		traceHintShown:     false,
+		streamedMessage:    make(map[string]bool),
+		announcedReviewers: make(map[string]bool),
 	}
 }
 
@@ -253,6 +255,16 @@ func (d *Display) OnMessageChunk(reviewerID string, chunk string) {
 func (d *Display) OnParallelStatus(round int, statuses []orchestrator.ReviewerStatus) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.showToolTrace {
+		for _, status := range statuses {
+			if status.Status != "thinking" || d.announcedReviewers[status.ReviewerID] {
+				continue
+			}
+			d.SpinnerStop()
+			fmt.Println(color.HiBlackString("  [%s] waiting for first chunk...", status.ReviewerID))
+			d.announcedReviewers[status.ReviewerID] = true
+		}
+	}
 	if !d.isTTY {
 		return
 	}
@@ -691,6 +703,7 @@ func (d *Display) printPhaseHeader(phaseLabel, title, phaseID string) {
 	}
 	d.currentPhase = phaseID
 	d.currentReviewer = ""
+	d.announcedReviewers = make(map[string]bool)
 
 	fmt.Println()
 	color.New(color.FgHiBlack, color.Bold).Printf("  %s", phaseLabel)

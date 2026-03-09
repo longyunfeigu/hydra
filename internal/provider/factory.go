@@ -13,12 +13,15 @@ import (
 // 支持的模型名称：
 //   - "claude-code"：使用 Claude Code CLI 作为后端
 //   - "codex-cli"：使用 OpenAI Codex CLI 作为后端
+//   - "gemini-cli"：使用 Gemini CLI 作为后端
 //   - "mock*"：使用模拟提供者（用于测试）
 //
+// providerName 为可选的显式 provider 名称（如 "openrouter"、"minimax"），
+// 用于指定 OpenAI-compatible API provider。
 // modelName 为可选的底层模型名称（如 "claude-sonnet-4-5-20250514"），
 // 对 CLI 提供者会通过 --model 参数传递。
 // 如果全局 Mock 模式开启，则所有模型都会被替换为 MockProvider。
-func CreateProvider(model, modelName, reasoningEffort string, cfg *config.HydraConfig) (AIProvider, error) {
+func CreateProvider(model, modelName, reasoningEffort, providerName string, cfg *config.HydraConfig) (AIProvider, error) {
 	// 全局模拟模式：将所有模型替换为 MockProvider，用于测试和开发
 	if cfg.Mock {
 		return NewMockProvider(), nil
@@ -41,6 +44,25 @@ func CreateProvider(model, modelName, reasoningEffort string, cfg *config.HydraC
 		p.skipPermissions = skipPerms
 		p.modelName = modelName
 		p.promptSizeThreshold = cfg.Defaults.PromptSizeThreshold
+		return p, nil
+	case model == "gemini-cli":
+		// 创建 Gemini CLI 提供者，通过调用 gemini 命令行工具进行交互
+		p := NewGeminiCliProvider()
+		p.skipPermissions = skipPerms
+		p.modelName = modelName
+		p.promptSizeThreshold = cfg.Defaults.PromptSizeThreshold
+		return p, nil
+	case providerName != "":
+		// 显式指定 provider 名称：使用对应的 OpenAI-compatible API
+		provCfg, exists := cfg.Providers[providerName]
+		if !exists {
+			return nil, fmt.Errorf("provider %q not found in config (providers.%s)", providerName, providerName)
+		}
+		if provCfg.APIKey == "" {
+			return nil, fmt.Errorf("provider %q requires api_key in config (providers.%s.api_key)", providerName, providerName)
+		}
+		p := NewOpenAIProvider(provCfg.APIKey, model, provCfg.BaseURL)
+		p.reasoningEffort = reasoningEffort
 		return p, nil
 	case strings.HasPrefix(model, "gpt-"),
 		strings.HasPrefix(model, "o1-"),

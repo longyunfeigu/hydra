@@ -21,10 +21,10 @@ import (
 // 它通过创建子进程调用 `codex` 命令，使用 JSONL 格式进行数据交换。
 // 支持会话恢复（resume）功能，通过 thread_id 维持多轮对话的上下文。
 type CodexCliProvider struct {
-	cwd             string           // CLI 命令的工作目录，决定 codex 在哪个目录下执行
-	timeout         time.Duration    // 无活动超时时间，超过此时间将终止 CLI 进程
-	session         CliSessionHelper // 会话辅助器，管理会话状态和提示词构建
-	sessionEnabled  bool             // 是否启用会话模式（支持多轮对话）
+	cwd                 string           // CLI 命令的工作目录，决定 codex 在哪个目录下执行
+	timeout             time.Duration    // 无活动超时时间，超过此时间将终止 CLI 进程
+	session             CliSessionHelper // 会话辅助器，管理会话状态和提示词构建
+	sessionEnabled      bool             // 是否启用会话模式（支持多轮对话）
 	skipPermissions     bool             // 是否跳过 CLI 的权限确认提示
 	modelName           string           // 底层模型名称，传给 --model 参数
 	promptSizeThreshold int              // 大 prompt 写临时文件的阈值（字节），0 表示使用默认值
@@ -63,11 +63,14 @@ func (p *CodexCliProvider) EndSession() {
 }
 
 // SessionID 返回当前会话的 thread_id。
-func (p *CodexCliProvider) SessionID() string          { return p.session.SessionID() }
+func (p *CodexCliProvider) SessionID() string { return p.session.SessionID() }
+
 // IsFirstMessage 返回当前是否是会话中的第一条消息。
-func (p *CodexCliProvider) IsFirstMessage() bool       { return p.session.IsFirstMessage() }
+func (p *CodexCliProvider) IsFirstMessage() bool { return p.session.IsFirstMessage() }
+
 // MarkMessageSent 标记一条消息已发送，更新会话状态。
-func (p *CodexCliProvider) MarkMessageSent()           { p.session.MarkMessageSent() }
+func (p *CodexCliProvider) MarkMessageSent() { p.session.MarkMessageSent() }
+
 // ShouldSendFullHistory 返回是否需要发送完整的消息历史（首次消息时需要）。
 func (p *CodexCliProvider) ShouldSendFullHistory() bool { return p.session.ShouldSendFullHistory() }
 
@@ -162,7 +165,7 @@ func (p *CodexCliProvider) buildArgs(snap SessionSnapshot) []string {
 //   - "thread.started"：线程启动事件，包含 thread_id 用于后续会话恢复
 //   - "item.completed"：内容完成事件，包含 AI 生成的消息文本
 type codexEvent struct {
-	Type     string         `json:"type"`               // 事件类型
+	Type     string         `json:"type"`                // 事件类型
 	ThreadID string         `json:"thread_id,omitempty"` // 线程 ID（仅 thread.started 事件包含）
 	Item     *codexItemData `json:"item,omitempty"`      // 事件数据（仅 item.completed 事件包含）
 }
@@ -173,31 +176,261 @@ type codexItemData struct {
 	Text string `json:"text"` // AI 生成的文本内容
 }
 
+type codexStreamState struct {
+	lastAgentText string
+}
+
 // parseJsonlOutput 解析 Codex CLI 的 JSONL 输出，提取会话 ID 和 AI 生成的消息文本。
 // 逐行解析 JSON 对象，处理两种关键事件：
 //   - thread.started：提取 thread_id 并保存到会话中，用于后续的会话恢复
 //   - item.completed（agent_message 类型）：提取 AI 的回复文本并拼接
 func (p *CodexCliProvider) parseJsonlOutput(output string) string {
-	var text string
+	var text strings.Builder
+	state := &codexStreamState{}
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
-		var event codexEvent
-		if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
-			util.Warnf("codex: failed to parse JSONL line: %v", err)
-			continue
-		}
-		// 捕获线程启动事件，保存 thread_id 以便后续恢复会话
-		if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
-			p.session.SetSessionID(event.ThreadID)
-		} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
-			// 提取 AI 代理消息的文本内容
-			text += event.Item.Text
+		for _, chunk := range p.handleCodexEvent(trimmed, state, false) {
+			text.WriteString(chunk)
 		}
 	}
-	return text
+	return text.String()
+}
+
+func (p *CodexCliProvider) handleCodexEvent(line string, state *codexStreamState, includeToolTrace bool) []string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(line), &payload); err != nil {
+		util.Warnf("codex: failed to parse JSONL line: %v", err)
+		return nil
+	}
+
+	eventType := strings.TrimSpace(getString(payload, "type"))
+	if eventType == "" {
+		return nil
+	}
+
+	if isCodexThreadStartedEvent(eventType) && p.sessionEnabled {
+		if threadID := strings.TrimSpace(getString(payload, "thread_id")); threadID != "" {
+			p.session.SetSessionID(threadID)
+		}
+	}
+
+	if chunk := extractCodexMessageChunk(payload, eventType, state); chunk != "" {
+		return []string{chunk}
+	}
+
+	if !includeToolTrace {
+		return nil
+	}
+	if chunk := formatCodexToolTrace(payload, eventType); chunk != "" {
+		return []string{chunk}
+	}
+	return nil
+}
+
+func isCodexThreadStartedEvent(eventType string) bool {
+	return eventType == "thread.started" || eventType == "thread_started"
+}
+
+func extractCodexMessageChunk(payload map[string]any, eventType string, state *codexStreamState) string {
+	switch eventType {
+	case "agent_message_delta", "agent_message_content_delta":
+		if delta := strings.TrimSpace(firstNonEmpty(
+			getString(payload, "delta"),
+			getString(payload, "text"),
+		)); delta != "" {
+			state.lastAgentText += delta
+			return delta
+		}
+	case "agent_message", "item.completed", "item_completed", "raw_response_item":
+		message := payload
+		if eventType == "item.completed" || eventType == "item_completed" {
+			item, ok := getMap(payload, "item")
+			if !ok {
+				return ""
+			}
+			itemType := strings.TrimSpace(getString(item, "type"))
+			if itemType != "" && itemType != "agent_message" {
+				return ""
+			}
+			message = item
+		}
+		if eventType == "raw_response_item" {
+			if item, ok := getMap(payload, "response_item"); ok {
+				message = item
+			}
+		}
+		text := strings.TrimSpace(extractCodexMessageText(message))
+		if text == "" {
+			return ""
+		}
+		delta := diffAssistantText(state.lastAgentText, text)
+		state.lastAgentText = text
+		return delta
+	}
+	return ""
+}
+
+func extractCodexMessageText(value map[string]any) string {
+	for _, key := range []string{"text", "raw_content", "summary_text"} {
+		if text := strings.TrimSpace(getString(value, key)); text != "" {
+			return text
+		}
+	}
+	for _, key := range []string{"message", "item", "output_item", "response_item"} {
+		if nested, ok := getMap(value, key); ok {
+			if text := strings.TrimSpace(extractCodexMessageText(nested)); text != "" {
+				return text
+			}
+		}
+	}
+	for _, key := range []string{"content", "content_items", "output_items"} {
+		if text := strings.TrimSpace(extractCodexTextArray(value[key])); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func extractCodexTextArray(value any) string {
+	items, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, item := range items {
+		switch v := item.(type) {
+		case string:
+			if s := strings.TrimSpace(v); s != "" {
+				parts = append(parts, s)
+			}
+		case map[string]any:
+			if text := strings.TrimSpace(extractCodexMessageText(v)); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+func formatCodexToolTrace(payload map[string]any, eventType string) string {
+	switch eventType {
+	case "exec_command_begin":
+		if cmd := strings.TrimSpace(formatCodexParsedCommand(payload["parsed_cmd"])); cmd != "" {
+			return fmt.Sprintf("\n[tool] Exec: %s\n", cmd)
+		}
+		if cmd := strings.TrimSpace(firstNonEmpty(
+			getString(payload, "command"),
+			getString(payload, "input_text"),
+			getString(payload, "aggregated_output"),
+		)); cmd != "" {
+			return fmt.Sprintf("\n[tool] Exec: %s\n", cmd)
+		}
+	case "mcp_tool_call_begin":
+		if invocation, ok := getMap(payload, "invocation"); ok {
+			server := strings.TrimSpace(firstNonEmpty(
+				getString(invocation, "server_name"),
+				getString(payload, "server_name"),
+			))
+			tool := strings.TrimSpace(firstNonEmpty(
+				getString(invocation, "tool_name"),
+				getString(invocation, "name"),
+				getString(payload, "tool_name"),
+			))
+			if server != "" || tool != "" {
+				return fmt.Sprintf("\n[tool] MCP: %s\n", strings.TrimSpace(strings.Join([]string{server, tool}, ".")))
+			}
+		}
+	case "web_search_begin":
+		if queries, ok := payload["queries"].([]any); ok {
+			for _, query := range queries {
+				if q, ok := query.(map[string]any); ok {
+					if text := strings.TrimSpace(getString(q, "q")); text != "" {
+						return fmt.Sprintf("\n[tool] WebSearch: %s\n", text)
+					}
+				}
+			}
+		}
+		if text := strings.TrimSpace(firstNonEmpty(getString(payload, "query"), getString(payload, "q"))); text != "" {
+			return fmt.Sprintf("\n[tool] WebSearch: %s\n", text)
+		}
+	case "view_image_tool_call":
+		return "\n[tool] ViewImage\n"
+	case "image_generation_begin":
+		return "\n[tool] ImageGeneration\n"
+	case "terminal_interaction":
+		if prompt := strings.TrimSpace(firstNonEmpty(
+			getString(payload, "stdin"),
+			getString(payload, "text"),
+			getString(payload, "prompt"),
+		)); prompt != "" {
+			return fmt.Sprintf("\n[input] %s\n", prompt)
+		}
+		return "\n[input] Codex requested terminal interaction\n"
+	case "request_user_input", "elicitation_request", "exec_approval_request", "apply_patch_approval_request":
+		if prompt := strings.TrimSpace(firstNonEmpty(
+			getString(payload, "reason"),
+			getString(payload, "text"),
+			getString(payload, "prompt"),
+		)); prompt != "" {
+			return fmt.Sprintf("\n[input] %s\n", prompt)
+		}
+		return "\n[input] Codex requested user input\n"
+	}
+	return ""
+}
+
+func formatCodexParsedCommand(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, part := range v {
+			if s, ok := part.(string); ok && strings.TrimSpace(s) != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	case map[string]any:
+		if cmd, ok := v["cmd"]; ok {
+			return formatCodexParsedCommand(cmd)
+		}
+	}
+	return ""
+}
+
+func getMap(value map[string]any, key string) (map[string]any, bool) {
+	nested, ok := value[key].(map[string]any)
+	return nested, ok
+}
+
+func getString(value map[string]any, key string) string {
+	raw, ok := value[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		return ""
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // runCodex 以同步方式运行 Codex CLI，等待命令完成后返回完整的响应文本。
@@ -230,10 +463,10 @@ func (p *CodexCliProvider) runCodex(ctx context.Context, prompt string, snap Ses
 // 适合长时间运行的审查任务。
 //
 // 主要机制：
-//   1. 通过 pipe 连接子进程的 stdout/stderr
-//   2. 后台 goroutine 监控无活动超时，超时后强制终止进程
-//   3. 后台 goroutine 读取 stderr 以更新活动时间戳
-//   4. 主循环逐行读取 stdout，解析 JSONL 事件并分发到 chunks channel
+//  1. 通过 pipe 连接子进程的 stdout/stderr
+//  2. 后台 goroutine 监控无活动超时，超时后强制终止进程
+//  3. 后台 goroutine 读取 stderr 以更新活动时间戳
+//  4. 主循环逐行读取 stdout，解析 JSONL 事件并分发到 chunks channel
 func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, snap SessionSnapshot, chunks chan<- string) error {
 	args := p.buildArgs(snap)
 	cmd := exec.CommandContext(ctx, "codex", args...)
@@ -308,6 +541,7 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 	}()
 
 	// 主循环：从 stdout 流式读取数据，按行缓冲并解析 JSONL 事件
+	state := &codexStreamState{}
 	var lineBuf string
 	buf := make([]byte, 4096)
 	for {
@@ -328,19 +562,8 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 				if line == "" {
 					continue
 				}
-
-				// 解析 JSONL 事件
-				var event codexEvent
-				if err := json.Unmarshal([]byte(line), &event); err != nil {
-					util.Warnf("codex stream: failed to parse JSONL line: %v", err)
-					continue
-				}
-				// 处理线程启动事件：保存 thread_id
-				if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
-					p.session.SetSessionID(event.ThreadID)
-				} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
-					// 处理完成事件：将 AI 响应文本发送到 chunks channel
-					chunks <- event.Item.Text
+				for _, chunk := range p.handleCodexEvent(line, state, true) {
+					chunks <- chunk
 				}
 			}
 		}
@@ -351,13 +574,8 @@ func (p *CodexCliProvider) runCodexStream(ctx context.Context, prompt string, sn
 
 	// 处理缓冲区中可能残留的最后一行数据（未以换行符结尾的情况）
 	if trimmed := strings.TrimSpace(lineBuf); trimmed != "" {
-		var event codexEvent
-		if err := json.Unmarshal([]byte(trimmed), &event); err == nil {
-			if event.Type == "thread.started" && event.ThreadID != "" && p.sessionEnabled {
-				p.session.SetSessionID(event.ThreadID)
-			} else if event.Type == "item.completed" && event.Item != nil && event.Item.Type == "agent_message" && event.Item.Text != "" {
-				chunks <- event.Item.Text
-			}
+		for _, chunk := range p.handleCodexEvent(trimmed, state, true) {
+			chunks <- chunk
 		}
 	}
 

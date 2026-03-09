@@ -69,6 +69,7 @@ type ReviewerConfig struct {
 	ModelName       string `yaml:"model_name,omitempty"`       // 底层模型名称，传给 CLI 的 --model 参数（如 "claude-sonnet-4-5-20250514"）
 	Prompt          string `yaml:"prompt"`                     // 系统提示词，指导模型的审查角度和风格
 	ReasoningEffort string `yaml:"reasoning_effort,omitempty"` // 推理深度（none|low|medium|high|xhigh），仅 OpenAI 推理模型有效
+	Provider        string `yaml:"provider,omitempty"`         // 显式指定 provider 名称（如 "openrouter"、"minimax"），用于 OpenAI-compatible API
 }
 
 // ContextGathererConfig 保存上下文收集器的配置。
@@ -124,6 +125,7 @@ func expandEnvVarsInConfig(cfg *HydraConfig) {
 		v.ModelName = expandEnvVars(v.ModelName)
 		v.Prompt = expandEnvVars(v.Prompt)
 		v.ReasoningEffort = expandEnvVars(v.ReasoningEffort)
+		v.Provider = expandEnvVars(v.Provider)
 		cfg.Reviewers[k] = v
 	}
 	// 替换分析器和汇总器配置中的环境变量
@@ -131,10 +133,12 @@ func expandEnvVarsInConfig(cfg *HydraConfig) {
 	cfg.Analyzer.ModelName = expandEnvVars(cfg.Analyzer.ModelName)
 	cfg.Analyzer.Prompt = expandEnvVars(cfg.Analyzer.Prompt)
 	cfg.Analyzer.ReasoningEffort = expandEnvVars(cfg.Analyzer.ReasoningEffort)
+	cfg.Analyzer.Provider = expandEnvVars(cfg.Analyzer.Provider)
 	cfg.Summarizer.Model = expandEnvVars(cfg.Summarizer.Model)
 	cfg.Summarizer.ModelName = expandEnvVars(cfg.Summarizer.ModelName)
 	cfg.Summarizer.Prompt = expandEnvVars(cfg.Summarizer.Prompt)
 	cfg.Summarizer.ReasoningEffort = expandEnvVars(cfg.Summarizer.ReasoningEffort)
+	cfg.Summarizer.Provider = expandEnvVars(cfg.Summarizer.Provider)
 }
 
 // GetConfigPath 返回配置文件的路径。
@@ -218,8 +222,8 @@ func validateConfig(cfg *HydraConfig) error {
 	if err := validateReviewerConfig("summarizer", cfg.Summarizer); err != nil {
 		return err
 	}
-	if !cfg.Mock && !isOpenAIModel(cfg.Summarizer.Model) && !isMockModel(cfg.Summarizer.Model) {
-		return fmt.Errorf("config error: summarizer.model must be an OpenAI model (gpt-*, o1-*, o3-*), got %q", cfg.Summarizer.Model)
+	if !cfg.Mock && !isAPIModel(cfg.Summarizer, cfg) && !isMockModel(cfg.Summarizer.Model) {
+		return fmt.Errorf("config error: summarizer.model must be an API model (gpt-*/o1-*/o3-*/o4-* or with explicit provider), got %q", cfg.Summarizer.Model)
 	}
 
 	// 验证分析器配置
@@ -235,11 +239,21 @@ func validateConfig(cfg *HydraConfig) error {
 	return nil
 }
 
-func isOpenAIModel(model string) bool {
-	m := strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(m, "gpt-") ||
+// isAPIModel 判断 reviewer 是否使用 API 模型（OpenAI 或带有显式 provider 的 OpenAI-compatible API）。
+func isAPIModel(rc ReviewerConfig, cfg *HydraConfig) bool {
+	m := strings.ToLower(strings.TrimSpace(rc.Model))
+	if strings.HasPrefix(m, "gpt-") ||
 		strings.HasPrefix(m, "o1-") ||
-		strings.HasPrefix(m, "o3-")
+		strings.HasPrefix(m, "o3-") ||
+		strings.HasPrefix(m, "o4-") {
+		return true
+	}
+	// 显式指定了 provider 且该 provider 在配置中存在
+	if rc.Provider != "" {
+		_, exists := cfg.Providers[rc.Provider]
+		return exists
+	}
+	return false
 }
 
 func isMockModel(model string) bool {

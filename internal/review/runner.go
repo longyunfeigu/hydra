@@ -164,7 +164,7 @@ func (r *Runner) Prepare(job Job, opts RunOptions) (*PreparedRun, error) {
 		if contextModel == "" {
 			contextModel = r.cfg.Analyzer.Model
 		}
-		contextProvider, err := provider.CreateProvider(contextModel, "", "", r.cfg)
+		contextProvider, err := provider.CreateProvider(contextModel, "", "", "", r.cfg)
 		if err != nil {
 			util.Warnf("Failed to create context gatherer provider: %v", err)
 			hasContext = false
@@ -244,7 +244,7 @@ func (r *Runner) buildReviewers(ids []string) ([]orchestrator.Reviewer, error) {
 	reviewers := make([]orchestrator.Reviewer, 0, len(ids))
 	for _, id := range ids {
 		rc := r.cfg.Reviewers[id]
-		p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, r.cfg)
+		p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, rc.Provider, r.cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider for reviewer %s: %w", id, err)
 		}
@@ -258,7 +258,7 @@ func (r *Runner) buildReviewers(ids []string) ([]orchestrator.Reviewer, error) {
 }
 
 func (r *Runner) buildSpecialReviewer(id string, rc config.ReviewerConfig) (orchestrator.Reviewer, provider.AIProvider, error) {
-	p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, r.cfg)
+	p, err := provider.CreateProvider(rc.Model, rc.ModelName, rc.ReasoningEffort, rc.Provider, r.cfg)
 	if err != nil {
 		return orchestrator.Reviewer{}, nil, fmt.Errorf("failed to create %s provider: %w", id, err)
 	}

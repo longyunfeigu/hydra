@@ -36,6 +36,17 @@ providers:
   openai:
     api_key: ${OPENAI_API_KEY}
     base_url: https://api.openai.com/v1  # optional, for Azure/Ollama compatibility
+  # gemini-cli:
+  #   enabled: true
+  # openrouter:
+  #   api_key: ${OPENROUTER_API_KEY}
+  #   base_url: https://openrouter.ai/api/v1
+  # minimax:
+  #   api_key: ${MINIMAX_API_KEY}
+  #   base_url: https://api.minimax.io/v1
+  # glm:
+  #   api_key: ${GLM_API_KEY}
+  #   base_url: https://open.bigmodel.cn/api/paas/v4
 
 defaults:
   max_rounds: 5
@@ -80,6 +91,15 @@ reviewers:
   #   prompt: |
   #     You are an experienced code reviewer focused on design patterns,
   #     API correctness, and code clarity. Provide actionable suggestions.
+  # gemini:
+  #   model: gemini-cli
+  #   prompt: |
+  #     You are a meticulous code reviewer focused on correctness and best practices.
+  # openrouter-review:
+  #   model: anthropic/claude-sonnet-4
+  #   provider: openrouter
+  #   prompt: |
+  #     You are a code reviewer focused on architecture and design quality.
 
 # Platform: auto-detected from git remote (github or gitlab)
 # platform:
