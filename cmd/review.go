@@ -123,6 +123,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 		MaxRoundsOverride:  maxRounds,
 		DisableConvergence: noConverge,
 		HistoryProvider:    plat,
+		Commenter:          plat,
 		CheckoutPlatform:   platformName,
 		CheckoutHost:       checkoutHost,
 	})

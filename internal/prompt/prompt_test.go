@@ -21,7 +21,7 @@ func TestRender(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !strings.Contains(result, "strict consensus judge") {
+		if !strings.Contains(result, "pragmatic consensus judge") {
 			t.Errorf("unexpected result: %s", result)
 		}
 	})
@@ -107,12 +107,13 @@ func TestRender(t *testing.T) {
 
 	t.Run("renders reviewer_first_round with all sections", func(t *testing.T) {
 		result, err := Render("reviewer_first_round.tmpl", map[string]any{
-			"TaskPrompt":       "Review this PR",
-			"ContextSection":   "\n## System Context\nSome context\n\n",
-			"FocusSection":     "\nFocus on security\n",
-			"CallChainSection": "\n## Call Chain\nSome calls\n",
-			"Analysis":         "Analysis result",
-			"ReviewerID":       "claude",
+			"TaskPrompt":              "Review this PR",
+			"ContextSection":          "\n## System Context\nSome context\n\n",
+			"FocusSection":            "\nFocus on security\n",
+			"CallChainSection":        "\n## Call Chain\nSome calls\n",
+			"PreviousCommentsSection": "\n## Previous Review Findings\n1. [high] `auth.go:42` - Missing validation\n",
+			"Analysis":                "Analysis result",
+			"ReviewerID":              "claude",
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -132,12 +133,17 @@ func TestRender(t *testing.T) {
 		if !strings.Contains(result, "Confirmed by workspace cross-check") {
 			t.Error("missing evidence source labeling rule")
 		}
+		if !strings.Contains(result, "Previous Review Findings") {
+			t.Error("missing PreviousCommentsSection")
+		}
 	})
 
-	t.Run("renders reviewer_debate_session with no handoff rules", func(t *testing.T) {
+	t.Run("renders reviewer_debate_session with early-round audit rules", func(t *testing.T) {
 		result, err := Render("reviewer_debate_session.tmpl", map[string]any{
 			"ReviewerID": "codex",
 			"NewContent": "- reviewer-a: check auth\n",
+			"Round":      2,
+			"MaxRounds":  5,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -150,6 +156,24 @@ func TestRender(t *testing.T) {
 		}
 	})
 
+	t.Run("renders reviewer_debate_session with late-round convergence rules", func(t *testing.T) {
+		result, err := Render("reviewer_debate_session.tmpl", map[string]any{
+			"ReviewerID": "codex",
+			"NewContent": "- reviewer-a: check auth\n",
+			"Round":      3,
+			"MaxRounds":  5,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(result, "Convergence mode") {
+			t.Error("missing late-round convergence mode")
+		}
+		if !strings.Contains(result, "Do NOT introduce new issues unless they are clearly critical/blocking") {
+			t.Error("missing late-round new-issue guardrail")
+		}
+	})
+
 	t.Run("renders reviewer_debate_full with no handoff rules", func(t *testing.T) {
 		result, err := Render("reviewer_debate_full.tmpl", map[string]any{
 			"TaskPrompt": "Review this PR",
@@ -158,6 +182,8 @@ func TestRender(t *testing.T) {
 			"OtherLabel": "[codex]",
 			"PluralS":    "",
 			"OtherWord":  "is",
+			"Round":      2,
+			"MaxRounds":  5,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -170,10 +196,33 @@ func TestRender(t *testing.T) {
 		}
 	})
 
+	t.Run("renders reviewer_debate_full with late-round convergence rules", func(t *testing.T) {
+		result, err := Render("reviewer_debate_full.tmpl", map[string]any{
+			"TaskPrompt": "Review this PR",
+			"Analysis":   "analysis",
+			"ReviewerID": "claude",
+			"OtherLabel": "[codex]",
+			"PluralS":    "",
+			"OtherWord":  "is",
+			"Round":      4,
+			"MaxRounds":  5,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(result, "Late-round convergence mode") {
+			t.Error("missing full-context late-round guidance")
+		}
+		if !strings.Contains(result, "Do NOT add minor new issues") {
+			t.Error("missing full-context scope guardrail")
+		}
+	})
+
 	t.Run("renders convergence_check with variables", func(t *testing.T) {
 		result, err := Render("convergence_check.tmpl", map[string]any{
 			"ReviewerCount":   2,
 			"RoundsCompleted": 3,
+			"MaxRounds":       5,
 			"MessagesText":    "reviewer messages here",
 		})
 		if err != nil {
@@ -184,6 +233,9 @@ func TestRender(t *testing.T) {
 		}
 		if !strings.Contains(result, "Round 3") {
 			t.Error("missing RoundsCompleted")
+		}
+		if !strings.Contains(result, "practical late-round standard") {
+			t.Error("missing late-round convergence guidance")
 		}
 	})
 

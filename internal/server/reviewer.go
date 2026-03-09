@@ -16,6 +16,7 @@ import (
 type reviewPlatform interface {
 	platform.Named
 	platform.MRMetadataProvider
+	platform.MRCommenter
 	platform.IssueCommenter
 	platform.HistoryProvider
 }
@@ -44,6 +45,7 @@ func RunServerReview(ctx context.Context, event *MergeRequestEvent, plat reviewP
 
 	prepared, err := runner.Prepare(*job, review.RunOptions{
 		HistoryProvider:  plat,
+		Commenter:        plat,
 		CheckoutPlatform: plat.Name(),
 		CheckoutHost:     checkoutHost,
 	})

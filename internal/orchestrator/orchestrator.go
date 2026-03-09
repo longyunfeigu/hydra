@@ -72,13 +72,14 @@ type DebateOrchestrator struct {
 // debateRun 通过嵌入 *DebateOrchestrator 继承其配置（reviewers、options 等），
 // 但拥有独立的对话历史、Token 计数等运行时状态。
 type debateRun struct {
-	*DebateOrchestrator                        // 嵌入编排器，继承配置信息（reviewers、analyzer、summarizer 等）
-	conversationHistory []DebateMessage        // 完整的辩论对话历史，按时间顺序记录所有审查者的发言
-	tokenUsage          map[string]*tokenCount // 每个审查者（含 analyzer/summarizer）的 Token 使用量映射
-	analysis            string                 // 预分析器（analyzer）生成的代码分析结果，用于指导审查者关注重点
+	*DebateOrchestrator                         // 嵌入编排器，继承配置信息（reviewers、analyzer、summarizer 等）
+	conversationHistory []DebateMessage         // 完整的辩论对话历史，按时间顺序记录所有审查者的发言
+	tokenUsage          map[string]*tokenCount  // 每个审查者（含 analyzer/summarizer）的 Token 使用量映射
+	analysis            string                  // 预分析器（analyzer）生成的代码分析结果，用于指导审查者关注重点
 	gatheredContext     *GatheredContext        // 从代码仓库中收集的上下文信息（调用链、模块关系等）
-	taskPrompt          string                 // 原始任务提示词，包含代码 diff 和审查要求
-	lastSeenIndex       map[string]int         // 每个审查者最后看到的消息在 conversationHistory 中的索引，用于会话模式的增量消息计算
+	taskPrompt          string                  // 原始任务提示词，包含代码 diff 和审查要求
+	currentRound        int                     // 当前正在执行的辩论轮次，用于后期轮次切换到收敛导向 prompt
+	lastSeenIndex       map[string]int          // 每个审查者最后看到的消息在 conversationHistory 中的索引，用于会话模式的增量消息计算
 	issueLedgers        map[string]*IssueLedger // 每个审查者的问题账本，用于 ledger 模式下的增量问题追踪
 	canonicalSignals    []CanonicalSignal       // 跨审查者的规范化信号（support/withdraw/contest），用于问题去重和置信度计算
 
@@ -481,6 +482,8 @@ func (o *debateRun) runDebatePhase(ctx context.Context, display DisplayCallbacks
 //  2. 使用 errgroup 进行并行执行，任一审查者失败则取消其他审查者。
 //  3. 所有审查者完成后，按固定顺序将结果添加到对话历史，保证消息顺序的确定性。
 func (o *debateRun) runDebateRound(ctx context.Context, round int, display DisplayCallbacks) (map[string]string, error) {
+	o.currentRound = round
+
 	// 在执行前为所有审查者构建消息（快照，确保所有审查者看到相同的信息）
 	// 这样避免了先执行的审查者的输出影响后执行审查者的输入
 	type reviewerTask struct {
@@ -1082,14 +1085,20 @@ func (o *debateRun) buildFirstRoundMessages(currentReviewerID string) []provider
 		callChainSection = "\n" + FormatCallChainForReviewer(o.gatheredContext.RawReferences) + "\n"
 	}
 
+	var previousCommentsSection string
+	if strings.TrimSpace(o.options.PreviousComments) != "" {
+		previousCommentsSection = fmt.Sprintf("\n## Previous Review Findings (from last Hydra run)\nThe following issues were flagged in the previous review and are still active.\nYour PRIMARY task: check if each issue has been fixed in the current diff.\n- Mark resolved issues as FIXED\n- Mark unresolved issues as STILL OPEN\n- Only raise NEW issues if they are critical/blocking\n\n%s\n", o.options.PreviousComments)
+	}
+
 	// 只传 focus bullets，不传 analyzer 全文，避免锚定 reviewer 思维
 	p := prompt.MustRender("reviewer_first_round.tmpl", map[string]any{
-		"TaskPrompt":       o.taskPrompt,
-		"ContextSection":   contextSection,
-		"FocusSection":     focusSection,
-		"CallChainSection": callChainSection,
-		"ReviewerID":       currentReviewerID,
-		"Language":         o.options.Language,
+		"TaskPrompt":              o.taskPrompt,
+		"ContextSection":          contextSection,
+		"FocusSection":            focusSection,
+		"CallChainSection":        callChainSection,
+		"PreviousCommentsSection": previousCommentsSection,
+		"ReviewerID":              currentReviewerID,
+		"Language":                o.options.Language,
 	})
 
 	return []provider.Message{{Role: "user", Content: p}}
@@ -1173,7 +1182,7 @@ func (o *debateRun) buildSessionDebateMessages(currentReviewerID string, myMessa
 	}
 
 	if len(newMessages) == 0 {
-		return []provider.Message{{Role: "user", Content: "Please continue with your review."}}
+		newMessages = append(newMessages, DebateMessage{ReviewerID: "system", Content: "No additional reviewer messages were added in the previous round. Focus on convergence based on the existing debate state."})
 	}
 
 	var parts []string
@@ -1185,6 +1194,8 @@ func (o *debateRun) buildSessionDebateMessages(currentReviewerID string, myMessa
 	p := prompt.MustRender("reviewer_debate_session.tmpl", map[string]any{
 		"ReviewerID": currentReviewerID,
 		"NewContent": newContent,
+		"Round":      o.currentRound,
+		"MaxRounds":  o.options.MaxRounds,
 		"Language":   o.options.Language,
 	})
 
@@ -1225,6 +1236,8 @@ func (o *debateRun) buildFullContextDebateMessages(currentReviewerID string, oth
 		"OtherLabel": otherLabel,
 		"PluralS":    pluralS(isPlural),
 		"OtherWord":  otherWord,
+		"Round":      o.currentRound,
+		"MaxRounds":  o.options.MaxRounds,
 		"Language":   o.options.Language,
 	})
 
@@ -1301,6 +1314,7 @@ func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbac
 	convergencePrompt := prompt.MustRender("convergence_check.tmpl", map[string]any{
 		"ReviewerCount":   len(o.reviewers),
 		"RoundsCompleted": roundsCompleted,
+		"MaxRounds":       o.options.MaxRounds,
 		"IsFirstRound":    roundsCompleted == 1,
 		"MessagesText":    messagesText,
 	})

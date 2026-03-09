@@ -135,6 +135,10 @@ type OrchestratorOptions struct {
 	// "legacy" 模式使用传统的全量解析方式，"ledger" 模式使用增量台账方式。
 	// 空值时按 "legacy" 处理以保持向后兼容。
 	StructurizeMode string
+
+	// PreviousComments 保存上一轮 Hydra review 仍处于 active 状态的评论摘要。
+	// 审查者在首轮会优先核查这些问题是否已修复，仅在必要时再提出新的 blocking 问题。
+	PreviousComments string
 }
 
 // OrchestratorConfig 保存创建 DebateOrchestrator 所需的全部配置。

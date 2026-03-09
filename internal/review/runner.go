@@ -3,6 +3,8 @@ package review
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/guwanhua/hydra/internal/checkout"
@@ -21,9 +23,12 @@ type RunOptions struct {
 	MaxRoundsOverride  int
 	DisableConvergence bool
 	HistoryProvider    platform.HistoryProvider
+	Commenter          platform.MRCommenter
 	CheckoutPlatform   string
 	CheckoutHost       string
 }
+
+var hydraIssueTitlePattern = regexp.MustCompile(`\*\*(.+?)\*\*`)
 
 // PreparedRun 是完成依赖装配、可直接执行的 review 任务。
 type PreparedRun struct {
@@ -180,6 +185,8 @@ func (r *Runner) Prepare(job Job, opts RunOptions) (*PreparedRun, error) {
 		job.Prompt += "\n\nNote: The full repository source code is available in your working directory.\nYou can browse files, read implementations, and examine the broader codebase context beyond the diff."
 	}
 
+	previousComments := loadPreviousComments(job, opts.Commenter)
+
 	maxRounds := r.cfg.Defaults.MaxRounds
 	if opts.MaxRoundsOverride > 0 {
 		maxRounds = opts.MaxRoundsOverride
@@ -200,6 +207,7 @@ func (r *Runner) Prepare(job Job, opts RunOptions) (*PreparedRun, error) {
 			CheckConvergence: checkConvergence,
 			Language:         r.cfg.Defaults.Language,
 			StructurizeMode:  r.cfg.Defaults.StructurizeMode,
+			PreviousComments: previousComments,
 		},
 	})
 
@@ -267,4 +275,142 @@ func (r *Runner) buildSpecialReviewer(id string, rc config.ReviewerConfig) (orch
 		Provider:     p,
 		SystemPrompt: rc.Prompt,
 	}, p, nil
+}
+
+func loadPreviousComments(job Job, commenter platform.MRCommenter) string {
+	if commenter == nil || job.Type != "pr" {
+		return ""
+	}
+	if strings.TrimSpace(job.MRNumber) == "" || strings.TrimSpace(job.Repo) == "" {
+		return ""
+	}
+	return formatPreviousComments(commenter.GetExistingComments(job.MRNumber, job.Repo))
+}
+
+func formatPreviousComments(comments []platform.ExistingComment) string {
+	type finding struct {
+		issueKey string
+		path     string
+		line     int
+		text     string
+	}
+
+	findings := make([]finding, 0, len(comments))
+	seen := make(map[string]struct{}, len(comments))
+	for _, comment := range comments {
+		if !comment.IsHydra || comment.Meta == nil || !strings.EqualFold(strings.TrimSpace(comment.Meta.Status), "active") {
+			continue
+		}
+		key := strings.TrimSpace(comment.Meta.IssueKey)
+		if key == "" {
+			key = fmt.Sprintf("%s|%s|%s", strings.TrimSpace(comment.Path), formatCommentLine(comment), platform.BodyHash(comment.Body))
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		severity := extractCommentSeverity(comment.Body)
+		location := formatCommentLocation(comment)
+		title := extractCommentTitle(comment.Body)
+		findings = append(findings, finding{
+			issueKey: key,
+			path:     strings.TrimSpace(comment.Path),
+			line:     sortLine(comment),
+			text:     fmt.Sprintf("[%s] %s - %s", severity, location, title),
+		})
+	}
+
+	if len(findings) == 0 {
+		return ""
+	}
+
+	sort.SliceStable(findings, func(i, j int) bool {
+		if findings[i].path != findings[j].path {
+			return findings[i].path < findings[j].path
+		}
+		if findings[i].line != findings[j].line {
+			return findings[i].line < findings[j].line
+		}
+		return findings[i].issueKey < findings[j].issueKey
+	})
+
+	var b strings.Builder
+	for i, item := range findings {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, item.text)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func extractCommentSeverity(body string) string {
+	trimmed := strings.TrimSpace(platform.StripHydraMeta(body))
+	switch {
+	case strings.HasPrefix(trimmed, "🔴"):
+		return "critical"
+	case strings.HasPrefix(trimmed, "🟠"):
+		return "high"
+	case strings.HasPrefix(trimmed, "🟡"):
+		return "medium"
+	case strings.HasPrefix(trimmed, "🟢"):
+		return "low"
+	default:
+		return "unspecified"
+	}
+}
+
+func extractCommentTitle(body string) string {
+	trimmed := strings.TrimSpace(platform.StripHydraMeta(body))
+	if trimmed == "" {
+		return "Existing Hydra finding"
+	}
+	if match := hydraIssueTitlePattern.FindStringSubmatch(trimmed); len(match) == 2 {
+		return strings.TrimSpace(match[1])
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "🔴🟠🟡🟢⚪")
+		line = strings.TrimSpace(strings.Trim(line, "`*_ -"))
+		if line != "" {
+			return line
+		}
+	}
+	return "Existing Hydra finding"
+}
+
+func formatCommentLocation(comment platform.ExistingComment) string {
+	line := commentLine(comment)
+	path := strings.TrimSpace(comment.Path)
+	switch {
+	case path != "" && line != nil:
+		return fmt.Sprintf("`%s:%d`", path, *line)
+	case path != "":
+		return fmt.Sprintf("`%s`", path)
+	case line != nil:
+		return fmt.Sprintf("line %d", *line)
+	default:
+		return "general comment"
+	}
+}
+
+func formatCommentLine(comment platform.ExistingComment) string {
+	line := commentLine(comment)
+	if line == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%d", *line)
+}
+
+func commentLine(comment platform.ExistingComment) *int {
+	if comment.Line != nil {
+		return comment.Line
+	}
+	return comment.OldLine
+}
+
+func sortLine(comment platform.ExistingComment) int {
+	line := commentLine(comment)
+	if line == nil {
+		return int(^uint(0) >> 1)
+	}
+	return *line
 }

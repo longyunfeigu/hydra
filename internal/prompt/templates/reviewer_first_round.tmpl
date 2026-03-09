@@ -1,5 +1,5 @@
 Task: {{.TaskPrompt}}
-{{.ContextSection}}{{.FocusSection}}{{.CallChainSection}}
+{{.ContextSection}}{{.FocusSection}}{{.CallChainSection}}{{.PreviousCommentsSection}}
 {{/* 不注入 analyzer 全文，仅保留 FocusSection 中的 bullets。
      原因：全文会锚定 reviewer 的思维，削弱对抗性辩论的独立性。
      bullets 提供方向指引但不约束审查视角。 */}}
