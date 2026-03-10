@@ -12,6 +12,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -80,6 +81,7 @@ type debateRun struct {
 	taskPrompt          string                  // 原始任务提示词，包含代码 diff 和审查要求
 	currentRound        int                     // 当前正在执行的辩论轮次，用于后期轮次切换到收敛导向 prompt
 	lastSeenIndex       map[string]int          // 每个审查者最后看到的消息在 conversationHistory 中的索引，用于会话模式的增量消息计算
+	failedReviewers     map[string]error        // 已在辩论阶段失败的审查者，后续轮次和总结阶段会跳过
 	issueLedgers        map[string]*IssueLedger // 每个审查者的问题账本，用于 ledger 模式下的增量问题追踪
 	canonicalSignals    []CanonicalSignal       // 跨审查者的规范化信号（support/withdraw/contest），用于问题去重和置信度计算
 
@@ -122,6 +124,7 @@ func (o *DebateOrchestrator) newRun(prompt string) *debateRun {
 		DebateOrchestrator: o,
 		tokenUsage:         make(map[string]*tokenCount),
 		lastSeenIndex:      make(map[string]int),
+		failedReviewers:    make(map[string]error),
 		taskPrompt:         prompt,
 	}
 }
@@ -152,6 +155,7 @@ func (o *DebateOrchestrator) legacyRun() *debateRun {
 		gatheredContext:     o.gatheredContext,
 		taskPrompt:          o.taskPrompt,
 		lastSeenIndex:       lastSeen,
+		failedReviewers:     make(map[string]error),
 		issueLedgers:        o.issueLedgers,
 		canonicalSignals:    o.canonicalSignals,
 	}
@@ -353,7 +357,7 @@ func (o *debateRun) startSessions(label string) {
 //   - display: UI 回调接口，用于实时更新显示状态
 //
 // 返回：
-//   - error: 仅当预分析（analyzer）失败时返回错误；上下文收集失败是非致命的
+//   - error: 仅在外部取消/超时时返回错误；上下文收集和预分析失败都按非致命处理
 //
 // 设计说明：上下文收集和预分析是两个完全独立的操作，互不依赖，因此使用 errgroup
 // 并行执行以减少总耗时。上下文收集从代码仓库中提取调用链、模块关系等信息；
@@ -388,7 +392,11 @@ func (o *debateRun) runAnalysisPhase(ctx context.Context, label, prompt string, 
 			display.OnMessageChunk("analyzer", chunk)
 		}
 		if err := <-errCh; err != nil {
-			return fmt.Errorf("analyzer failed: %w", err)
+			if isContextCancellation(err, gctx) {
+				return err
+			}
+			util.Warnf("runAnalysisPhase: analyzer failed, continuing without analyzer guidance: %v", err)
+			return nil
 		}
 		o.analysis = sb.String()
 		display.OnMessage("analyzer", o.analysis)
@@ -416,7 +424,7 @@ func (o *debateRun) runAnalysisPhase(ctx context.Context, label, prompt string, 
 //
 // 返回：
 //   - *int: 达成共识的轮次号；如果辩论打满所有轮次仍未达成共识则返回 nil
-//   - error: 任何审查者执行失败时的错误
+//   - error: 仅在所有审查者都未产出任何结果，或外部取消/超时时返回错误
 //
 // 核心逻辑：
 //  1. 如果使用 ledger 模式，先初始化每个审查者的问题账本
@@ -430,9 +438,25 @@ func (o *debateRun) runDebatePhase(ctx context.Context, display DisplayCallbacks
 	}
 
 	for round := 1; round <= o.options.MaxRounds; round++ {
+		if len(o.activeReviewers()) == 0 {
+			if o.hasReviewerMessages() {
+				util.Warnf("runDebatePhase: no reviewers remain after earlier failures, finishing with partial results")
+				break
+			}
+			return nil, fmt.Errorf("all reviewers failed before any review output was produced")
+		}
+
 		roundOutputs, err := o.runDebateRound(ctx, round, display)
 		if err != nil {
 			return nil, err
+		}
+		if len(roundOutputs) == 0 {
+			if o.hasReviewerMessages() {
+				util.Warnf("runDebatePhase: round %d produced no successful reviewer output, finishing with partial results", round)
+				display.OnRoundComplete(round, false)
+				break
+			}
+			return nil, fmt.Errorf("all reviewers failed before any review output was produced")
 		}
 		if o.useLedgerStructurize() {
 			o.extractRoundIssueDeltas(ctx, round, roundOutputs, display)
@@ -460,6 +484,10 @@ func (o *debateRun) runDebatePhase(ctx context.Context, display DisplayCallbacks
 		if converged {
 			break
 		}
+		if len(o.activeReviewers()) <= 1 {
+			util.Warnf("runDebatePhase: %d reviewer remains after round %d, skipping remaining debate rounds", len(o.activeReviewers()), round)
+			break
+		}
 	}
 
 	return convergedAtRound, nil
@@ -474,13 +502,13 @@ func (o *debateRun) runDebatePhase(ctx context.Context, display DisplayCallbacks
 //
 // 返回：
 //   - map[string]string: 每个审查者本轮的完整响应（reviewerID -> content），用于后续增量问题提取
-//   - error: 任何审查者执行失败时的错误
+//   - error: 仅在外部取消/超时时返回错误；单个审查者失败会被记录并跳过
 //
 // 关键设计：
 //  1. 先为所有审查者构建消息（快照），再并行执行。这确保所有审查者看到完全相同的
 //     辩论历史，避免先执行完的审查者的输出影响后执行审查者的输入（保证公平性）。
-//  2. 使用 errgroup 进行并行执行，任一审查者失败则取消其他审查者。
-//  3. 所有审查者完成后，按固定顺序将结果添加到对话历史，保证消息顺序的确定性。
+//  2. 并行执行各审查者，单个审查者失败不会取消其他审查者。
+//  3. 所有成功的审查者完成后，按固定顺序将结果添加到对话历史，保证消息顺序的确定性。
 func (o *debateRun) runDebateRound(ctx context.Context, round int, display DisplayCallbacks) (map[string]string, error) {
 	o.currentRound = round
 
@@ -492,8 +520,9 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 		inputText   string
 		inputTokens int
 	}
-	tasks := make([]reviewerTask, len(o.reviewers))
-	for i, r := range o.reviewers {
+	activeReviewers := o.activeReviewers()
+	tasks := make([]reviewerTask, len(activeReviewers))
+	for i, r := range activeReviewers {
 		messages := o.buildMessages(r.ID)
 		var inputParts []string
 		for _, m := range messages {
@@ -507,11 +536,14 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 			inputTokens: estimateTokens(inputText),
 		}
 	}
+	if len(tasks) == 0 {
+		return nil, nil
+	}
 
 	// 初始化每个审查者的状态追踪，用于UI实时显示
-	statuses := make([]ReviewerStatus, len(o.reviewers))
+	statuses := make([]ReviewerStatus, len(tasks))
 	var statusesMu sync.Mutex
-	for i, r := range o.reviewers {
+	for i, r := range activeReviewers {
 		statuses[i] = ReviewerStatus{
 			ReviewerID: r.ID,
 			Status:     "pending",
@@ -528,11 +560,15 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 		inputText    string
 	}
 	results := make([]roundResult, len(tasks))
-
-	rg, rgctx := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
+	var roundErr error
+	var roundErrMu sync.Mutex
 	for i, task := range tasks {
 		i, task := i, task
-		rg.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
 			// 标记审查者状态为"思考中"，记录开始时间
 			startTime := time.Now().UnixMilli()
 			statusesMu.Lock()
@@ -547,14 +583,39 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 			display.OnParallelStatus(round, statusSnapshot)
 
 			// 流式接收审查者的响应，逐块读取
-			ch, errCh := task.reviewer.Provider.ChatStream(rgctx, task.messages, task.reviewer.SystemPrompt)
+			ch, errCh := task.reviewer.Provider.ChatStream(ctx, task.messages, task.reviewer.SystemPrompt)
 			var sb strings.Builder
 			for chunk := range ch {
 				sb.WriteString(chunk)
 				display.OnMessageChunk(task.reviewer.ID, chunk)
 			}
 			if err := <-errCh; err != nil {
-				return fmt.Errorf("reviewer %s failed: %w", task.reviewer.ID, err)
+				if isContextCancellation(err, ctx) {
+					roundErrMu.Lock()
+					if roundErr == nil {
+						roundErr = err
+					}
+					roundErrMu.Unlock()
+					return
+				}
+
+				endTime := time.Now().UnixMilli()
+				statusesMu.Lock()
+				statuses[i] = ReviewerStatus{
+					ReviewerID:  task.reviewer.ID,
+					Status:      "failed",
+					StartTime:   startTime,
+					EndTime:     endTime,
+					Duration:    float64(endTime-startTime) / 1000.0,
+					InputTokens: task.inputTokens,
+				}
+				statusSnapshot = copyStatuses(statuses)
+				statusesMu.Unlock()
+				display.OnParallelStatus(round, statusSnapshot)
+
+				o.markReviewerFailed(task.reviewer.ID, err)
+				util.Warnf("runDebateRound: reviewer %s failed in round %d, continuing with remaining reviewers: %v", task.reviewer.ID, round, err)
+				return
 			}
 
 			fullResponse := sb.String()
@@ -582,17 +643,23 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 				fullResponse: fullResponse,
 				inputText:    task.inputText,
 			}
-			return nil
-		})
+		}()
 	}
 
-	if err := rg.Wait(); err != nil {
-		return nil, err
+	wg.Wait()
+	if roundErr != nil {
+		return nil, roundErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	// 所有审查者完成后，将结果添加到对话历史并通知UI
 	// 注意：必须在所有审查者完成后统一添加，保证消息顺序一致
 	for _, r := range results {
+		if r.reviewer.ID == "" {
+			continue
+		}
 		o.trackTokens(r.reviewer.ID, r.inputText, r.fullResponse)
 		o.conversationHistory = append(o.conversationHistory, DebateMessage{
 			ReviewerID: r.reviewer.ID,
@@ -621,7 +688,7 @@ func (o *debateRun) runDebateRound(ctx context.Context, round int, display Displ
 //
 // 返回：
 //   - *DebateResult: 完整的辩论结果，包含分析、上下文、对话历史、总结、结论和结构化问题
-//   - error: 总结收集或结论生成失败时的错误
+//   - error: 仅在外部取消/超时时返回错误；总结/结论失败会回退到 partial result
 //
 // 流程：
 //  1. 并行收集每个审查者的最终总结
@@ -647,17 +714,23 @@ func (o *debateRun) runSummaryPhase(ctx context.Context, label string, display D
 	)
 
 	display.OnWaiting("final-conclusion")
-	if o.useLedgerStructurize() {
-		finalConclusion, err = o.getFinalConclusion(ctx, summaries, display)
-		if err != nil {
-			return nil, fmt.Errorf("final conclusion: %w", err)
-		}
-		parsedIssues = o.structurizeIssuesFromLedgers(ctx, display)
+	if len(summaries) == 0 {
+		finalConclusion = o.buildFallbackConclusion(nil)
+		display.OnMessage("summarizer", finalConclusion)
 	} else {
 		finalConclusion, err = o.getFinalConclusion(ctx, summaries, display)
 		if err != nil {
-			return nil, fmt.Errorf("final conclusion: %w", err)
+			if isContextCancellation(err, ctx) {
+				return nil, fmt.Errorf("final conclusion: %w", err)
+			}
+			util.Warnf("runSummaryPhase: final conclusion generation failed, using fallback summary: %v", err)
+			finalConclusion = o.buildFallbackConclusion(summaries)
+			display.OnMessage("summarizer", finalConclusion)
 		}
+	}
+	if o.useLedgerStructurize() {
+		parsedIssues = o.structurizeIssuesFromLedgers(ctx, display)
+	} else {
 		parsedIssues = o.structurizeIssuesLegacy(ctx, display)
 	}
 
@@ -1292,11 +1365,15 @@ func (o *debateRun) buildFullContextDebateMessages(currentReviewerID string, oth
 // 容错：空响应、无法识别的判定词、AI 调用失败都视为未达成共识（保守策略），
 // 确保不会因为判定错误而提前终止辩论。
 func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbacks) (bool, error) {
-	if len(o.conversationHistory) < len(o.reviewers) {
+	activeReviewerCount := len(o.activeReviewers())
+	if activeReviewerCount < 2 {
+		return false, nil
+	}
+	if len(o.conversationHistory) < activeReviewerCount {
 		return false, nil
 	}
 
-	roundsCompleted := len(o.conversationHistory) / len(o.reviewers)
+	roundsCompleted := o.completedRounds()
 
 	// 使用所有已完成轮次的消息（而非仅最后一轮），避免以下情况导致误判：
 	// 审查者在最后一轮表面上达成一致，但实际上早期轮次中有重要的分歧被遗忘了
@@ -1312,7 +1389,7 @@ func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbac
 	messagesText := strings.Join(parts, "\n\n---\n\n")
 
 	convergencePrompt := prompt.MustRender("convergence_check.tmpl", map[string]any{
-		"ReviewerCount":   len(o.reviewers),
+		"ReviewerCount":   activeReviewerCount,
 		"RoundsCompleted": roundsCompleted,
 		"MaxRounds":       o.options.MaxRounds,
 		"IsFirstRound":    roundsCompleted == 1,
@@ -1389,7 +1466,7 @@ func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbac
 //
 // 返回：
 //   - []DebateSummary: 每个审查者的最终总结，顺序与 o.reviewers 一致
-//   - error: 任何审查者总结失败时的错误
+//   - error: 仅在外部取消/超时时返回错误；单个审查者总结失败会被跳过
 //
 // 在辩论结束后，每个审查者独立总结自己的核心观点和结论。总结内容将传递给
 // 总结器（summarizer）用于生成最终结论。审查者在总结中不透露身份，
@@ -1399,18 +1476,22 @@ func (o *debateRun) checkConvergence(ctx context.Context, display DisplayCallbac
 // 需要将最新的辩论上下文和总结要求合并到同一条消息中，
 // 否则审查者可能看不到最后一轮的辩论内容。
 func (o *debateRun) collectSummaries(ctx context.Context, display DisplayCallbacks) ([]DebateSummary, error) {
+	activeReviewers := o.activeReviewers()
+	if len(activeReviewers) == 0 {
+		return nil, nil
+	}
+
 	// 预分配结果切片，每个 goroutine 写入自己的索引位置，无需加锁
-	summaries := make([]DebateSummary, len(o.reviewers))
-	statuses := make([]ReviewerStatus, len(o.reviewers))
+	summaries := make([]DebateSummary, len(activeReviewers))
+	statuses := make([]ReviewerStatus, len(activeReviewers))
 	var statusesMu sync.Mutex
-	for i, reviewer := range o.reviewers {
+	for i, reviewer := range activeReviewers {
 		statuses[i] = ReviewerStatus{
 			ReviewerID: reviewer.ID,
 			Status:     "pending",
 		}
 	}
 
-	g, gctx := errgroup.WithContext(ctx)
 	displayStatuses := func() {
 		statusesMu.Lock()
 		snapshot := copyStatuses(statuses)
@@ -1418,9 +1499,15 @@ func (o *debateRun) collectSummaries(ctx context.Context, display DisplayCallbac
 		display.OnSummaryStatus(snapshot)
 	}
 	displayStatuses()
-	for i, reviewer := range o.reviewers {
+	var wg sync.WaitGroup
+	var summaryErr error
+	var summaryErrMu sync.Mutex
+	for i, reviewer := range activeReviewers {
 		i, reviewer := i, reviewer
-		g.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
 			messages := o.buildMessages(reviewer.ID)
 			summaryPrompt := prompt.MustRender("reviewer_summary.tmpl", map[string]any{
 				"Language": o.options.Language,
@@ -1463,14 +1550,37 @@ func (o *debateRun) collectSummaries(ctx context.Context, display DisplayCallbac
 			statusesMu.Unlock()
 			displayStatuses()
 
-			ch, errCh := reviewer.Provider.ChatStream(gctx, messages, reviewer.SystemPrompt)
+			ch, errCh := reviewer.Provider.ChatStream(ctx, messages, reviewer.SystemPrompt)
 			var sb strings.Builder
 			for chunk := range ch {
 				sb.WriteString(chunk)
 				display.OnMessageChunk("summary:"+reviewer.ID, chunk)
 			}
 			if err := <-errCh; err != nil {
-				return fmt.Errorf("summary from %s: %w", reviewer.ID, err)
+				if isContextCancellation(err, ctx) {
+					summaryErrMu.Lock()
+					if summaryErr == nil {
+						summaryErr = err
+					}
+					summaryErrMu.Unlock()
+					return
+				}
+
+				endTime := time.Now().UnixMilli()
+				statusesMu.Lock()
+				statuses[i] = ReviewerStatus{
+					ReviewerID:  reviewer.ID,
+					Status:      "failed",
+					StartTime:   startTime,
+					EndTime:     endTime,
+					Duration:    float64(endTime-startTime) / 1000.0,
+					InputTokens: inputTokens,
+				}
+				statusesMu.Unlock()
+				displayStatuses()
+
+				util.Warnf("collectSummaries: reviewer %s summary failed, skipping: %v", reviewer.ID, err)
+				return
 			}
 
 			summary := sb.String()
@@ -1498,14 +1608,22 @@ func (o *debateRun) collectSummaries(ctx context.Context, display DisplayCallbac
 				ReviewerID: reviewer.ID,
 				Summary:    summary,
 			}
-			return nil
-		})
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+	wg.Wait()
+	if summaryErr != nil {
+		return nil, summaryErr
 	}
-	return summaries, nil
+
+	filtered := make([]DebateSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		if strings.TrimSpace(summary.ReviewerID) == "" {
+			continue
+		}
+		filtered = append(filtered, summary)
+	}
+	return filtered, nil
 }
 
 // getFinalConclusion 请求总结器根据所有审查者的匿名总结生成最终结论。
@@ -1848,6 +1966,85 @@ func (o *debateRun) getTokenUsage() []TokenUsage {
 	return usage
 }
 
+func (o *debateRun) activeReviewers() []Reviewer {
+	if len(o.failedReviewers) == 0 {
+		return o.reviewers
+	}
+
+	active := make([]Reviewer, 0, len(o.reviewers))
+	for _, reviewer := range o.reviewers {
+		if _, failed := o.failedReviewers[reviewer.ID]; failed {
+			continue
+		}
+		active = append(active, reviewer)
+	}
+	return active
+}
+
+func (o *debateRun) markReviewerFailed(reviewerID string, err error) {
+	if reviewerID == "" || err == nil {
+		return
+	}
+	if o.failedReviewers == nil {
+		o.failedReviewers = make(map[string]error)
+	}
+	o.failedReviewers[reviewerID] = err
+}
+
+func (o *debateRun) completedRounds() int {
+	maxRound := 0
+	if o.currentRound > maxRound {
+		maxRound = o.currentRound
+	}
+
+	counts := make(map[string]int)
+	for _, msg := range o.conversationHistory {
+		if msg.ReviewerID == "user" {
+			continue
+		}
+		if msg.Round > maxRound {
+			maxRound = msg.Round
+		}
+		counts[msg.ReviewerID]++
+	}
+	if maxRound > 0 {
+		return maxRound
+	}
+
+	for _, count := range counts {
+		if count > maxRound {
+			maxRound = count
+		}
+	}
+	return maxRound
+}
+
+func (o *debateRun) buildFallbackConclusion(summaries []DebateSummary) string {
+	var b strings.Builder
+	b.WriteString("## Partial Review Result\n\n")
+	b.WriteString("Hydra completed with partial results because final synthesis could not be generated reliably.\n\n")
+
+	if len(summaries) > 0 {
+		b.WriteString("### Available reviewer summaries\n\n")
+		for _, summary := range summaries {
+			if strings.TrimSpace(summary.ReviewerID) == "" || strings.TrimSpace(summary.Summary) == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "#### %s\n\n%s\n\n", summary.ReviewerID, summary.Summary)
+		}
+	} else {
+		transcript := strings.TrimSpace(o.buildDebateTranscript(4000))
+		if transcript != "" {
+			b.WriteString("### Debate Transcript Excerpt\n\n")
+			b.WriteString("```text\n")
+			b.WriteString(transcript)
+			b.WriteString("\n```\n")
+		}
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
 // endAllSessions 结束所有 AI 提供者的会话，释放服务端的会话资源。
 //
 // 在辩论完成或出错时通过 defer 调用，确保会话资源不会泄漏。
@@ -1998,6 +2195,13 @@ func copyStatuses(statuses []ReviewerStatus) []ReviewerStatus {
 	cp := make([]ReviewerStatus, len(statuses))
 	copy(cp, statuses)
 	return cp
+}
+
+func isContextCancellation(err error, ctx context.Context) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(ctx.Err(), context.Canceled) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 // pluralS 根据是否为复数返回英文复数后缀 "s" 或空字符串。

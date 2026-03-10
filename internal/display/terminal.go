@@ -631,6 +631,9 @@ func formatParallelStatus(round int, statuses []orchestrator.ReviewerStatus) str
 					formatNumber(s.OutputTokens),
 					s.EstimatedCost,
 				)
+		case "failed":
+			parts[i] = color.RedString("✗ %s", s.ReviewerID) +
+				color.HiBlackString(" (%.1fs)", s.Duration)
 		case "thinking":
 			elapsed := 0.0
 			if s.StartTime > 0 {
@@ -658,6 +661,9 @@ func formatSummaryStatus(statuses []orchestrator.ReviewerStatus) string {
 					formatNumber(s.OutputTokens),
 					s.EstimatedCost,
 				)
+		case "failed":
+			parts[i] = color.RedString("✗ %s", s.ReviewerID) +
+				color.HiBlackString(" (%.1fs)", s.Duration)
 		case "thinking":
 			elapsed := 0.0
 			if s.StartTime > 0 {

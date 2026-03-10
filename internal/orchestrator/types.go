@@ -89,7 +89,8 @@ type ReviewerStatus struct {
 	ReviewerID string
 
 	// Status 表示审查者当前的工作状态。
-	// 可选值："pending"（等待中）、"thinking"（思考中）、"done"（已完成）。
+	// 可选值："pending"（等待中）、"thinking"（思考中）、"done"（已完成）、
+	// "failed"（本阶段失败，已跳过）。
 	// UI 层根据此字段展示不同的状态图标和样式。
 	Status string
 
